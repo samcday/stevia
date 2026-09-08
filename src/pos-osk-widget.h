@@ -42,4 +42,8 @@ const char *const *pos_osk_widget_get_symbols (PosOskWidget *self);
 void              pos_osk_widget_set_key_height (PosOskWidget *self, guint key_height);
 guint             pos_osk_widget_max_rows (PosOskWidget *self);
 
+void              pos_osk_widget_set_swipe_enabled (PosOskWidget *self, gboolean enabled);
+void              pos_osk_widget_cancel_swipe (PosOskWidget *self);
+gboolean          pos_osk_widget_swipe_in_progress (PosOskWidget *self);
+
 G_END_DECLS

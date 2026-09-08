@@ -13,6 +13,9 @@ static const char service_xml[] =
   "<method name='Complete'><arg type='s' direction='in'/>"
   "<arg type='u' direction='in'/><arg type='s' direction='in'/>"
   "<arg type='a(sd)' direction='out'/></method>"
+  "<method name='RecognizeSwipe'><arg type='a(ddu)' direction='in'/>"
+  "<arg type='a(sdddd)' direction='in'/><arg type='u' direction='in'/>"
+  "<arg type='s' direction='in'/><arg type='a(sd)' direction='out'/></method>"
   "</interface></node>";
 
 typedef struct {
@@ -23,6 +26,7 @@ typedef struct {
   const char *hold_word;
   gboolean fail;
   guint requests;
+  guint swipe_requests;
   guint changes;
   gboolean unsupported;
   char *committed;
@@ -90,9 +94,16 @@ answer (GDBusMethodInvocation *invocation)
   g_autofree char *generated = NULL;
   GVariantBuilder builder;
 
-  g_variant_get_child (parameters, 0, "&s", &word);
+  if (g_str_equal (g_dbus_method_invocation_get_method_name (invocation), "RecognizeSwipe"))
+    word = "swipe";
+  else
+    g_variant_get_child (parameters, 0, "&s", &word);
   g_variant_builder_init (&builder, G_VARIANT_TYPE ("a(sd)"));
-  if (g_str_equal (word, "hel")) {
+  if (g_str_equal (word, "swipe")) {
+    const char *ranked[] = {"hello", "hello", "help", "held", "world", "word", "work", "extra", NULL};
+    for (guint i = 0; ranked[i]; i++)
+      g_variant_builder_add (&builder, "(sd)", ranked[i], 1.0 - i * 0.1);
+  } else if (g_str_equal (word, "hel")) {
     g_variant_builder_add (&builder, "(sd)", "hello", 0.9);
     g_variant_builder_add (&builder, "(sd)", "help", 0.8);
     g_variant_builder_add (&builder, "(sd)", "hello", 0.7);
@@ -136,9 +147,20 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
   const char *word;
   guint max;
 
-  g_assert_cmpstr (method, ==, "Complete");
   fixture->requests++;
-  g_variant_get (parameters, "(&su&s)", &word, &max, &language);
+  if (g_str_equal (method, "RecognizeSwipe")) {
+    g_autoptr (GVariant) trace = NULL;
+    g_autoptr (GVariant) keys = NULL;
+
+    fixture->swipe_requests++;
+    g_variant_get (parameters, "(@a(ddu)@a(sdddd)u&s)", &trace, &keys, &max, &language);
+    g_assert_cmpuint (g_variant_n_children (trace), ==, 3);
+    g_assert_cmpuint (g_variant_n_children (keys), ==, 26);
+    word = "swipe";
+  } else {
+    g_assert_cmpstr (method, ==, "Complete");
+    g_variant_get (parameters, "(&su&s)", &word, &max, &language);
+  }
   g_assert_cmpstr (language, ==, "en_US");
   g_assert_cmpuint (max, ==, 6);
 
@@ -480,6 +502,137 @@ test_input_limit (Fixture *fixture, gconstpointer unused)
 
 
 static void
+request_swipe (Fixture *fixture)
+{
+  GVariantBuilder trace, keys;
+  g_autoptr (GVariant) points = NULL;
+  g_autoptr (GVariant) geometry = NULL;
+
+  g_variant_builder_init (&trace, G_VARIANT_TYPE ("a(ddu)"));
+  g_variant_builder_add (&trace, "(ddu)", 10.0, 20.0, 0u);
+  g_variant_builder_add (&trace, "(ddu)", 80.0, 40.0, 70u);
+  g_variant_builder_add (&trace, "(ddu)", 120.0, 20.0, 140u);
+  g_variant_builder_init (&keys, G_VARIANT_TYPE ("a(sdddd)"));
+  for (char c = 'a'; c <= 'z'; c++) {
+    char label[] = {c, 0};
+    g_variant_builder_add (&keys, "(sdddd)", label,
+                           (double) ((c - 'a') % 10 * 30),
+                           (double) ((c - 'a') / 10 * 50), 30.0, 50.0);
+  }
+  points = g_variant_ref_sink (g_variant_builder_end (&trace));
+  geometry = g_variant_ref_sink (g_variant_builder_end (&keys));
+  pos_completer_verbisage_recognize_swipe (POS_COMPLETER_VERBISAGE (fixture->completer),
+                                         points, geometry);
+}
+
+
+static void
+test_swipe_results (Fixture *fixture, gconstpointer unused)
+{
+  g_auto (GStrv) words = NULL;
+
+  request_swipe (fixture);
+  wait_completion (fixture->completer, "hello");
+  words = pos_completer_get_completions (fixture->completer);
+  g_assert_cmpstr (words[0], ==, "hello");
+  g_assert_cmpstr (words[1], ==, "help");
+  g_assert_cmpstr (words[5], ==, "work");
+  g_assert_cmpuint (g_strv_length (words), ==, 6);
+  g_assert_cmpuint (fixture->swipe_requests, ==, 1);
+  g_assert_cmpuint (fixture->requests, ==, 1);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_null (fixture->committed);
+  /* A space never accepts the first decoded candidate implicitly. */
+  pos_completer_feed_symbol (fixture->completer, " ");
+  g_assert_cmpstr (fixture->committed, ==, " ");
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+}
+
+
+static void
+test_swipe_stale (Fixture *fixture, gconstpointer unused)
+{
+  fixture->hold_word = "swipe";
+  request_swipe (fixture);
+  wait_held (fixture);
+  pos_completer_feed_symbol (fixture->completer, "w");
+  release_held (fixture);
+  wait_completion (fixture->completer, "wword");
+  g_assert_false (has_completion (fixture->completer, "hello"));
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "w");
+  g_assert_null (fixture->committed);
+}
+
+
+static void
+test_swipe_cancel (Fixture *fixture, gconstpointer unused)
+{
+  fixture->hold_word = "swipe";
+  request_swipe (fixture);
+  wait_held (fixture);
+  pos_completer_verbisage_cancel_swipe (POS_COMPLETER_VERBISAGE (fixture->completer));
+  release_held (fixture);
+  spin (50);
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+  g_assert_null (fixture->committed);
+}
+
+
+static void
+test_swipe_context (Fixture *fixture, gconstpointer unused)
+{
+  pos_completer_set_surrounding_text (fixture->completer, "one ", "");
+  fixture->hold_word = "swipe";
+  request_swipe (fixture);
+  wait_held (fixture);
+  /* Repeated context notification preserves an otherwise valid reply. */
+  pos_completer_set_surrounding_text (fixture->completer, "one ", "");
+  release_held (fixture);
+  wait_completion (fixture->completer, "hello");
+  g_ptr_array_set_size (fixture->held, 0);
+  request_swipe (fixture);
+  wait_held (fixture);
+  pos_completer_set_surrounding_text (fixture->completer, "one two ", "");
+  release_held (fixture);
+  spin (50);
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+  g_assert_null (fixture->committed);
+}
+
+
+static void
+test_swipe_error (Fixture *fixture, gconstpointer unused)
+{
+  fixture->fail = fixture->unsupported = TRUE;
+  request_swipe (fixture);
+  spin (100);
+  g_assert_false (has_completion (fixture->completer, "hello"));
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_null (fixture->committed);
+  fixture->fail = FALSE;
+  request_swipe (fixture);
+  wait_completion (fixture->completer, "hello");
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, "KEY_BACKSPACE"));
+  g_assert_null (fixture->committed);
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+}
+
+
+static void
+test_swipe_reset (Fixture *fixture, gconstpointer unused)
+{
+  fixture->hold_word = "swipe";
+  request_swipe (fixture);
+  wait_held (fixture);
+  pos_completer_set_preedit (fixture->completer, NULL);
+  release_held (fixture);
+  spin (50);
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+  g_assert_null (fixture->committed);
+}
+
+
+static void
 test_real_service (void)
 {
   g_autoptr (PosCompleter) completer = pos_completer_verbisage_new (NULL);
@@ -537,6 +690,12 @@ main (int argc, char **argv)
   ADD_TEST ("editing", test_editing);
   ADD_TEST ("dispose-pending", test_dispose_pending);
   ADD_TEST ("input-limit", test_input_limit);
+  ADD_TEST ("swipe-results", test_swipe_results);
+  ADD_TEST ("swipe-stale", test_swipe_stale);
+  ADD_TEST ("swipe-cancel", test_swipe_cancel);
+  ADD_TEST ("swipe-context", test_swipe_context);
+  ADD_TEST ("swipe-error", test_swipe_error);
+  ADD_TEST ("swipe-reset", test_swipe_reset);
 #undef ADD_TEST
   result = g_test_run ();
   g_test_dbus_down (bus);

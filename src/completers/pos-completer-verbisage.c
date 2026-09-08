@@ -37,6 +37,8 @@ struct _PosCompleterVerbisage {
   GString *preedit;
   GStrv completions;
   GStrv ranked;
+  gboolean swipe;
+  GVariant *swipe_parameters;
   char *language;
   GDBusConnection *connection;
   GCancellable *cancellable;
@@ -86,6 +88,8 @@ cancel_lookup (PosCompleterVerbisage *self)
     g_cancellable_cancel (self->cancellable);
   g_clear_object (&self->cancellable);
   g_clear_pointer (&self->ranked, g_strfreev);
+  g_clear_pointer (&self->swipe_parameters, g_variant_unref);
+  self->swipe = FALSE;
 }
 
 
@@ -140,9 +144,10 @@ publish_completions (PosCompleterVerbisage *self)
   /* Literal input stays first and is committed unchanged by Space or Enter.
    * The service ranks completion and correction together; preserve that order
    * instead of giving either source a quota that can hide a useful result. */
-  if (self->preedit->len) {
-    g_ptr_array_add (words, g_strdup (self->preedit->str));
-    ranked = capitalize_ranked (self);
+  if (self->preedit->len || self->swipe) {
+    if (!self->swipe)
+      g_ptr_array_add (words, g_strdup (self->preedit->str));
+    ranked = self->swipe ? g_strdupv (self->ranked) : capitalize_ranked (self);
     for (guint i = 0; ranked && ranked[i]; i++)
       append_unique (words, ranked[i]);
     g_ptr_array_add (words, NULL);
@@ -200,6 +205,14 @@ static void
 start_lookup (PosCompleterVerbisage *self)
 {
   g_autofree char *word = g_utf8_strdown (self->preedit->str, -1);
+
+  if (self->swipe) {
+    g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "RecognizeSwipe",
+                             self->swipe_parameters, G_VARIANT_TYPE ("(a(sd))"),
+                             G_DBUS_CALL_FLAGS_NONE, LOOKUP_TIMEOUT_MS, self->cancellable,
+                             on_lookup_finished, lookup_new (self));
+    return;
+  }
 
   /* One ranked reply prevents the candidate bar changing order as separate
    * prefix and spelling calls finish. Older daemons fail safely to literal. */
@@ -287,6 +300,13 @@ pos_completer_verbisage_feed_symbol (PosCompleter *iface, const char *symbol)
   PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (iface);
   g_autofree char *previous = g_strdup (self->preedit->str);
 
+  if (self->swipe) {
+    pos_completer_verbisage_cancel_swipe (self);
+    /* Backspace dismisses an uncommitted gesture without deleting app text. */
+    if (g_str_equal (symbol, "KEY_BACKSPACE"))
+      return TRUE;
+  }
+
   if (pos_completer_add_preedit (iface, self->preedit, symbol)) {
     PosCompleterBase *base = POS_COMPLETER_BASE (self);
     int before = 0;
@@ -313,7 +333,12 @@ pos_completer_verbisage_set_surrounding_text (PosCompleter *iface,
                                              const char *before,
                                              const char *after)
 {
-  pos_completer_base_set_surrounding_text (POS_COMPLETER_BASE (iface), before, after);
+  PosCompleterBase *base = POS_COMPLETER_BASE (iface);
+
+  if (g_strcmp0 (pos_completer_base_get_before_text (base), before) ||
+      g_strcmp0 (pos_completer_base_get_after_text (base), after))
+    pos_completer_verbisage_cancel_swipe (POS_COMPLETER_VERBISAGE (iface));
+  pos_completer_base_set_surrounding_text (base, before, after);
 }
 
 
@@ -454,4 +479,42 @@ pos_completer_verbisage_new (GError **error)
 {
   /* Connecting and activating the daemon is deferred until actual input. */
   return g_object_new (POS_TYPE_COMPLETER_VERBISAGE, NULL);
+}
+
+
+/* Gesture candidates are deliberately not preedit: only an explicit candidate
+ * selection can commit them. Ordinary typing/reset cancels their generation. */
+void
+pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
+                                        GVariant *trace,
+                                        GVariant *keys)
+{
+  g_return_if_fail (POS_IS_COMPLETER_VERBISAGE (self));
+  g_return_if_fail (g_variant_is_of_type (trace, G_VARIANT_TYPE ("a(ddu)")));
+  g_return_if_fail (g_variant_is_of_type (keys, G_VARIANT_TYPE ("a(sdddd)")));
+
+  if (self->preedit->len || !self->language ||
+      g_variant_n_children (trace) < 2 || g_variant_n_children (trace) > 512 ||
+      g_variant_n_children (keys) == 0 || g_variant_n_children (keys) > 64)
+    return;
+
+  cancel_lookup (self);
+  self->swipe = TRUE;
+  self->swipe_parameters = g_variant_ref_sink (
+    g_variant_new ("(@a(ddu)@a(sdddd)us)", g_variant_ref (trace), g_variant_ref (keys),
+                     (guint) MAX_RESULTS, self->language));
+  publish_completions (self);
+  lookup_timeout (self);
+}
+
+
+void
+pos_completer_verbisage_cancel_swipe (PosCompleterVerbisage *self)
+{
+  g_return_if_fail (POS_IS_COMPLETER_VERBISAGE (self));
+
+  if (!self->swipe)
+    return;
+  cancel_lookup (self);
+  publish_completions (self);
 }

@@ -11,4 +11,10 @@ G_DECLARE_FINAL_TYPE (PosCompleterVerbisage, pos_completer_verbisage, POS, COMPL
 
 PosCompleter *pos_completer_verbisage_new (GError **error);
 
+
+void pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
+                                             GVariant *trace,
+                                             GVariant *keys);
+void pos_completer_verbisage_cancel_swipe (PosCompleterVerbisage *self);
+
 G_END_DECLS

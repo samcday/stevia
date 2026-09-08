@@ -161,6 +161,7 @@ struct _PosInputSurface {
 
   /* Swipe gesture */
   GtkGesture                 *swipe_down;
+  gboolean                    swipe_typing;
 
   /* emission hook for clicks */
   gulong                      clicked_id;
@@ -176,6 +177,7 @@ struct _PosInputSurface {
 
 static void pos_input_surface_submit_symbol (PosInputSurface *self, const char *symbol);
 static void select_layout_by_im_purpose (PosInputSurface *self);
+static void update_swipe_enabled (PosInputSurface *self);
 
 static void pos_input_surface_action_group_iface_init (GActionGroupInterface *iface);
 static void pos_input_surface_action_map_iface_init (GActionMapInterface *iface);
@@ -331,8 +333,13 @@ static void
 on_swipe (GtkGestureSwipe *swipe, double velocity_x, double velocity_y, gpointer data)
 {
   PosInputSurface *self = POS_INPUT_SURFACE (data);
+  GtkWidget *child = hdy_deck_get_visible_child (self->deck);
 
   g_return_if_fail (GTK_IS_GESTURE_SWIPE (swipe));
+
+  if (POS_IS_OSK_WIDGET (child) &&
+      pos_osk_widget_swipe_in_progress (POS_OSK_WIDGET (child)))
+    return;
 
   g_debug ("swipe with v_x: %f, v_y: %f", velocity_x, velocity_y);
 
@@ -432,6 +439,108 @@ pos_input_surface_is_completion_mode (PosInputSurface *self)
 }
 
 
+static gboolean
+swipe_at_word_boundary (const char *text, guint anchor, guint cursor)
+{
+  const char *previous;
+
+  if (anchor != cursor)
+    return FALSE;
+  if (!text)
+    return cursor == 0;
+  if (!g_utf8_validate (text, -1, NULL) || cursor > strlen (text) ||
+      !g_utf8_validate (text, cursor, NULL))
+    return FALSE;
+  previous = g_utf8_find_prev_char (text, text + cursor);
+  return (!previous || g_unichar_isspace (g_utf8_get_char (previous))) &&
+         (!text[cursor] || g_unichar_isspace (g_utf8_get_char (text + cursor)));
+}
+
+
+static gboolean
+swipe_purpose_supported (PosInputMethodPurpose purpose, guint hints)
+{
+  /* input-method-v2 carries text-input-v3 wire flags. The existing
+   * PosInputMethodHint enum is sequential, so use the protocol masks here. */
+  const guint private_hints = 0x40 | 0x80; /* hidden_text | sensitive_data */
+
+  return purpose == POS_INPUT_METHOD_PURPOSE_NORMAL && !(hints & private_hints);
+}
+
+
+static gboolean
+swipe_layout_supported (PosOskWidget *osk)
+{
+  return g_strcmp0 (pos_osk_widget_get_lang (osk), "en") == 0 &&
+         g_strcmp0 (pos_osk_widget_get_region (osk), "us") == 0 &&
+         pos_osk_widget_get_layer (osk) == POS_OSK_WIDGET_LAYER_NORMAL;
+}
+
+
+/* The first prototype only inserts an entire new word. In particular it must
+ * not replace a selection or append a decoded word inside surrounding text. */
+static gboolean
+swipe_eligible (PosInputSurface *self, GtkWidget *widget)
+{
+  const char *text, *preedit;
+  guint anchor, cursor;
+
+  if (!self->swipe_typing || !self->surface_visible || !self->input_method ||
+      !POS_IS_COMPLETER_VERBISAGE (self->completer) ||
+      !POS_INPUT_SURFACE_IS_LANG_LAYOUT (widget) ||
+      widget != hdy_deck_get_visible_child (self->deck) ||
+      !pos_input_surface_is_completion_mode (self) ||
+      !swipe_purpose_supported (pos_input_method_get_purpose (self->input_method),
+                                pos_input_method_get_hint (self->input_method)) ||
+      !swipe_layout_supported (POS_OSK_WIDGET (widget)))
+    return FALSE;
+
+  preedit = pos_completer_get_preedit (self->completer);
+  if (!gm_str_is_null_or_empty (preedit))
+    return FALSE;
+
+  text = pos_input_method_get_surrounding_text (self->input_method, &anchor, &cursor);
+  return swipe_at_word_boundary (text, anchor, cursor);
+}
+
+
+static void
+update_swipe_enabled (PosInputSurface *self)
+{
+  if (!self->osks)
+    return;
+  for (guint i = 0; i < self->osks->len; i++) {
+    GtkWidget *osk = g_ptr_array_index (self->osks, i);
+    pos_osk_widget_set_swipe_enabled (POS_OSK_WIDGET (osk), swipe_eligible (self, osk));
+  }
+}
+
+
+static void
+on_osk_swipe_cancelled (PosInputSurface *self)
+{
+  if (POS_IS_COMPLETER_VERBISAGE (self->completer))
+    pos_completer_verbisage_cancel_swipe (POS_COMPLETER_VERBISAGE (self->completer));
+}
+
+
+static void
+on_osk_swipe (PosInputSurface *self, GVariant *trace, GVariant *keys, GtkWidget *osk)
+{
+  if (swipe_eligible (self, osk))
+    pos_completer_verbisage_recognize_swipe (POS_COMPLETER_VERBISAGE (self->completer),
+                                           trace, keys);
+}
+
+
+static void
+on_swipe_typing_changed (PosInputSurface *self)
+{
+  self->swipe_typing = g_settings_get_boolean (self->osk_settings, "swipe-typing");
+  update_swipe_enabled (self);
+}
+
+
 static void
 on_completion_selected (PosInputSurface *self, const char *completion)
 {
@@ -474,6 +583,8 @@ on_completer_preedit_changed (PosInputSurface *self)
 {
   const char *preedit = NULL;
   int pos;
+
+  update_swipe_enabled (self);
 
   /* Only update preedit when in cursor mode as this updates preedit too */
   if (pos_input_surface_is_completion_mode (self) == FALSE)
@@ -670,6 +781,8 @@ on_osk_mode_changed (PosInputSurface *self, GParamSpec *pspec, GtkWidget *osk_wi
 {
   g_return_if_fail (POS_IS_INPUT_SURFACE (self));
   g_return_if_fail (POS_IS_OSK_WIDGET (osk_widget));
+
+  update_swipe_enabled (self);
 
   /* We only want to clear preedit when entering cursor mode */
   if (pos_input_surface_is_completion_mode (self) == TRUE)
@@ -1033,6 +1146,7 @@ on_visible_child_changed (PosInputSurface *self)
   child = hdy_deck_get_visible_child (self->deck);
 
   pos_input_surface_toggle_shortcuts_bar (self);
+  update_swipe_enabled (self);
 
   if (!POS_IS_OSK_WIDGET (child))
     return;
@@ -1491,6 +1605,7 @@ on_im_purpose_changed (PosInputSurface *self, GParamSpec *pspec, PosInputMethod 
   g_assert (self->input_method == im);
 
   select_layout_by_im_purpose (self);
+  update_swipe_enabled (self);
 }
 
 
@@ -1516,6 +1631,7 @@ on_im_hint_changed (PosInputSurface *self, GParamSpec *pspec, PosInputMethod *im
   g_assert (POS_IS_INPUT_SURFACE (self));
   g_assert (POS_IS_INPUT_METHOD (im));
 
+  update_swipe_enabled (self);
   g_debug ("Hint changed: 0x%.2x", pos_input_method_get_hint (im));
   if ((self->completion_mode & PHOSH_OSK_COMPLETION_MODE_HINT) == 0)
     return;
@@ -1537,6 +1653,13 @@ on_im_surrounding_text_changed (PosInputSurface *self, GParamSpec *pspec, PosInp
   g_assert (POS_IS_INPUT_METHOD (im));
 
   text = pos_input_method_get_surrounding_text (im, &anchor, &cursor);
+  /* PosInputMethod only notifies when text, cursor or anchor actually changes.
+   * Moving between two otherwise eligible insertion points still invalidates
+   * both the gesture in progress and any pending recognition result. */
+  for (guint i = 0; i < self->osks->len; i++)
+    pos_osk_widget_cancel_swipe (g_ptr_array_index (self->osks, i));
+  on_osk_swipe_cancelled (self);
+  update_swipe_enabled (self);
 
   if (!pos_input_surface_is_completion_mode (self))
     return;
@@ -2055,6 +2178,9 @@ insert_osk (PosInputSurface   *self,
   g_debug ("Adding osk for layout '%s'", name);
   gtk_widget_set_visible (GTK_WIDGET (osk_widget), TRUE);
   g_object_connect (osk_widget,
+                    "swapped-signal::swipe", G_CALLBACK (on_osk_swipe), self,
+                    "swapped-signal::swipe-cancelled", G_CALLBACK (on_osk_swipe_cancelled), self,
+                    "swapped-signal::notify::layer", G_CALLBACK (update_swipe_enabled), self,
                     "swapped-signal::key-cancelled", G_CALLBACK (on_osk_key_cancelled), self,
                     "swapped-signal::key-down", G_CALLBACK (on_osk_key_down), self,
                     "swapped-signal::key-symbol", G_CALLBACK (on_osk_key_symbol), self,
@@ -2324,6 +2450,13 @@ pos_input_surface_init (PosInputSurface *self)
                             G_CALLBACK (on_completion_mode_changed),
                             self);
   on_completion_mode_changed (self, NULL, self->osk_settings);
+  g_signal_connect_swapped (self->osk_settings, "changed::swipe-typing",
+                            G_CALLBACK (on_swipe_typing_changed), self);
+  g_signal_connect_swapped (self, "notify::completer-active",
+                            G_CALLBACK (update_swipe_enabled), self);
+  g_signal_connect_swapped (self, "notify::surface-visible",
+                            G_CALLBACK (update_swipe_enabled), self);
+  on_swipe_typing_changed (self);
   g_settings_bind (self->osk_settings, "osk-features", self, "osk-features", G_SETTINGS_BIND_GET);
 
   if (!pos_osk_widget_set_layout (POS_OSK_WIDGET (self->osk_terminal),

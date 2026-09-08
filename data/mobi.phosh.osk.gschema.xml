@@ -1,6 +1,15 @@
 <schemalist>
   <schema id="mobi.phosh.osk"
           path="/mobi/phosh/osk/">
+    <key name="swipe-typing" type="b">
+      <default>false</default>
+      <summary>Experimental English swipe typing</summary>
+      <description>
+        Enable single-finger whole-word gestures on the English (US) alphabet
+        layout with Verbisage. A fading trail follows the pointer and candidates
+        are offered on release. Selecting a candidate commits the word.
+      </description>
+    </key>
     <key name="completion-mode" flags="mobi.phosh.osk.PhoshOskCompletionModeFlags">
       <default>['hint']</default>
       <summary>When to enable the on screen keyboard's text completion</summary>

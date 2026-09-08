@@ -6,7 +6,11 @@ Verbisage completion backend. The upstream project remains
 [World/Phosh/stevia on GNOME GitLab](https://gitlab.gnome.org/World/Phosh/stevia).
 This GitHub repository is a downstream import, not an upstream merge request.
 
-Two implementation commits correspond to the tested PocketFed
+The published `codex/pocketfed` baseline is unchanged. The separate
+`codex/swipe-prototype` branch additionally implements an opt-in gesture path;
+see [SWIPE-PROTOTYPE.md](SWIPE-PROTOTYPE.md) for its scope and validation.
+
+Two baseline implementation commits correspond to the tested PocketFed
 `stevia-0.57.0-1.2.pocketfed` RPM patches:
 
 1. Add the asynchronous Verbisage adapter, completer metadata, lifecycle hooks
@@ -14,7 +18,7 @@ Two implementation commits correspond to the tested PocketFed
 2. Request one ranked current-word response, preserve capitalization and the
    six-candidate limit, and expand ordering/error regression coverage.
 
-The implementation files are byte-for-byte equivalent to upstream's 0.57.0
+At the `codex/pocketfed` baseline, the implementation files are byte-for-byte equivalent to upstream's 0.57.0
 archive with those two patches applied. This document is the only additional
 file. The archive SHA-256 is
 `72dfbedf5ac7e341639cd9628173baffea84559f40a6453f504eb0f91cdf39ff`.
@@ -22,7 +26,7 @@ file. The archive SHA-256 is
 ## Behavior and protocol
 
 The backend supports English (US) current-word completion and explicitly
-selected spelling corrections. It does not enable swipe typing, next-word
+selected spelling corrections. The baseline does not enable swipe typing, next-word
 prediction, learning or automatic correction on Space/Enter. The literal
 spelling stays first; at most five additional unique suggestions follow in
 service-provided order. Title case and all caps are preserved.

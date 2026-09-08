@@ -36,6 +36,9 @@
 #define MINIMUM_WIDTH 360
 
 #define EVENT_HISTORY_THRESHOLD_MS 150
+#define SWIPE_MAX_POINTS 512
+#define SWIPE_MAX_DURATION_MS 10000
+#define SWIPE_TRAIL_DURATION_US (1500 * G_TIME_SPAN_MILLISECOND)
 
 enum {
   OSK_KEY_DOWN,
@@ -44,6 +47,8 @@ enum {
   OSK_KEY_SYMBOL,
   OSK_POPOVER_SHOWN,
   OSK_POPOVER_HIDDEN,
+  OSK_SWIPE,
+  OSK_SWIPE_CANCELLED,
   N_SIGNALS
 };
 static guint signals[N_SIGNALS];
@@ -119,6 +124,13 @@ typedef struct {
   double                    width;
 } PosOskWidgetLayout;
 
+typedef struct {
+  double x, y;
+  guint32 millis;
+  gint64 drawn_at;
+} SwipePoint;
+
+
 /**
  * PosOskWidget:
  * @name: The name of the layout, e.g. `de`, `us`, `de+ch`
@@ -164,6 +176,17 @@ struct _PosOskWidget {
   GArray              *event_history;
   cursor_drag_t        drag_type;
 
+  /* Single-contact whole-word gesture. Points and key boxes use widget units. */
+  gboolean swipe_enabled;
+  gboolean swipe_pending;
+  gboolean swiping;
+  gboolean swipe_blocked;
+  guint32 swipe_start_time;
+  GArray *swipe_points;
+  GVariant *swipe_keys;
+  GHashTable *touches;
+  guint trail_tick;
+
   /* Key scaling */
   GtkCssProvider      *css_provider;
   int key_scale;
@@ -174,6 +197,12 @@ typedef struct {
   double delta_x, delta_y;
   guint32 time;
 } EventHistoryRecord;
+
+
+static void swipe_begin (PosOskWidget *self, double x, double y, guint32 time);
+static gboolean swipe_update (PosOskWidget *self, double x, double y, guint32 time);
+static gboolean swipe_finish (PosOskWidget *self, double x, double y, guint32 time);
+static void pos_osk_widget_cancel_press (PosOskWidget *self);
 
 
 static void
@@ -1032,7 +1061,15 @@ pos_osk_widget_button_press_event (GtkWidget *widget, GdkEventButton *event)
   if (event->type != GDK_BUTTON_PRESS)
     return GDK_EVENT_PROPAGATE;
 
+  if (event->button != 1) {
+    if (pos_osk_widget_swipe_in_progress (self))
+      pos_osk_widget_cancel_swipe (self);
+    return GDK_EVENT_PROPAGATE;
+  }
+  if (self->swipe_blocked)
+    return GDK_EVENT_STOP;
   pos_osk_widget_key_press (self, event->x, event->y);
+  swipe_begin (self, event->x, event->y, event->time);
 
   return GDK_EVENT_STOP;
 }
@@ -1104,6 +1141,13 @@ pos_osk_widget_button_release_event (GtkWidget *widget, GdkEventButton *event)
   g_debug ("Button release: %f, %f, button: %d, state: %d",
            event->x, event->y, event->button, event->state);
 
+  if (event->button == 1) {
+    gboolean handled = self->swipe_blocked || swipe_finish (self, event->x, event->y, event->time);
+    self->swipe_blocked = FALSE;
+    if (handled)
+      return GDK_EVENT_STOP;
+  }
+
   key_repeat_cancel (self);
   pos_osk_widget_set_mode (self, POS_OSK_WIDGET_MODE_KEYBOARD);
 
@@ -1139,6 +1183,207 @@ pos_osk_widget_cancel_press (PosOskWidget *self)
 }
 
 
+static double
+swipe_opacity (const SwipePoint *point, gint64 now)
+{
+  return CLAMP (1.0 - (double) (now - point->drawn_at) / SWIPE_TRAIL_DURATION_US, 0.0, 1.0);
+}
+
+
+static gboolean
+swipe_trail_alive (PosOskWidget *self, gint64 now)
+{
+  if (self->swipe_points->len == 0)
+    return FALSE;
+  return swipe_opacity (&g_array_index (self->swipe_points, SwipePoint,
+                                        self->swipe_points->len - 1), now) > 0.0;
+}
+
+
+static gboolean
+swipe_tick (GtkWidget *widget, GdkFrameClock *clock, gpointer unused)
+{
+  PosOskWidget *self = POS_OSK_WIDGET (widget);
+
+  gtk_widget_queue_draw (widget);
+  if (self->swiping || swipe_trail_alive (self, g_get_monotonic_time ()))
+    return G_SOURCE_CONTINUE;
+
+  self->trail_tick = 0;
+  g_array_set_size (self->swipe_points, 0);
+  return G_SOURCE_REMOVE;
+}
+
+
+static void
+swipe_clear (PosOskWidget *self)
+{
+  self->swipe_pending = self->swiping = FALSE;
+  if (self->trail_tick) {
+    gtk_widget_remove_tick_callback (GTK_WIDGET (self), self->trail_tick);
+    self->trail_tick = 0;
+  }
+  g_array_set_size (self->swipe_points, 0);
+  g_clear_pointer (&self->swipe_keys, g_variant_unref);
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+}
+
+
+void
+pos_osk_widget_cancel_swipe (PosOskWidget *self)
+{
+  g_return_if_fail (POS_IS_OSK_WIDGET (self));
+
+  if (self->swipe_pending || self->swiping) {
+    pos_osk_widget_cancel_press (self);
+    self->swipe_blocked = TRUE;
+  }
+  swipe_clear (self);
+  /* This only cancels gesture results, never ordinary text composition. */
+  g_signal_emit (self, signals[OSK_SWIPE_CANCELLED], 0);
+}
+
+
+void
+pos_osk_widget_set_swipe_enabled (PosOskWidget *self, gboolean enabled)
+{
+  g_return_if_fail (POS_IS_OSK_WIDGET (self));
+
+  if (self->swipe_enabled == enabled)
+    return;
+  self->swipe_enabled = enabled;
+  if (!enabled)
+    pos_osk_widget_cancel_swipe (self);
+}
+
+
+gboolean
+pos_osk_widget_swipe_in_progress (PosOskWidget *self)
+{
+  g_return_val_if_fail (POS_IS_OSK_WIDGET (self), FALSE);
+  return self->swipe_pending || self->swiping || self->swipe_blocked;
+}
+
+
+static GVariant *
+swipe_layout (PosOskWidget *self)
+{
+  GVariantBuilder keys;
+  PosOskWidgetKeyboardLayer *layer = pos_osk_widget_get_current_layer (self);
+  guint count = 0;
+
+  g_variant_builder_init (&keys, G_VARIANT_TYPE ("a(sdddd)"));
+  for (guint r = 0; r < layer->n_rows; r++) {
+    PosOskWidgetRow *row = pos_osk_widget_get_row (self, r);
+    for (guint k = 0; k < row->keys->len; k++) {
+      PosOskKey *key = pos_osk_widget_row_get_key (row, k);
+      const char *symbol = pos_osk_key_get_symbol (key);
+      const GdkRectangle *box = pos_osk_key_get_box (key);
+
+      if (!symbol || strlen (symbol) != 1 || symbol[0] < 'a' || symbol[0] > 'z')
+        continue;
+      if (box->width <= 0 || box->height <= 0)
+        continue;
+      g_variant_builder_add (&keys, "(sdddd)", symbol,
+                               (double) box->x + layer->offset_x, (double) box->y,
+                               (double) box->width, (double) box->height);
+      count++;
+    }
+  }
+  if (count != 26) {
+    g_variant_builder_clear (&keys);
+    return NULL;
+  }
+  return g_variant_ref_sink (g_variant_builder_end (&keys));
+}
+
+
+static void
+swipe_begin (PosOskWidget *self, double x, double y, guint32 time)
+{
+  const char *symbol = self->current ? pos_osk_key_get_symbol (self->current) : NULL;
+  SwipePoint point = {x, y, 0, g_get_monotonic_time ()};
+
+  if (!self->swipe_enabled || self->swipe_blocked ||
+      self->mode != POS_OSK_WIDGET_MODE_KEYBOARD || self->layer != POS_OSK_WIDGET_LAYER_NORMAL ||
+      !symbol || strlen (symbol) != 1 || symbol[0] < 'a' || symbol[0] > 'z' ||
+      !isfinite (x) || !isfinite (y))
+    return;
+
+  swipe_clear (self);
+  self->swipe_keys = swipe_layout (self);
+  if (!self->swipe_keys)
+    return;
+  self->swipe_start_time = time;
+  self->swipe_pending = TRUE;
+  g_array_append_val (self->swipe_points, point);
+  /* A new possible gesture invalidates a previous outstanding recognition. */
+  g_signal_emit (self, signals[OSK_SWIPE_CANCELLED], 0);
+}
+
+
+static gboolean
+swipe_update (PosOskWidget *self, double x, double y, guint32 time)
+{
+  SwipePoint point = {x, y, time - self->swipe_start_time, g_get_monotonic_time ()};
+  SwipePoint *first, *last;
+  double threshold;
+
+  if (!self->swipe_pending && !self->swiping)
+    return FALSE;
+  last = &g_array_index (self->swipe_points, SwipePoint, self->swipe_points->len - 1);
+  if (!isfinite (x) || !isfinite (y) || x < 0 || y < 0 ||
+      x > self->width || y > self->height || point.millis > SWIPE_MAX_DURATION_MS ||
+      point.millis < last->millis || self->swipe_points->len >= SWIPE_MAX_POINTS) {
+    pos_osk_widget_cancel_swipe (self);
+    return TRUE;
+  }
+  /* Drop stationary updates; retain event timestamps for the decoder. */
+  if (hypot (x - last->x, y - last->y) >= 1.0)
+    g_array_append_val (self->swipe_points, point);
+
+  first = &g_array_index (self->swipe_points, SwipePoint, 0);
+  threshold = MAX (12.0, pos_osk_widget_get_current_layer (self)->key_width * 0.35);
+  if (!self->swiping && hypot (x - first->x, y - first->y) >= threshold) {
+    self->swipe_pending = FALSE;
+    self->swiping = TRUE;
+    pos_osk_widget_cancel_press (self);
+    gtk_event_controller_reset (GTK_EVENT_CONTROLLER (self->long_press));
+    self->trail_tick = gtk_widget_add_tick_callback (GTK_WIDGET (self), swipe_tick, NULL, NULL);
+  }
+  gtk_widget_queue_draw (GTK_WIDGET (self));
+  return TRUE;
+}
+
+
+static gboolean
+swipe_finish (PosOskWidget *self, double x, double y, guint32 time)
+{
+  GVariantBuilder trace;
+  g_autoptr (GVariant) points = NULL;
+  g_autoptr (GVariant) keys = NULL;
+
+  if (!swipe_update (self, x, y, time))
+    return FALSE;
+  if (self->swipe_blocked)
+    return TRUE;
+  if (!self->swiping) {
+    swipe_clear (self);
+    return FALSE;
+  }
+  self->swiping = FALSE;
+  g_variant_builder_init (&trace, G_VARIANT_TYPE ("a(ddu)"));
+  for (guint i = 0; i < self->swipe_points->len; i++) {
+    const SwipePoint *point = &g_array_index (self->swipe_points, SwipePoint, i);
+    g_variant_builder_add (&trace, "(ddu)", point->x, point->y, point->millis);
+  }
+  points = g_variant_ref_sink (g_variant_builder_end (&trace));
+  keys = g_steal_pointer (&self->swipe_keys);
+  g_signal_emit (self, signals[OSK_SWIPE], 0, points, keys);
+  return TRUE;
+}
+
+
 static gboolean
 pos_osk_widget_touch_event (GtkWidget *widget, GdkEventTouch *event)
 {
@@ -1150,6 +1395,19 @@ pos_osk_widget_touch_event (GtkWidget *widget, GdkEventTouch *event)
            event->y,
            event->type);
 
+  if (event->type == GDK_TOUCH_BEGIN)
+    g_hash_table_add (self->touches, event->sequence);
+  if (event->type == GDK_TOUCH_END || event->type == GDK_TOUCH_CANCEL)
+    g_hash_table_remove (self->touches, event->sequence);
+
+  if (g_hash_table_size (self->touches) > 1 && pos_osk_widget_swipe_in_progress (self))
+    pos_osk_widget_cancel_swipe (self);
+  if (self->swipe_blocked) {
+    if (g_hash_table_size (self->touches) == 0)
+      self->swipe_blocked = FALSE;
+    return GDK_EVENT_STOP;
+  }
+
   if (event->type == GDK_TOUCH_BEGIN) {
     if (self->current) {
       key_repeat_cancel (self);
@@ -1159,11 +1417,25 @@ pos_osk_widget_touch_event (GtkWidget *widget, GdkEventTouch *event)
 
     self->sequence = event->sequence;
     pos_osk_widget_key_press (self, event->x, event->y);
+    if (g_hash_table_size (self->touches) == 1)
+      swipe_begin (self, event->x, event->y, event->time);
     return GDK_EVENT_STOP;
   }
 
   if (event->sequence != self->sequence)
     return GDK_EVENT_PROPAGATE;
+
+  if (event->type == GDK_TOUCH_CANCEL && pos_osk_widget_swipe_in_progress (self)) {
+    pos_osk_widget_cancel_swipe (self);
+    self->swipe_blocked = g_hash_table_size (self->touches) != 0;
+    return GDK_EVENT_STOP;
+  }
+  if (event->type == GDK_TOUCH_END && swipe_finish (self, event->x, event->y, event->time)) {
+    self->swipe_blocked = FALSE;
+    return GDK_EVENT_STOP;
+  }
+  if (event->type == GDK_TOUCH_UPDATE && swipe_update (self, event->x, event->y, event->time))
+    return GDK_EVENT_STOP;
 
   if (event->type == GDK_TOUCH_END || event->type == GDK_TOUCH_CANCEL) {
     if (self->current) {
@@ -1207,6 +1479,8 @@ pos_osk_widget_motion_notify_event (GtkWidget *widget, GdkEventMotion *event)
 
   if ((event->state & GDK_BUTTON1_MASK) == 0)
     return GDK_EVENT_PROPAGATE;
+  if (self->swipe_blocked || swipe_update (self, event->x, event->y, event->time))
+    return GDK_EVENT_STOP;
 
   key = pos_osk_widget_locate_key (self, event->x, event->y);
   if (self->current && key != self->current) {
@@ -1256,6 +1530,10 @@ on_long_pressed (GtkGestureLongPress *gesture, double x, double y, gpointer user
   GStrv symbols = NULL;
   GdkRectangle rect = { 0 };
 
+  if (self->swiping || self->swipe_blocked || key == NULL)
+    return;
+  swipe_clear (self);
+  g_signal_emit (self, signals[OSK_SWIPE_CANCELLED], 0);
   g_debug ("Long press '%s'", pos_osk_key_get_label (key) ?: pos_osk_key_get_symbol (key));
 
   if (g_strcmp0 (pos_osk_key_get_symbol (key), POS_OSK_SYMBOL_SPACE) == 0) {
@@ -1544,6 +1822,8 @@ pos_osk_widget_size_allocate (GtkWidget *widget, GdkRectangle *allocation)
 {
   PosOskWidget *self = POS_OSK_WIDGET (widget);
 
+  if (self->width != allocation->width || self->height != allocation->height)
+    pos_osk_widget_cancel_swipe (self);
   self->width = allocation->width;
   self->height = allocation->height;
 
@@ -1608,7 +1888,49 @@ pos_osk_widget_draw (GtkWidget *widget, cairo_t *cr)
   }
 
   cairo_restore (cr);
+  if (!self->swipe_pending && self->swipe_points->len > 1) {
+    gint64 now = g_get_monotonic_time ();
+
+    cairo_save (cr);
+    cairo_set_line_cap (cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_width (cr, 5.0);
+    for (guint i = 1; i < self->swipe_points->len; i++) {
+      const SwipePoint *a = &g_array_index (self->swipe_points, SwipePoint, i - 1);
+      const SwipePoint *b = &g_array_index (self->swipe_points, SwipePoint, i);
+      double opacity = swipe_opacity (b, now);
+
+      if (opacity <= 0.0)
+        continue;
+      cairo_set_source_rgba (cr, 0.15, 0.75, 1.0, 0.85 * opacity);
+      cairo_move_to (cr, a->x, a->y);
+      cairo_line_to (cr, b->x, b->y);
+      cairo_stroke (cr);
+    }
+    cairo_restore (cr);
+  }
   return FALSE;
+}
+
+
+static void
+pos_osk_widget_dispose (GObject *object)
+{
+  PosOskWidget *self = POS_OSK_WIDGET (object);
+
+  pos_osk_widget_cancel_swipe (self);
+  G_OBJECT_CLASS (pos_osk_widget_parent_class)->dispose (object);
+}
+
+
+static void
+pos_osk_widget_unmap (GtkWidget *widget)
+{
+  PosOskWidget *self = POS_OSK_WIDGET (widget);
+
+  pos_osk_widget_cancel_swipe (self);
+  g_hash_table_remove_all (self->touches);
+  self->swipe_blocked = FALSE;
+  GTK_WIDGET_CLASS (pos_osk_widget_parent_class)->unmap (widget);
 }
 
 
@@ -1627,6 +1949,8 @@ pos_osk_widget_finalize (GObject *object)
   g_clear_pointer (&self->layout_id, g_free);
   g_ptr_array_free (self->symbols, TRUE);
   g_clear_pointer (&self->event_history, g_array_unref);
+  g_clear_pointer (&self->swipe_points, g_array_unref);
+  g_clear_pointer (&self->touches, g_hash_table_unref);
 
   G_OBJECT_CLASS (pos_osk_widget_parent_class)->finalize (object);
 }
@@ -1660,9 +1984,11 @@ pos_osk_widget_class_init (PosOskWidgetClass *klass)
 
   object_class->get_property = pos_osk_widget_get_property;
   object_class->set_property = pos_osk_widget_set_property;
+  object_class->dispose = pos_osk_widget_dispose;
   object_class->finalize = pos_osk_widget_finalize;
 
   widget_class->draw = pos_osk_widget_draw;
+  widget_class->unmap = pos_osk_widget_unmap;
   widget_class->size_allocate = pos_osk_widget_size_allocate;
   widget_class->button_press_event = pos_osk_widget_button_press_event;
   widget_class->button_release_event = pos_osk_widget_button_release_event;
@@ -1670,6 +1996,13 @@ pos_osk_widget_class_init (PosOskWidgetClass *klass)
   widget_class->touch_event = pos_osk_widget_touch_event;
   widget_class->get_preferred_height = pos_osk_widget_get_preferred_height;
   widget_class->get_preferred_width = pos_osk_widget_get_preferred_width;
+
+  signals[OSK_SWIPE] = g_signal_new ("swipe", G_TYPE_FROM_CLASS (klass),
+                                     G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
+                                     G_TYPE_NONE, 2, G_TYPE_VARIANT, G_TYPE_VARIANT);
+  signals[OSK_SWIPE_CANCELLED] = g_signal_new ("swipe-cancelled", G_TYPE_FROM_CLASS (klass),
+                                               G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
+                                               G_TYPE_NONE, 0);
 
   /**
    * PosOskWidget:features
@@ -1829,6 +2162,8 @@ pos_osk_widget_init (PosOskWidget *self)
   GtkStyleContext *key_context;
   GtkStyleContext *context;
 
+  self->swipe_points = g_array_new (FALSE, FALSE, sizeof (SwipePoint));
+  self->touches = g_hash_table_new (g_direct_hash, g_direct_equal);
   self->key_scale = 100; /* percent */
   self->mode = POS_OSK_WIDGET_MODE_KEYBOARD;
   self->layer = POS_OSK_WIDGET_LAYER_NORMAL;
@@ -1910,6 +2245,7 @@ pos_osk_widget_set_layer (PosOskWidget *self, PosOskWidgetLayer layer)
   if (layer == self->layer)
     return;
 
+  pos_osk_widget_cancel_swipe (self);
   self->layer = layer;
 
   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_LAYER]);
@@ -2000,6 +2336,8 @@ pos_osk_widget_set_layout (PosOskWidget *self,
   if (g_strcmp0 (self->name, name) == 0)
     return TRUE;
 
+  pos_osk_widget_cancel_swipe (self);
+
   if (self->layout.name)
     pos_osk_widget_layout_free (&self->layout);
   g_free (self->name);
@@ -2068,6 +2406,7 @@ pos_osk_widget_set_mode (PosOskWidget *self, PosOskWidgetMode mode)
   if (self->mode == mode)
     return;
 
+  pos_osk_widget_cancel_swipe (self);
   g_debug ("Switching to mode: %d", mode);
   self->mode = mode;
 
