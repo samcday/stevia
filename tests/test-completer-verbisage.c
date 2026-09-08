@@ -10,14 +10,9 @@
 
 static const char service_xml[] =
   "<node><interface name='org.verbisage.Dictionary1'>"
-  "<method name='QueryLimited'>"
-  "<arg type='as' direction='in'/><arg type='as' direction='in'/>"
-  "<arg type='u' direction='in'/><arg type='u' direction='in'/>"
-  "<arg type='s' direction='in'/><arg type='u' direction='in'/>"
-  "<arg type='a(sd)' direction='out'/></method>"
-  "<method name='Suggest'><arg type='s' direction='in'/>"
+  "<method name='Complete'><arg type='s' direction='in'/>"
   "<arg type='u' direction='in'/><arg type='s' direction='in'/>"
-  "<arg type='as' direction='out'/></method>"
+  "<arg type='a(sd)' direction='out'/></method>"
   "</interface></node>";
 
 typedef struct {
@@ -27,8 +22,9 @@ typedef struct {
   GPtrArray *held;
   const char *hold_word;
   gboolean fail;
-  guint queries;
-  guint suggestions;
+  guint requests;
+  guint changes;
+  gboolean unsupported;
   char *committed;
   int before;
   int after;
@@ -80,9 +76,9 @@ wait_held (Fixture *fixture)
 {
   gint64 deadline = g_get_monotonic_time () + 3 * G_TIME_SPAN_SECOND;
 
-  while (fixture->held->len != 2 && g_get_monotonic_time () < deadline)
+  while (fixture->held->len != 1 && g_get_monotonic_time () < deadline)
     spin (5);
-  g_assert_cmpuint (fixture->held->len, ==, 2);
+  g_assert_cmpuint (fixture->held->len, ==, 1);
 }
 
 
@@ -90,42 +86,43 @@ static void
 answer (GDBusMethodInvocation *invocation)
 {
   GVariant *parameters = g_dbus_method_invocation_get_parameters (invocation);
-  const char *method = g_dbus_method_invocation_get_method_name (invocation);
   const char *word;
-  g_auto (GStrv) prefixes = NULL;
   g_autofree char *generated = NULL;
+  GVariantBuilder builder;
 
-  if (g_str_equal (method, "Suggest")) {
-    const char *words[] = {NULL, NULL, NULL};
-
-    g_variant_get_child (parameters, 0, "&s", &word);
-    if (g_str_equal (word, "hel")) {
-      words[0] = "help";
-      words[1] = "held";
-    } else if (g_str_equal (word, "teh")) {
-      words[0] = "the";
-    } else if (g_str_equal (word, "wor")) {
-      words[0] = "word";
-    }
-    g_dbus_method_invocation_return_value (invocation, g_variant_new ("(^as)", words));
+  g_variant_get_child (parameters, 0, "&s", &word);
+  g_variant_builder_init (&builder, G_VARIANT_TYPE ("a(sd)"));
+  if (g_str_equal (word, "hel")) {
+    g_variant_builder_add (&builder, "(sd)", "hello", 0.9);
+    g_variant_builder_add (&builder, "(sd)", "help", 0.8);
+    g_variant_builder_add (&builder, "(sd)", "hello", 0.7);
+    g_variant_builder_add (&builder, "(sd)", "held", 0.6);
+  } else if (g_str_equal (word, "helo")) {
+    /* More than the requested limit checks the client bound independently.
+     * This order models one ranked reply, not separate prefix/edit quotas. */
+    const char *ranked[] = {"hello", "held", "help", "hero", "helots", "helot", "helotry", NULL};
+    for (guint i = 0; ranked[i]; i++)
+      g_variant_builder_add (&builder, "(sd)", ranked[i], 1.0 - i * 0.1);
+  } else if (g_str_equal (word, "hello")) {
+    g_variant_builder_add (&builder, "(sd)", "hello", 1.0);
+    g_variant_builder_add (&builder, "(sd)", "hello", 0.9);
+    g_variant_builder_add (&builder, "(sd)", "hellos", 0.8);
+  } else if (g_str_equal (word, "cap")) {
+    g_variant_builder_add (&builder, "(sd)", "capital", 0.9);
+    g_variant_builder_add (&builder, "(sd)", "CAPITAL", 0.8);
+    g_variant_builder_add (&builder, "(sd)", "captain", 0.7);
+  } else if (g_str_equal (word, "known")) {
+    g_variant_builder_add (&builder, "(sd)", "known", 1.0);
+  } else if (g_str_equal (word, "teh")) {
+    g_variant_builder_add (&builder, "(sd)", "the", 0.9);
+  } else if (g_str_equal (word, "wor")) {
+    g_variant_builder_add (&builder, "(sd)", "world", 0.9);
+    g_variant_builder_add (&builder, "(sd)", "word", 0.8);
   } else {
-    GVariantBuilder builder;
-
-    g_variant_get_child (parameters, 0, "^as", &prefixes);
-    word = prefixes[0];
-    g_variant_builder_init (&builder, G_VARIANT_TYPE ("a(sd)"));
-    if (g_str_equal (word, "hel")) {
-      g_variant_builder_add (&builder, "(sd)", "hello", 0.9);
-      g_variant_builder_add (&builder, "(sd)", "help", 0.8);
-      g_variant_builder_add (&builder, "(sd)", "hello", 0.7);
-    } else if (g_str_equal (word, "wor")) {
-      g_variant_builder_add (&builder, "(sd)", "world", 0.9);
-    } else if (!g_str_equal (word, "teh")) {
-      generated = g_strdup_printf ("%sword", word);
-      g_variant_builder_add (&builder, "(sd)", generated, 0.9);
-    }
-    g_dbus_method_invocation_return_value (invocation, g_variant_new ("(a(sd))", &builder));
+    generated = g_strdup_printf ("%sword", word);
+    g_variant_builder_add (&builder, "(sd)", generated, 0.9);
   }
+  g_dbus_method_invocation_return_value (invocation, g_variant_new ("(a(sd))", &builder));
 }
 
 
@@ -138,31 +135,18 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
   const char *language;
   const char *word;
   guint max;
-  g_auto (GStrv) prefixes = NULL;
-  g_auto (GStrv) suffixes = NULL;
 
-  if (g_str_equal (method, "QueryLimited")) {
-    guint min_len, max_len;
-
-    fixture->queries++;
-    g_variant_get (parameters, "(^as^asuu&su)", &prefixes, &suffixes,
-                     &min_len, &max_len, &language, &max);
-    g_assert_cmpuint (g_strv_length (prefixes), ==, 1);
-    g_assert_cmpuint (g_strv_length (suffixes), ==, 0);
-    g_assert_cmpuint (min_len, ==, 0);
-    g_assert_cmpuint (max_len, ==, 0);
-    word = prefixes[0];
-  } else {
-    fixture->suggestions++;
-    g_variant_get (parameters, "(&su&s)", &word, &max, &language);
-  }
+  g_assert_cmpstr (method, ==, "Complete");
+  fixture->requests++;
+  g_variant_get (parameters, "(&su&s)", &word, &max, &language);
   g_assert_cmpstr (language, ==, "en_US");
   g_assert_cmpuint (max, ==, 6);
 
   if (fixture->hold_word && g_str_equal (word, fixture->hold_word))
     g_ptr_array_add (fixture->held, g_object_ref (invocation));
   else if (fixture->fail)
-    g_dbus_method_invocation_return_dbus_error (invocation, "org.freedesktop.DBus.Error.Failed",
+    g_dbus_method_invocation_return_dbus_error (invocation,
+                                               fixture->unsupported ? "org.freedesktop.DBus.Error.UnknownMethod" : "org.freedesktop.DBus.Error.Failed",
                                                "Dictionary unavailable for test");
   else
     answer (invocation);
@@ -180,6 +164,13 @@ on_commit (PosCompleter *completer, const char *text, int before, int after, gpo
   fixture->committed = g_strdup (text);
   fixture->before = before;
   fixture->after = after;
+}
+
+
+static void
+on_completions_changed (PosCompleter *completer, GParamSpec *pspec, Fixture *fixture)
+{
+  fixture->changes++;
 }
 
 
@@ -208,6 +199,7 @@ setup (Fixture *fixture, gconstpointer unused)
   fixture->completer = pos_completer_verbisage_new (&error);
   g_assert_no_error (error);
   g_signal_connect (fixture->completer, "commit-string", G_CALLBACK (on_commit), fixture);
+  g_signal_connect (fixture->completer, "notify::completions", G_CALLBACK (on_completions_changed), fixture);
 }
 
 
@@ -251,9 +243,81 @@ test_completion (Fixture *fixture, gconstpointer unused)
   wait_completion (fixture->completer, "Hello");
   words = pos_completer_get_completions (fixture->completer);
   g_assert_cmpstrv (words, expected);
-  g_assert_cmpuint (fixture->queries, ==, 1);
-  g_assert_cmpuint (fixture->suggestions, ==, 1);
+  g_assert_cmpuint (fixture->requests, ==, 1);
   g_assert_null (fixture->committed);
+}
+
+
+static void
+test_ranked (Fixture *fixture, gconstpointer unused)
+{
+  g_auto (GStrv) words = NULL;
+  const char *expected[] = {"helo", "hello", "held", "help", "hero", "helots", NULL};
+
+  fixture->hold_word = "helo";
+  pos_completer_set_preedit (fixture->completer, "helo");
+  wait_held (fixture);
+  g_assert_cmpuint (fixture->requests, ==, 1);
+  g_assert_cmpuint (fixture->changes, ==, 1);
+  release_held (fixture);
+  wait_completion (fixture->completer, "hello");
+  words = pos_completer_get_completions (fixture->completer);
+  g_assert_cmpstrv (words, expected);
+  g_assert_cmpuint (fixture->changes, ==, 2);
+  spin (30);
+  g_assert_cmpuint (fixture->changes, ==, 2);
+  g_assert_null (fixture->committed);
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, " "));
+  g_assert_cmpstr (fixture->committed, ==, "helo ");
+}
+
+
+static void
+test_known_word (Fixture *fixture, gconstpointer unused)
+{
+  g_auto (GStrv) words = NULL;
+  const char *expected[] = {"hello", "hellos", NULL};
+
+  pos_completer_set_preedit (fixture->completer, "hello");
+  wait_completion (fixture->completer, "hellos");
+  words = pos_completer_get_completions (fixture->completer);
+  g_assert_cmpstrv (words, expected);
+  pos_completer_set_preedit (fixture->completer, "known");
+  spin (120);
+  /* A reply containing only the literal must not rebuild the same bar. */
+  g_assert_cmpuint (fixture->changes, ==, 3);
+  g_assert_cmpuint (fixture->requests, ==, 2);
+}
+
+
+static void
+test_all_caps (Fixture *fixture, gconstpointer unused)
+{
+  g_auto (GStrv) words = NULL;
+  const char *expected[] = {"CAP", "CAPITAL", "CAPTAIN", NULL};
+
+  pos_completer_set_preedit (fixture->completer, "CAP");
+  wait_completion (fixture->completer, "CAPITAL");
+  words = pos_completer_get_completions (fixture->completer);
+  g_assert_cmpstrv (words, expected);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "CAP");
+  pos_completer_set_preedit (fixture->completer, "H");
+  wait_completion (fixture->completer, "Hword");
+  g_assert_false (has_completion (fixture->completer, "HWORD"));
+}
+
+
+static void
+test_unsupported_service (Fixture *fixture, gconstpointer unused)
+{
+  fixture->fail = fixture->unsupported = TRUE;
+  pos_completer_set_preedit (fixture->completer, "helo");
+  spin (120);
+  g_assert_cmpuint (fixture->requests, ==, 1);
+  g_assert_true (has_completion (fixture->completer, "helo"));
+  g_assert_null (fixture->committed);
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, " "));
+  g_assert_cmpstr (fixture->committed, ==, "helo ");
 }
 
 
@@ -317,7 +381,7 @@ test_error_recovery (Fixture *fixture, gconstpointer unused)
   fixture->fail = TRUE;
   pos_completer_set_preedit (fixture->completer, "teh");
   spin (120);
-  g_assert_cmpuint (fixture->suggestions, ==, 1);
+  g_assert_cmpuint (fixture->requests, ==, 1);
   g_assert_true (has_completion (fixture->completer, "teh"));
   g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "teh");
   g_assert_true (pos_completer_feed_symbol (fixture->completer, " "));
@@ -358,7 +422,7 @@ test_daemon_restart (Fixture *fixture, gconstpointer unused)
   pos_completer_set_preedit (fixture->completer, "hel");
   spin (120);
   g_assert_true (has_completion (fixture->completer, "hel"));
-  g_assert_cmpuint (fixture->queries, ==, 0);
+  g_assert_cmpuint (fixture->requests, ==, 0);
   g_clear_pointer (&reply, g_variant_unref);
   reply = g_dbus_connection_call_sync (fixture->service, "org.freedesktop.DBus",
     "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName",
@@ -408,7 +472,7 @@ test_input_limit (Fixture *fixture, gconstpointer unused)
 
   pos_completer_set_preedit (fixture->completer, word);
   spin (120);
-  g_assert_cmpuint (fixture->queries, ==, 0);
+  g_assert_cmpuint (fixture->requests, ==, 0);
   g_assert_true (has_completion (fixture->completer, word));
   g_assert_true (pos_completer_feed_symbol (fixture->completer, " "));
   g_assert_cmpuint (strlen (fixture->committed), ==, 201);
@@ -420,6 +484,15 @@ test_real_service (void)
 {
   g_autoptr (PosCompleter) completer = pos_completer_verbisage_new (NULL);
 
+  g_auto (GStrv) words = NULL;
+
+  pos_completer_set_preedit (completer, "helo");
+  wait_completion (completer, "hello");
+  words = pos_completer_get_completions (completer);
+  g_assert_cmpstr (words[0], ==, "helo");
+  g_assert_cmpstr (words[1], ==, "hello");
+  g_assert_cmpuint (g_strv_length (words), <=, 6);
+  g_assert_cmpstr (pos_completer_get_preedit (completer), ==, "helo");
   pos_completer_set_preedit (completer, "hell");
   wait_completion (completer, "hello");
   pos_completer_set_preedit (completer, "teh");
@@ -451,6 +524,10 @@ main (int argc, char **argv)
 #define ADD_TEST(name, function) \
   g_test_add ("/pos/completer/verbisage/" name, Fixture, NULL, setup, function, teardown)
   ADD_TEST ("completion", test_completion);
+  ADD_TEST ("ranked", test_ranked);
+  ADD_TEST ("known-word", test_known_word);
+  ADD_TEST ("all-caps", test_all_caps);
+  ADD_TEST ("unsupported-service", test_unsupported_service);
   ADD_TEST ("stale", test_stale);
   ADD_TEST ("reset", test_reset);
   ADD_TEST ("language", test_language);

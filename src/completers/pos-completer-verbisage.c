@@ -36,8 +36,7 @@ struct _PosCompleterVerbisage {
   PosCompleterBase parent;
   GString *preedit;
   GStrv completions;
-  GStrv prefixes;
-  GStrv suggestions;
+  GStrv ranked;
   char *language;
   GDBusConnection *connection;
   GCancellable *cancellable;
@@ -48,7 +47,6 @@ struct _PosCompleterVerbisage {
 typedef struct {
   GWeakRef completer;
   guint64 generation;
-  gboolean suggest;
 } Lookup;
 
 static void pos_completer_verbisage_interface_init (PosCompleterInterface *iface);
@@ -59,13 +57,12 @@ G_DEFINE_TYPE_WITH_CODE (PosCompleterVerbisage, pos_completer_verbisage, POS_TYP
 
 
 static Lookup *
-lookup_new (PosCompleterVerbisage *self, gboolean suggest)
+lookup_new (PosCompleterVerbisage *self)
 {
   Lookup *lookup = g_new0 (Lookup, 1);
 
   g_weak_ref_init (&lookup->completer, self);
   lookup->generation = self->generation;
-  lookup->suggest = suggest;
   return lookup;
 }
 
@@ -88,8 +85,7 @@ cancel_lookup (PosCompleterVerbisage *self)
   if (self->cancellable)
     g_cancellable_cancel (self->cancellable);
   g_clear_object (&self->cancellable);
-  g_clear_pointer (&self->prefixes, g_strfreev);
-  g_clear_pointer (&self->suggestions, g_strfreev);
+  g_clear_pointer (&self->ranked, g_strfreev);
 }
 
 
@@ -107,39 +103,62 @@ append_unique (GPtrArray *words, const char *word)
 }
 
 
+/* The existing capitalization helper copies uppercase positions. For an
+ * all-caps word the entire longer completion should stay uppercase too. */
+static GStrv
+capitalize_ranked (PosCompleterVerbisage *self)
+{
+  guint upper = 0;
+  gboolean lower = FALSE;
+  GStrv words;
+
+  if (self->ranked == NULL)
+    return NULL;
+  for (const char *p = self->preedit->str; *p; p = g_utf8_next_char (p)) {
+    gunichar ch = g_utf8_get_char (p);
+    upper += g_unichar_isupper (ch) ? 1 : 0;
+    lower |= g_unichar_islower (ch);
+  }
+  /* One initial capital is ambiguous; keep ordinary title-case suggestions. */
+  if (upper < 2 || lower)
+    return pos_completer_capitalize_by_template (self->preedit->str, self->ranked);
+
+  words = g_new0 (char *, g_strv_length (self->ranked) + 1);
+  for (guint i = 0; self->ranked[i]; i++)
+    words[i] = g_utf8_strup (self->ranked[i], -1);
+  return words;
+}
+
+
 static void
 publish_completions (PosCompleterVerbisage *self)
 {
   g_autoptr (GPtrArray) words = g_ptr_array_new_with_free_func (g_free);
-  g_auto (GStrv) prefixes = NULL;
-  g_auto (GStrv) suggestions = NULL;
+  g_auto (GStrv) ranked = NULL;
+  g_auto (GStrv) completions = NULL;
 
-  /* The literal spelling is always available, including during daemon failure.
-   * Asynchronous results never replace or commit the user's preedit. */
+  /* Literal input stays first and is committed unchanged by Space or Enter.
+   * The service ranks completion and correction together; preserve that order
+   * instead of giving either source a quota that can hide a useful result. */
   if (self->preedit->len) {
     g_ptr_array_add (words, g_strdup (self->preedit->str));
-    if (self->prefixes)
-      prefixes = pos_completer_capitalize_by_template (self->preedit->str, self->prefixes);
-    if (self->suggestions)
-      suggestions = pos_completer_capitalize_by_template (self->preedit->str, self->suggestions);
-
-    /* Interleave completion and correction so either source can be selected. */
-    for (guint i = 0; i < MAX_RESULTS; i++) {
-      if (prefixes && i < g_strv_length (prefixes))
-        append_unique (words, prefixes[i]);
-      if (suggestions && i < g_strv_length (suggestions))
-        append_unique (words, suggestions[i]);
-    }
-  }
-
-  g_clear_pointer (&self->completions, g_strfreev);
-  if (words->len) {
+    ranked = capitalize_ranked (self);
+    for (guint i = 0; ranked && ranked[i]; i++)
+      append_unique (words, ranked[i]);
     g_ptr_array_add (words, NULL);
-    self->completions = (GStrv) g_ptr_array_free (g_steal_pointer (&words), FALSE);
+    completions = (GStrv) g_ptr_array_free (g_steal_pointer (&words), FALSE);
   }
+
+  if ((!self->completions && !completions) ||
+      (self->completions && completions &&
+       g_strv_equal ((const char *const *) self->completions,
+                      (const char *const *) completions)))
+    return;
+
+  g_strfreev (self->completions);
+  self->completions = g_steal_pointer (&completions);
   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_COMPLETIONS]);
 }
-
 
 static void
 on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
@@ -160,13 +179,7 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
     return;
   }
 
-  if (lookup->suggest) {
-    g_auto (GStrv) suggestions = NULL;
-
-    g_variant_get (reply, "(^as)", &suggestions);
-    for (guint i = 0; suggestions[i] && words->len < MAX_RESULTS; i++)
-      append_unique (words, suggestions[i]);
-  } else {
+  {
     g_autoptr (GVariantIter) iter = NULL;
     const char *word;
     double score;
@@ -177,13 +190,8 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
   }
 
   g_ptr_array_add (words, NULL);
-  if (lookup->suggest) {
-    g_strfreev (self->suggestions);
-    self->suggestions = (GStrv) g_ptr_array_free (g_steal_pointer (&words), FALSE);
-  } else {
-    g_strfreev (self->prefixes);
-    self->prefixes = (GStrv) g_ptr_array_free (g_steal_pointer (&words), FALSE);
-  }
+  g_strfreev (self->ranked);
+  self->ranked = (GStrv) g_ptr_array_free (g_steal_pointer (&words), FALSE);
   publish_completions (self);
 }
 
@@ -192,22 +200,15 @@ static void
 start_lookup (PosCompleterVerbisage *self)
 {
   g_autofree char *word = g_utf8_strdown (self->preedit->str, -1);
-  const char *prefixes[] = {word, NULL};
-  const char *suffixes[] = {NULL};
 
-  g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "QueryLimited",
-                           g_variant_new ("(^as^asuusu)", prefixes, suffixes, 0u, 0u,
-                                          self->language, (guint) MAX_RESULTS),
+  /* One ranked reply prevents the candidate bar changing order as separate
+   * prefix and spelling calls finish. Older daemons fail safely to literal. */
+  g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "Complete",
+                           g_variant_new ("(sus)", word, (guint) MAX_RESULTS, self->language),
                            G_VARIANT_TYPE ("(a(sd))"), G_DBUS_CALL_FLAGS_NONE,
                            LOOKUP_TIMEOUT_MS, self->cancellable, on_lookup_finished,
-                           lookup_new (self, FALSE));
-  g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "Suggest",
-                           g_variant_new ("(sus)", word, (guint) MAX_RESULTS, self->language),
-                           G_VARIANT_TYPE ("(as)"), G_DBUS_CALL_FLAGS_NONE,
-                           LOOKUP_TIMEOUT_MS, self->cancellable, on_lookup_finished,
-                           lookup_new (self, TRUE));
+                           lookup_new (self));
 }
-
 
 static void
 on_bus_ready (GObject *source, GAsyncResult *result, gpointer user_data)
@@ -242,7 +243,7 @@ lookup_timeout (gpointer user_data)
   if (self->connection)
     start_lookup (self);
   else
-    g_bus_get (G_BUS_TYPE_SESSION, self->cancellable, on_bus_ready, lookup_new (self, FALSE));
+    g_bus_get (G_BUS_TYPE_SESSION, self->cancellable, on_bus_ready, lookup_new (self));
 
   return G_SOURCE_REMOVE;
 }

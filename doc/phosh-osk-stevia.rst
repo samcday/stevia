@@ -175,7 +175,8 @@ TEXT COMPLETION USING VERBISAGE
 ******************************
 
 The experimental ``verbisage`` backend queries the session service
-``org.verbisage.Dictionary`` for prefix completions and spelling suggestions.
+``org.verbisage.Dictionary`` for jointly ranked current-word completions and
+spelling suggestions through its ``Complete`` method.
 It currently supports English US (``en_US``). Install the Verbisage service
 and its English dictionary, then opt in with::
 
@@ -187,7 +188,9 @@ To restore the distribution's default backend::
 
 The original typed text remains the first candidate. A space commits that
 text; corrections are applied only when selected. Dictionary requests are
-asynchronous and bounded, and service errors retain the literal input.
+asynchronous and bounded to six displayed candidates including the literal.
+One reply supplies the complete ranking; older daemons without ``Complete``
+and service errors retain the literal input.
 This backend adds no swipe recognition, next-word model, or learned history.
 
 
