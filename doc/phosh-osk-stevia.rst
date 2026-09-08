@@ -133,6 +133,7 @@ built. Available are currently at most
 
   - ``hunspell``: word correction based on the hunspell library
   - ``presage``: (experimental) word prediction based on the presage library
+  - ``verbisage``: experimental session D-Bus completion and correction (en_US)
   - ``pipe``: completer using a pipe
   - ``fzf``: completer based on fzf command line tool. Useful for experiments)
   - ``varnam``: completer using govarnam for Indic languages
@@ -168,6 +169,26 @@ For the presage based completer to work you need a model file in
 ships one with the presage library. You can simply symlink it
 there.  Models for more languages can be found in
 https://gitlab.gnome.org/guidog/phosh-osk-data
+
+
+TEXT COMPLETION USING VERBISAGE
+******************************
+
+The experimental ``verbisage`` backend queries the session service
+``org.verbisage.Dictionary`` for prefix completions and spelling suggestions.
+It currently supports English US (``en_US``). Install the Verbisage service
+and its English dictionary, then opt in with::
+
+  gsettings set mobi.phosh.osk.Completers default verbisage
+
+To restore the distribution's default backend::
+
+  gsettings reset mobi.phosh.osk.Completers default
+
+The original typed text remains the first candidate. A space commits that
+text; corrections are applied only when selected. Dictionary requests are
+asynchronous and bounded, and service errors retain the literal input.
+This backend adds no swipe recognition, next-word model, or learned history.
 
 
 TEXT COMPLETION USING PIPE

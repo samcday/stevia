@@ -149,10 +149,25 @@ else
   libpos_completer_varnam_dep = declare_dependency()
 endif
 
+# Verbisage is an opt-in session D-Bus backend; it adds no link-time dependency.
+libpos_completer_verbisage_sources = files('pos-completer-verbisage.c', 'pos-completer-verbisage.h')
+libpos_completer_verbisage_lib = static_library(
+  'pos-completer-verbisage',
+  libpos_completer_verbisage_sources,
+  include_directories: pos_includes,
+  install: false,
+  dependencies: [gio_dep, glib_dep],
+)
+libpos_completer_verbisage_dep = declare_dependency(
+  include_directories: libpos_completer_includes,
+  link_with: libpos_completer_verbisage_lib,
+)
+
 libpos_completers_sources = [
   libpos_completer_fzf_sources,
   libpos_completer_hunspell_sources,
   libpos_completer_pipe_sources,
+  libpos_completer_verbisage_sources,
   libpos_completer_presage_sources,
   libpos_completer_uim_sources,
   libpos_completer_varnam_sources,
@@ -162,6 +177,7 @@ libpos_completer_libs = [
   libpos_completer_fzf_lib,
   libpos_completer_hunspell_lib,
   libpos_completer_pipe_lib,
+  libpos_completer_verbisage_lib,
   libpos_completer_presage_lib,
   libpos_completer_uim_lib,
   libpos_completer_varnam_lib,
@@ -172,6 +188,7 @@ libpos_completers_dep = declare_dependency(
     libpos_completer_fzf_dep,
     libpos_completer_hunspell_dep,
     libpos_completer_pipe_dep,
+    libpos_completer_verbisage_dep,
     libpos_completer_presage_dep,
     libpos_completer_uim_dep,
     libpos_completer_varnam_dep,

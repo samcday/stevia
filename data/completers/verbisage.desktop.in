@@ -1,0 +1,5 @@
+[Completer]
+Id=verbisage
+Name=Verbisage (experimental)
+Description=Prefix completion and spelling suggestions from the Verbisage service
+Comment=Requires Verbisage and an English US dictionary

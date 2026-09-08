@@ -159,6 +159,9 @@ if completers.length() == 0
   error('No usable completer found')
 endif
 
+# Keep a local completer as the default; Verbisage requires explicit selection.
+completers += ['verbisage']
+
 have_memfd_create = cc.has_function(
   'memfd_create',
   prefix: ['#define _GNU_SOURCE', '#include <sys/mman.h>'],
@@ -224,6 +227,7 @@ summary(
     'Varnam': varnam_dep.found(),
     'Uim': uim_dep.found(),
     'Hunspell': hunspell_dep.found(),
+    'Verbisage (opt-in)': true,
   },
   bool_yn: true,
   section: 'Completers',

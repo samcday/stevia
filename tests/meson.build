@@ -23,6 +23,7 @@ tests = [
   'completer',
   'completer-base',
   'completer-hunspell',
+  'completer-verbisage',
   'input-surface',
   'load-layouts',
   'osk-widget',

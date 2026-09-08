@@ -18,6 +18,7 @@
 #include "pos-clipboard-manager.h"
 #include "pos-completer.h"
 #include "pos-completer-manager.h"
+#include "completers/pos-completer-verbisage.h"
 #include "pos-completion-bar.h"
 #include "pos-input-surface.h"
 #include "pos-keypad.h"
@@ -1147,6 +1148,10 @@ pos_input_surface_set_completer (PosInputSurface *self, PosCompleter *completer)
   g_clear_object (&self->mode_menu_binding);
   g_clear_object (&self->mode_actions_binding);
 
+  if (POS_IS_COMPLETER_VERBISAGE (self->completer)) {
+    pos_input_surface_submit_current_preedit (self);
+    pos_completer_set_preedit (self->completer, NULL);
+  }
   if (self->completer)
     g_signal_handlers_disconnect_by_data (self->completer, self);
 
@@ -1558,6 +1563,11 @@ on_im_active_changed (PosInputSurface *self, GParamSpec *pspec, PosInputMethod *
 
   active = pos_input_method_get_active (im);
   g_debug ("IM active: %d", active);
+
+  /* Cancel dictionary requests immediately on focus loss. The ordinary
+   * activation reset below still handles the next input field. */
+  if (!active && POS_IS_COMPLETER_VERBISAGE (self->completer))
+    pos_completer_set_preedit (self->completer, NULL);
 
   if (active) {
     /* TODO: Reset buffered commit_string, delete_surrounding_text */

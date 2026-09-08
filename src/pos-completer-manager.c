@@ -13,6 +13,7 @@
 #include "pos-completer-manager.h"
 #include "completers/pos-completer-presage.h"
 #include "completers/pos-completer-pipe.h"
+#include "completers/pos-completer-verbisage.h"
 #ifdef POS_HAVE_FZF
 # include "completers/pos-completer-fzf.h"
 #endif
@@ -89,7 +90,12 @@ init_completer (PosCompleterManager *self, const char *name, GError **err)
   if (completer)
     return g_steal_pointer (&completer);
 
-  if (g_strcmp0 (name, "pipe") == 0) {
+  if (g_strcmp0 (name, "verbisage") == 0) {
+    completer = pos_completer_verbisage_new (err);
+    if (completer)
+      goto done;
+    return NULL;
+  } else if (g_strcmp0 (name, "pipe") == 0) {
     completer = pos_completer_pipe_new (err);
     if (completer)
       goto done;
