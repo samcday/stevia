@@ -182,6 +182,7 @@ struct _PosOskWidget {
   gboolean swiping;
   gboolean swipe_blocked;
   guint32 swipe_start_time;
+  guint swipe_capitalization;
   GArray *swipe_points;
   GVariant *swipe_keys;
   GHashTable *touches;
@@ -1265,6 +1266,23 @@ pos_osk_widget_swipe_in_progress (PosOskWidget *self)
 }
 
 
+/**
+ * pos_osk_widget_get_swipe_capitalization:
+ * @self: The keyboard
+ *
+ * Returns the case captured at gesture start: 0 for lowercase, 1 for one-shot
+ * Shift, or 2 for caps lock. Read this when handling the `swipe` signal; the
+ * one-shot Shift layer has already been consumed by then.
+ */
+guint
+pos_osk_widget_get_swipe_capitalization (PosOskWidget *self)
+{
+  g_return_val_if_fail (POS_IS_OSK_WIDGET (self), 0);
+
+  return self->swipe_capitalization;
+}
+
+
 static GVariant *
 swipe_layout (PosOskWidget *self)
 {
@@ -1279,12 +1297,14 @@ swipe_layout (PosOskWidget *self)
       PosOskKey *key = pos_osk_widget_row_get_key (row, k);
       const char *symbol = pos_osk_key_get_symbol (key);
       const GdkRectangle *box = pos_osk_key_get_box (key);
+      char label[2] = {0};
 
-      if (!symbol || strlen (symbol) != 1 || symbol[0] < 'a' || symbol[0] > 'z')
+      if (!symbol || strlen (symbol) != 1 || !g_ascii_isalpha (symbol[0]))
         continue;
       if (box->width <= 0 || box->height <= 0)
         continue;
-      g_variant_builder_add (&keys, "(sdddd)", symbol,
+      label[0] = g_ascii_tolower (symbol[0]);
+      g_variant_builder_add (&keys, "(sdddd)", label,
                                (double) box->x + layer->offset_x, (double) box->y,
                                (double) box->width, (double) box->height);
       count++;
@@ -1305,8 +1325,9 @@ swipe_begin (PosOskWidget *self, double x, double y, guint32 time)
   SwipePoint point = {x, y, 0, g_get_monotonic_time ()};
 
   if (!self->swipe_enabled || self->swipe_blocked ||
-      self->mode != POS_OSK_WIDGET_MODE_KEYBOARD || self->layer != POS_OSK_WIDGET_LAYER_NORMAL ||
-      !symbol || strlen (symbol) != 1 || symbol[0] < 'a' || symbol[0] > 'z' ||
+      self->mode != POS_OSK_WIDGET_MODE_KEYBOARD ||
+      (self->layer != POS_OSK_WIDGET_LAYER_NORMAL && self->layer != POS_OSK_WIDGET_LAYER_CAPS) ||
+      !symbol || strlen (symbol) != 1 || !g_ascii_isalpha (symbol[0]) ||
       !isfinite (x) || !isfinite (y))
     return;
 
@@ -1315,6 +1336,8 @@ swipe_begin (PosOskWidget *self, double x, double y, guint32 time)
   if (!self->swipe_keys)
     return;
   self->swipe_start_time = time;
+  self->swipe_capitalization = self->layer == POS_OSK_WIDGET_LAYER_CAPS ?
+                              (self->caps_lock ? 2 : 1) : 0;
   self->swipe_pending = TRUE;
   g_array_append_val (self->swipe_points, point);
   /* A new possible gesture invalidates a previous outstanding recognition. */
@@ -1327,7 +1350,7 @@ swipe_update (PosOskWidget *self, double x, double y, guint32 time)
 {
   SwipePoint point = {x, y, time - self->swipe_start_time, g_get_monotonic_time ()};
   SwipePoint *first, *last;
-  double threshold;
+  int threshold;
 
   if (!self->swipe_pending && !self->swiping)
     return FALSE;
@@ -1343,8 +1366,13 @@ swipe_update (PosOskWidget *self, double x, double y, guint32 time)
     g_array_append_val (self->swipe_points, point);
 
   first = &g_array_index (self->swipe_points, SwipePoint, 0);
-  threshold = MAX (12.0, pos_osk_widget_get_current_layer (self)->key_width * 0.35);
-  if (!self->swiping && hypot (x - first->x, y - first->y) >= threshold) {
+  /* Match GtkGestureLongPress's axis-aligned tap slop. Once movement cancels
+   * a long press it must also start the trail, without a second, wider dead
+   * zone. Retain four logical pixels of tap tolerance even if GTK has none. */
+  g_object_get (gtk_widget_get_settings (GTK_WIDGET (self)),
+                "gtk-dnd-drag-threshold", &threshold, NULL);
+  threshold = MAX (4, threshold);
+  if (!self->swiping && MAX (fabs (x - first->x), fabs (y - first->y)) > threshold) {
     self->swipe_pending = FALSE;
     self->swiping = TRUE;
     pos_osk_widget_cancel_press (self);
@@ -1379,6 +1407,17 @@ swipe_finish (PosOskWidget *self, double x, double y, guint32 time)
   }
   points = g_variant_ref_sink (g_variant_builder_end (&trace));
   keys = g_steal_pointer (&self->swipe_keys);
+  if (self->swipe_capitalization == 1) {
+    g_autoptr (GArray) trail = g_array_copy (self->swipe_points);
+
+    /* Reset Shift before publishing the new request: layer changes cancel
+     * stale recognition. Keep the already released trace fading afterwards. */
+    pos_osk_widget_set_layer (self, POS_OSK_WIDGET_LAYER_NORMAL);
+    if (self->swipe_enabled && gtk_widget_get_mapped (GTK_WIDGET (self))) {
+      g_array_append_vals (self->swipe_points, trail->data, trail->len);
+      self->trail_tick = gtk_widget_add_tick_callback (GTK_WIDGET (self), swipe_tick, NULL, NULL);
+    }
+  }
   g_signal_emit (self, signals[OSK_SWIPE], 0, points, keys);
   return TRUE;
 }

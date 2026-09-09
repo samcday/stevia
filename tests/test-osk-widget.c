@@ -153,6 +153,8 @@ typedef struct {
   PosOskWidget *osk;
   GString *typed;
   guint swipes;
+  guint capitalization;
+  PosOskWidgetLayer layer_on_swipe;
   GVariant *trace;
   GVariant *keys;
 } SwipeFixture;
@@ -169,6 +171,8 @@ static void
 record_swipe (PosOskWidget *osk, GVariant *trace, GVariant *keys, SwipeFixture *fixture)
 {
   fixture->swipes++;
+  fixture->capitalization = pos_osk_widget_get_swipe_capitalization (osk);
+  fixture->layer_on_swipe = pos_osk_widget_get_layer (osk);
   g_clear_pointer (&fixture->trace, g_variant_unref);
   g_clear_pointer (&fixture->keys, g_variant_unref);
   fixture->trace = g_variant_ref (trace);
@@ -183,6 +187,8 @@ swipe_setup (SwipeFixture *fixture, gconstpointer unused)
 
   fixture->window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
   fixture->osk = pos_osk_widget_new (PHOSH_OSK_FEATURE_KEY_DRAG);
+  g_object_set (gtk_widget_get_settings (GTK_WIDGET (fixture->osk)),
+                "gtk-dnd-drag-threshold", 8, "gtk-long-press-time", 500, NULL);
   fixture->typed = g_string_new (NULL);
   g_assert_true (pos_osk_widget_set_layout (fixture->osk, "us", "us", "English (US)", "us", NULL, NULL));
   gtk_container_add (GTK_CONTAINER (fixture->window), GTK_WIDGET (fixture->osk));
@@ -416,6 +422,204 @@ test_swipe_long_press (SwipeFixture *fixture, gconstpointer unused)
 }
 
 
+/* Feed the public GTK dispatch entry point so capture-phase controllers,
+ * pointer-emulating contacts, event coordinates and real timeout callbacks
+ * participate. Calling the widget vfunc directly cannot exercise those. */
+static void
+dispatch_touch (SwipeFixture *fixture, GdkEventType type, guint contact,
+                double x, double y, guint32 time, gboolean emulating_pointer)
+{
+  g_autoptr (GdkEvent) event = gdk_event_new (type);
+  GdkDevice *pointer = gdk_seat_get_pointer (gdk_display_get_default_seat (gdk_display_get_default ()));
+  GdkWindow *window = gtk_widget_get_window (GTK_WIDGET (fixture->osk));
+  int root_x, root_y;
+
+  gdk_window_get_origin (window, &root_x, &root_y);
+  event->touch.window = g_object_ref (window);
+  event->touch.sequence = GUINT_TO_POINTER (contact);
+  event->touch.time = time;
+  event->touch.x = x;
+  event->touch.y = y;
+  event->touch.x_root = root_x + x;
+  event->touch.y_root = root_y + y;
+  event->touch.emulating_pointer = emulating_pointer;
+  gdk_event_set_device (event, pointer);
+  gdk_event_set_source_device (event, pointer);
+  gtk_main_do_event (event);
+}
+
+
+static void
+spin_main (guint milliseconds)
+{
+  gint64 deadline = g_get_monotonic_time () + milliseconds * G_TIME_SPAN_MILLISECOND;
+
+  do {
+    while (g_main_context_iteration (NULL, FALSE))
+      ;
+    g_usleep (1000);
+  } while (g_get_monotonic_time () < deadline);
+}
+
+
+static void
+test_swipe_dispatch_quick (SwipeFixture *fixture, gconstpointer unused)
+{
+  double x, y, end_x, end_y;
+  g_autoptr (GtkGesture) ancestor_swipe = gtk_gesture_swipe_new (fixture->window);
+
+  gtk_gesture_single_set_touch_only (GTK_GESTURE_SINGLE (ancestor_swipe), TRUE);
+  gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (ancestor_swipe), GTK_PHASE_CAPTURE);
+  g_object_set (fixture->osk, "features", PHOSH_OSK_FEATURE_KEY_DRAG | PHOSH_OSK_FEATURE_KEY_INDICATOR, NULL);
+  spin_main (30);
+  key_center (fixture, "e", &x, &y);
+  key_center (fixture, "h", &end_x, &end_y);
+  dispatch_touch (fixture, GDK_TOUCH_BEGIN, 1, x, y, 100, TRUE);
+  g_assert_true (fixture->osk->swipe_pending);
+  g_assert_true (gtk_gesture_is_active (GTK_GESTURE (fixture->osk->long_press)));
+  g_assert_true (gtk_gesture_is_active (ancestor_swipe));
+  dispatch_touch (fixture, GDK_TOUCH_UPDATE, 1, x + 8, y, 104, TRUE);
+  g_assert_true (fixture->osk->swipe_pending);
+  dispatch_touch (fixture, GDK_TOUCH_UPDATE, 1, x + 9, y, 108, TRUE);
+  g_assert_true (fixture->osk->swiping);
+  g_assert_null (fixture->osk->current);
+  spin_main (350);
+  g_assert_null (fixture->osk->char_popup);
+  dispatch_touch (fixture, GDK_TOUCH_END, 1, end_x, end_y, 460, TRUE);
+  g_assert_cmpuint (fixture->swipes, ==, 1);
+  g_assert_cmpstr (fixture->typed->str, ==, "");
+  g_assert_null (fixture->osk->char_popup);
+}
+
+
+static void
+test_swipe_dispatch_hold (SwipeFixture *fixture, gconstpointer unused)
+{
+  double x, y;
+
+  spin_main (30);
+  key_center (fixture, "e", &x, &y);
+  dispatch_touch (fixture, GDK_TOUCH_BEGIN, 1, x, y, 100, TRUE);
+  g_assert_true (fixture->osk->swipe_pending);
+  dispatch_touch (fixture, GDK_TOUCH_UPDATE, 1, x + 3, y + 3, 108, TRUE);
+  g_assert_false (fixture->osk->swiping);
+  spin_main (350);
+  g_assert_nonnull (fixture->osk->char_popup);
+  dispatch_touch (fixture, GDK_TOUCH_END, 1, x, y, 500, TRUE);
+  g_assert_cmpuint (fixture->swipes, ==, 0);
+  g_assert_cmpstr (fixture->typed->str, ==, "");
+}
+
+
+static void
+test_swipe_dispatch_tap (SwipeFixture *fixture, gconstpointer unused)
+{
+  double x, y;
+
+  spin_main (30);
+  key_center (fixture, "e", &x, &y);
+  /* Exercise both primary pointer-emulating and other touch sequences. */
+  for (guint i = 0; i < 2; i++) {
+    dispatch_touch (fixture, GDK_TOUCH_BEGIN, i + 1, x, y, 100 + i * 30, i == 0);
+    dispatch_touch (fixture, GDK_TOUCH_UPDATE, i + 1, x + 3, y + 3, 108 + i * 30, i == 0);
+    dispatch_touch (fixture, GDK_TOUCH_END, i + 1, x + 3, y + 3, 116 + i * 30, i == 0);
+  }
+  g_assert_cmpuint (fixture->swipes, ==, 0);
+  g_assert_cmpstr (fixture->typed->str, ==, "ee");
+  g_assert_false (pos_osk_widget_swipe_in_progress (fixture->osk));
+  spin_main (350);
+  g_assert_null (fixture->osk->char_popup);
+}
+
+
+static void
+test_swipe_dispatch_caps (SwipeFixture *fixture, gconstpointer unused)
+{
+  double x, y, end_x, end_y;
+
+  for (guint capitalization = 1; capitalization <= 2; capitalization++) {
+    if (capitalization == 1)
+      pos_osk_widget_set_layer (fixture->osk, POS_OSK_WIDGET_LAYER_CAPS);
+    else
+      set_caps_lock (fixture->osk, TRUE);
+    spin_main (30);
+    key_center (fixture, "E", &x, &y);
+    key_center (fixture, "H", &end_x, &end_y);
+    dispatch_touch (fixture, GDK_TOUCH_BEGIN, capitalization, x, y, 100, TRUE);
+    g_assert_true (fixture->osk->swipe_pending);
+    dispatch_touch (fixture, GDK_TOUCH_UPDATE, capitalization, x + 9, y, 108, TRUE);
+    g_assert_true (fixture->osk->swiping);
+    dispatch_touch (fixture, GDK_TOUCH_END, capitalization, end_x, end_y, 116, TRUE);
+    g_assert_cmpuint (fixture->swipes, ==, capitalization);
+    g_assert_cmpuint (fixture->capitalization, ==, capitalization);
+    g_assert_cmpint (fixture->layer_on_swipe, ==, capitalization == 1 ?
+                    POS_OSK_WIDGET_LAYER_NORMAL : POS_OSK_WIDGET_LAYER_CAPS);
+    g_assert_cmpint (fixture->osk->caps_lock, ==, capitalization == 2);
+    g_assert_cmpstr (fixture->typed->str, ==, "");
+    g_assert_cmpuint (fixture->osk->trail_tick, >, 0);
+    g_assert_cmpuint (fixture->osk->swipe_points->len, >, 1);
+    g_assert_false (pos_osk_widget_swipe_in_progress (fixture->osk));
+    g_assert_cmpuint (g_variant_n_children (fixture->keys), ==, 26);
+    for (guint i = 0; i < 26; i++) {
+      const char *label;
+      double left, top, width, height;
+
+      g_variant_get_child (fixture->keys, i, "(&sdddd)", &label, &left, &top, &width, &height);
+      g_assert_cmpuint (strlen (label), ==, 1);
+      g_assert_true (g_ascii_islower (label[0]));
+    }
+  }
+}
+
+
+static void
+test_swipe_dispatch_cancel (SwipeFixture *fixture, gconstpointer unused)
+{
+  double x, y;
+
+  spin_main (30);
+  key_center (fixture, "e", &x, &y);
+  dispatch_touch (fixture, GDK_TOUCH_BEGIN, 1, x, y, 100, TRUE);
+  dispatch_touch (fixture, GDK_TOUCH_UPDATE, 1, x + 9, y, 108, TRUE);
+  dispatch_touch (fixture, GDK_TOUCH_BEGIN, 2, x + 30, y, 116, FALSE);
+  g_assert_true (fixture->osk->swipe_blocked);
+  g_assert_cmpuint (fixture->osk->trail_tick, ==, 0);
+  dispatch_touch (fixture, GDK_TOUCH_END, 1, x + 9, y, 124, TRUE);
+  dispatch_touch (fixture, GDK_TOUCH_END, 2, x + 30, y, 132, FALSE);
+  g_assert_false (pos_osk_widget_swipe_in_progress (fixture->osk));
+  dispatch_touch (fixture, GDK_TOUCH_BEGIN, 3, x, y, 140, TRUE);
+  dispatch_touch (fixture, GDK_TOUCH_CANCEL, 3, x, y, 148, TRUE);
+  g_assert_cmpuint (fixture->swipes, ==, 0);
+  g_assert_cmpstr (fixture->typed->str, ==, "");
+  g_assert_false (pos_osk_widget_swipe_in_progress (fixture->osk));
+  spin_main (350);
+  g_assert_null (fixture->osk->char_popup);
+  dispatch_touch (fixture, GDK_TOUCH_BEGIN, 4, x, y, 600, TRUE);
+  dispatch_touch (fixture, GDK_TOUCH_END, 4, x, y, 608, TRUE);
+  g_assert_cmpstr (fixture->typed->str, ==, "e");
+}
+
+
+static void
+test_swipe_dispatch_space (SwipeFixture *fixture, gconstpointer unused)
+{
+  double x, y;
+
+  spin_main (30);
+  key_center (fixture, POS_OSK_SYMBOL_SPACE, &x, &y);
+  dispatch_touch (fixture, GDK_TOUCH_BEGIN, 1, x, y, 100, TRUE);
+  g_assert_false (fixture->osk->swipe_pending);
+  spin_main (350);
+  g_assert_cmpint (fixture->osk->mode, ==, POS_OSK_WIDGET_MODE_CURSOR);
+  dispatch_touch (fixture, GDK_TOUCH_UPDATE, 1, x + 20, y, 500, TRUE);
+  dispatch_touch (fixture, GDK_TOUCH_END, 1, x + 20, y, 508, TRUE);
+  g_assert_cmpint (fixture->osk->mode, ==, POS_OSK_WIDGET_MODE_KEYBOARD);
+  g_assert_cmpuint (fixture->swipes, ==, 0);
+  g_assert_cmpstr (fixture->typed->str, ==, "KEY_RIGHT");
+  g_assert_null (fixture->osk->char_popup);
+}
+
+
 int
 main (int argc, char *argv[])
 {
@@ -424,6 +628,7 @@ main (int argc, char *argv[])
   gtk_test_init (&argc, &argv, NULL);
 
   pos_init ();
+  gtk_icon_theme_add_resource_path (gtk_icon_theme_get_default (), "/mobi/phosh/stevia/icons");
 
   g_test_add_func ("/pos/osk-widget/switch_layer", test_switch_layer);
 
@@ -436,6 +641,12 @@ main (int argc, char *argv[])
   SWIPE_TEST ("fade", test_swipe_fade);
   SWIPE_TEST ("limits", test_swipe_limits);
   SWIPE_TEST ("long-press", test_swipe_long_press);
+  SWIPE_TEST ("dispatch-quick", test_swipe_dispatch_quick);
+  SWIPE_TEST ("dispatch-hold", test_swipe_dispatch_hold);
+  SWIPE_TEST ("dispatch-tap", test_swipe_dispatch_tap);
+  SWIPE_TEST ("dispatch-caps", test_swipe_dispatch_caps);
+  SWIPE_TEST ("dispatch-cancel", test_swipe_dispatch_cancel);
+  SWIPE_TEST ("dispatch-space", test_swipe_dispatch_space);
 #undef SWIPE_TEST
 
   ret = g_test_run ();
