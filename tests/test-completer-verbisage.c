@@ -25,6 +25,9 @@ typedef struct {
   GPtrArray *held;
   const char *hold_word;
   gboolean fail;
+  gboolean empty;
+  gboolean accept_again;
+  guint commits;
   guint requests;
   guint swipe_requests;
   guint changes;
@@ -166,6 +169,9 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
 
   if (fixture->hold_word && g_str_equal (word, fixture->hold_word))
     g_ptr_array_add (fixture->held, g_object_ref (invocation));
+  else if (fixture->empty)
+    g_dbus_method_invocation_return_value (invocation,
+      g_variant_new ("(@a(sd))", g_variant_new_array (G_VARIANT_TYPE ("(sd)"), NULL, 0)));
   else if (fixture->fail)
     g_dbus_method_invocation_return_dbus_error (invocation,
                                                fixture->unsupported ? "org.freedesktop.DBus.Error.UnknownMethod" : "org.freedesktop.DBus.Error.Failed",
@@ -186,6 +192,10 @@ on_commit (PosCompleter *completer, const char *text, int before, int after, gpo
   fixture->committed = g_strdup (text);
   fixture->before = before;
   fixture->after = after;
+  fixture->commits++;
+  if (fixture->accept_again)
+    g_assert_false (pos_completer_verbisage_accept_swipe (
+      POS_COMPLETER_VERBISAGE (completer)));
 }
 
 
@@ -502,7 +512,7 @@ test_input_limit (Fixture *fixture, gconstpointer unused)
 
 
 static void
-request_swipe (Fixture *fixture)
+request_swipe_capitalized (Fixture *fixture, guint capitalization)
 {
   GVariantBuilder trace, keys;
   g_autoptr (GVariant) points = NULL;
@@ -522,7 +532,14 @@ request_swipe (Fixture *fixture)
   points = g_variant_ref_sink (g_variant_builder_end (&trace));
   geometry = g_variant_ref_sink (g_variant_builder_end (&keys));
   pos_completer_verbisage_recognize_swipe (POS_COMPLETER_VERBISAGE (fixture->completer),
-                                         points, geometry);
+                                         points, geometry, capitalization);
+}
+
+
+static void
+request_swipe (Fixture *fixture)
+{
+  request_swipe_capitalized (fixture, 0);
 }
 
 
@@ -540,11 +557,19 @@ test_swipe_results (Fixture *fixture, gconstpointer unused)
   g_assert_cmpuint (g_strv_length (words), ==, 6);
   g_assert_cmpuint (fixture->swipe_requests, ==, 1);
   g_assert_cmpuint (fixture->requests, ==, 1);
-  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "hello");
+  g_assert_true (pos_completer_verbisage_has_swipe_preedit (
+    POS_COMPLETER_VERBISAGE (fixture->completer)));
   g_assert_null (fixture->committed);
-  /* A space never accepts the first decoded candidate implicitly. */
+  spin (120);
+  g_assert_cmpuint (fixture->requests, ==, 1);
+  /* Space accepts the editable guess exactly once. */
   pos_completer_feed_symbol (fixture->completer, " ");
-  g_assert_cmpstr (fixture->committed, ==, " ");
+  g_assert_cmpstr (fixture->committed, ==, "hello ");
+  g_assert_cmpuint (fixture->commits, ==, 1);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_false (pos_completer_verbisage_has_swipe_preedit (
+    POS_COMPLETER_VERBISAGE (fixture->completer)));
   g_assert_null (pos_completer_get_completions (fixture->completer));
 }
 
@@ -590,6 +615,7 @@ test_swipe_context (Fixture *fixture, gconstpointer unused)
   release_held (fixture);
   wait_completion (fixture->completer, "hello");
   g_ptr_array_set_size (fixture->held, 0);
+  pos_completer_set_preedit (fixture->completer, NULL);
   request_swipe (fixture);
   wait_held (fixture);
   pos_completer_set_surrounding_text (fixture->completer, "one two ", "");
@@ -609,12 +635,17 @@ test_swipe_error (Fixture *fixture, gconstpointer unused)
   g_assert_false (has_completion (fixture->completer, "hello"));
   g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
   g_assert_null (fixture->committed);
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+  g_assert_false (pos_completer_feed_symbol (fixture->completer, "KEY_BACKSPACE"));
   fixture->fail = FALSE;
   request_swipe (fixture);
   wait_completion (fixture->completer, "hello");
   g_assert_true (pos_completer_feed_symbol (fixture->completer, "KEY_BACKSPACE"));
   g_assert_null (fixture->committed);
-  g_assert_null (pos_completer_get_completions (fixture->completer));
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "hell");
+  g_assert_false (pos_completer_verbisage_has_swipe_preedit (
+    POS_COMPLETER_VERBISAGE (fixture->completer)));
+  g_assert_true (has_completion (fixture->completer, "hell"));
 }
 
 
@@ -629,6 +660,262 @@ test_swipe_reset (Fixture *fixture, gconstpointer unused)
   spin (50);
   g_assert_null (pos_completer_get_completions (fixture->completer));
   g_assert_null (fixture->committed);
+}
+
+
+static void
+test_swipe_capitalization (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) snapshot = NULL;
+
+  request_swipe_capitalized (fixture, 1);
+  wait_completion (fixture->completer, "Hello");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "Hello");
+  g_assert_true (has_completion (fixture->completer, "Help"));
+  g_assert_false (has_completion (fixture->completer, "hello"));
+  g_assert_false (has_completion (fixture->completer, "HELLO"));
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, " "));
+  g_assert_cmpstr (fixture->committed, ==, "Hello ");
+
+  request_swipe_capitalized (fixture, 2);
+  wait_completion (fixture->completer, "HELLO");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "HELLO");
+  g_assert_true (has_completion (fixture->completer, "HELP"));
+  g_assert_false (has_completion (fixture->completer, "Hello"));
+  snapshot = pos_completer_verbisage_snapshot_swipe (self);
+  pos_completer_set_preedit (fixture->completer, NULL);
+  g_assert_true (pos_completer_verbisage_restore_swipe (self, snapshot));
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "HELLO");
+  g_assert_true (has_completion (fixture->completer, "HELP"));
+  g_assert_true (pos_completer_verbisage_accept_swipe (self));
+  g_assert_cmpstr (fixture->committed, ==, "HELLO ");
+  g_assert_cmpuint (fixture->requests, ==, 2);
+  request_swipe_capitalized (fixture, 3);
+  spin (100);
+  g_assert_cmpuint (fixture->requests, ==, 2);
+}
+
+
+static void
+test_swipe_accept (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  g_assert_false (pos_completer_verbisage_accept_swipe (self));
+  fixture->hold_word = "swipe";
+  request_swipe (fixture);
+  wait_held (fixture);
+  g_assert_false (pos_completer_verbisage_has_swipe_preedit (self));
+  g_assert_false (pos_completer_verbisage_accept_swipe (self));
+  g_assert_null (pos_completer_verbisage_snapshot_swipe (self));
+  release_held (fixture);
+  wait_completion (fixture->completer, "hello");
+
+  fixture->accept_again = TRUE;
+  g_assert_true (pos_completer_verbisage_accept_swipe (self));
+  g_assert_false (pos_completer_verbisage_accept_swipe (self));
+  g_assert_cmpstr (fixture->committed, ==, "hello ");
+  g_assert_cmpuint (fixture->commits, ==, 1);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+
+  /* The surface waits for this ACK before submitting the next trace. */
+  pos_completer_set_surrounding_text (fixture->completer, "hello ", "");
+  request_swipe (fixture);
+  wait_held (fixture);
+  release_held (fixture);
+  wait_completion (fixture->completer, "hello");
+  g_assert_cmpuint (fixture->swipe_requests, ==, 2);
+  g_assert_true (pos_completer_verbisage_has_swipe_preedit (self));
+  g_assert_cmpuint (fixture->commits, ==, 1);
+}
+
+
+static void
+test_swipe_tap (Fixture *fixture, gconstpointer unused)
+{
+  request_swipe (fixture);
+  wait_completion (fixture->completer, "hello");
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, "w"));
+  g_assert_cmpstr (fixture->committed, ==, "hello ");
+  g_assert_cmpuint (fixture->commits, ==, 1);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "w");
+  g_assert_false (pos_completer_verbisage_has_swipe_preedit (
+    POS_COMPLETER_VERBISAGE (fixture->completer)));
+  /* The previous commit's context notification cannot cancel this tap. */
+  pos_completer_set_surrounding_text (fixture->completer, "hello ", "");
+  wait_completion (fixture->completer, "wword");
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, " "));
+  g_assert_cmpstr (fixture->committed, ==, "w ");
+  g_assert_cmpuint (fixture->commits, ==, 2);
+}
+
+
+static void
+test_swipe_separators (Fixture *fixture, gconstpointer unused)
+{
+  request_swipe (fixture);
+  wait_completion (fixture->completer, "hello");
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, "."));
+  g_assert_cmpstr (fixture->committed, ==, "hello. ");
+  g_assert_cmpuint (fixture->commits, ==, 1);
+  request_swipe (fixture);
+  wait_completion (fixture->completer, "hello");
+  g_assert_false (pos_completer_feed_symbol (fixture->completer, "KEY_ENTER"));
+  g_assert_cmpstr (fixture->committed, ==, "hello");
+  g_assert_cmpuint (fixture->commits, ==, 2);
+}
+
+
+static void
+test_swipe_pending_backspace (Fixture *fixture, gconstpointer unused)
+{
+  fixture->hold_word = "swipe";
+  request_swipe (fixture);
+  wait_held (fixture);
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, "KEY_BACKSPACE"));
+  release_held (fixture);
+  spin (50);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+  g_assert_null (fixture->committed);
+  /* Cancellation consumed only the first Backspace, while the request existed. */
+  g_assert_false (pos_completer_feed_symbol (fixture->completer, "KEY_BACKSPACE"));
+}
+
+
+static void
+test_swipe_timeout (Fixture *fixture, gconstpointer unused)
+{
+  fixture->hold_word = "swipe";
+  request_swipe (fixture);
+  wait_held (fixture);
+  spin (1100);
+  g_assert_false (pos_completer_feed_symbol (fixture->completer, "KEY_BACKSPACE"));
+  release_held (fixture);
+  spin (50);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+  g_assert_null (fixture->committed);
+  fixture->hold_word = NULL;
+  request_swipe (fixture);
+  wait_completion (fixture->completer, "hello");
+}
+
+
+static void
+test_swipe_empty (Fixture *fixture, gconstpointer unused)
+{
+  fixture->empty = TRUE;
+  request_swipe (fixture);
+  spin (100);
+  g_assert_cmpuint (fixture->swipe_requests, ==, 1);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+  g_assert_false (pos_completer_feed_symbol (fixture->completer, "KEY_BACKSPACE"));
+  g_assert_null (fixture->committed);
+  fixture->empty = FALSE;
+  request_swipe (fixture);
+  wait_completion (fixture->completer, "hello");
+}
+
+
+static void
+on_swipe_preedit (PosCompleter *completer, GParamSpec *pspec, guint *notifications)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (completer);
+
+  (*notifications)++;
+  g_assert_true (pos_completer_verbisage_has_swipe_preedit (self));
+  g_assert_cmpstr (pos_completer_get_preedit (completer), ==, "hello");
+  g_assert_true (has_completion (completer, "help"));
+  /* Disabling/cancelling widget capture must not erase the just-published text. */
+  pos_completer_verbisage_cancel_swipe (self);
+  g_assert_true (pos_completer_verbisage_has_swipe_preedit (self));
+}
+
+
+static void
+test_swipe_composition_cancel (Fixture *fixture, gconstpointer unused)
+{
+  guint notifications = 0;
+  gulong handler = g_signal_connect (fixture->completer, "notify::preedit",
+                                     G_CALLBACK (on_swipe_preedit), &notifications);
+
+  request_swipe (fixture);
+  wait_completion (fixture->completer, "hello");
+  g_assert_cmpuint (notifications, ==, 1);
+  g_signal_handler_disconnect (fixture->completer, handler);
+  pos_completer_verbisage_cancel_swipe (POS_COMPLETER_VERBISAGE (fixture->completer));
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "hello");
+  g_assert_true (has_completion (fixture->completer, "help"));
+  /* Focus/reset explicitly discards the completed composition. */
+  pos_completer_set_preedit (fixture->completer, NULL);
+  g_assert_false (pos_completer_verbisage_has_swipe_preedit (
+    POS_COMPLETER_VERBISAGE (fixture->completer)));
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+}
+
+
+static void
+test_swipe_snapshot (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) snapshot = NULL;
+  g_auto (GStrv) before = NULL;
+  g_auto (GStrv) after = NULL;
+
+  request_swipe (fixture);
+  wait_completion (fixture->completer, "hello");
+  snapshot = pos_completer_verbisage_snapshot_swipe (self);
+  before = pos_completer_get_completions (fixture->completer);
+  g_assert_nonnull (snapshot);
+  /* The surface captures this before selection, then removes the selected
+   * committed word before asking the adapter to restore this composition. */
+  pos_completer_set_preedit (fixture->completer, NULL);
+  g_assert_true (pos_completer_verbisage_restore_swipe (self, snapshot));
+  after = pos_completer_get_completions (fixture->completer);
+  g_assert_cmpstrv (before, after);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "hello");
+  g_assert_true (pos_completer_verbisage_has_swipe_preedit (self));
+  spin (120);
+  g_assert_cmpuint (fixture->requests, ==, 1);
+  g_assert_null (fixture->committed);
+
+  fixture->hold_word = "old";
+  pos_completer_set_preedit (fixture->completer, "old");
+  wait_held (fixture);
+  g_assert_true (pos_completer_verbisage_restore_swipe (self, snapshot));
+  release_held (fixture);
+  spin (50);
+  g_assert_false (has_completion (fixture->completer, "oldword"));
+  g_assert_true (has_completion (fixture->completer, "help"));
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, "KEY_BACKSPACE"));
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "hell");
+  g_assert_null (pos_completer_verbisage_snapshot_swipe (self));
+}
+
+
+static void
+test_swipe_snapshot_invalid (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) snapshot = NULL;
+  g_autoptr (GVariant) wrong_type = g_variant_ref_sink (g_variant_new_string ("hello"));
+  g_autoptr (GError) error = NULL;
+
+  request_swipe (fixture);
+  wait_completion (fixture->completer, "hello");
+  snapshot = pos_completer_verbisage_snapshot_swipe (self);
+  g_assert_false (pos_completer_verbisage_restore_swipe (self, NULL));
+  g_assert_false (pos_completer_verbisage_restore_swipe (self, wrong_type));
+  g_assert_true (pos_completer_verbisage_has_swipe_preedit (self));
+  g_assert_false (pos_completer_set_language (fixture->completer, "de", "DE", &error));
+  g_assert_error (error, POS_COMPLETER_ERROR, POS_COMPLETER_ERROR_LANG_INIT);
+  g_assert_false (pos_completer_verbisage_restore_swipe (self, snapshot));
+  g_assert_false (pos_completer_verbisage_has_swipe_preedit (self));
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "hello");
 }
 
 
@@ -696,6 +983,16 @@ main (int argc, char **argv)
   ADD_TEST ("swipe-context", test_swipe_context);
   ADD_TEST ("swipe-error", test_swipe_error);
   ADD_TEST ("swipe-reset", test_swipe_reset);
+  ADD_TEST ("swipe-capitalization", test_swipe_capitalization);
+  ADD_TEST ("swipe-accept", test_swipe_accept);
+  ADD_TEST ("swipe-tap", test_swipe_tap);
+  ADD_TEST ("swipe-separators", test_swipe_separators);
+  ADD_TEST ("swipe-pending-backspace", test_swipe_pending_backspace);
+  ADD_TEST ("swipe-empty", test_swipe_empty);
+  ADD_TEST ("swipe-timeout", test_swipe_timeout);
+  ADD_TEST ("swipe-composition-cancel", test_swipe_composition_cancel);
+  ADD_TEST ("swipe-snapshot", test_swipe_snapshot);
+  ADD_TEST ("swipe-snapshot-invalid", test_swipe_snapshot_invalid);
 #undef ADD_TEST
   result = g_test_run ();
   g_test_dbus_down (bus);

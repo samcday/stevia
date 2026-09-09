@@ -32,12 +32,20 @@ enum {
 };
 static GParamSpec *props[PROP_LAST_PROP];
 
+typedef enum {
+  SWIPE_NONE,
+  SWIPE_PENDING,
+  SWIPE_PREEDIT,
+} SwipeState;
+
+
 struct _PosCompleterVerbisage {
   PosCompleterBase parent;
   GString *preedit;
   GStrv completions;
   GStrv ranked;
-  gboolean swipe;
+  SwipeState swipe_state;
+  guint swipe_capitalization;
   GVariant *swipe_parameters;
   char *language;
   GDBusConnection *connection;
@@ -89,7 +97,8 @@ cancel_lookup (PosCompleterVerbisage *self)
   g_clear_object (&self->cancellable);
   g_clear_pointer (&self->ranked, g_strfreev);
   g_clear_pointer (&self->swipe_parameters, g_variant_unref);
-  self->swipe = FALSE;
+  self->swipe_state = SWIPE_NONE;
+  self->swipe_capitalization = 0;
 }
 
 
@@ -141,13 +150,12 @@ publish_completions (PosCompleterVerbisage *self)
   g_auto (GStrv) ranked = NULL;
   g_auto (GStrv) completions = NULL;
 
-  /* Literal input stays first and is committed unchanged by Space or Enter.
-   * The service ranks completion and correction together; preserve that order
-   * instead of giving either source a quota that can hide a useful result. */
-  if (self->preedit->len || self->swipe) {
-    if (!self->swipe)
+  /* Typed text keeps its literal choice first. A completed swipe keeps the
+   * service ranking while its first candidate is shown as editable preedit. */
+  if (self->preedit->len || self->swipe_state == SWIPE_PENDING) {
+    if (self->swipe_state == SWIPE_NONE)
       g_ptr_array_add (words, g_strdup (self->preedit->str));
-    ranked = self->swipe ? g_strdupv (self->ranked) : capitalize_ranked (self);
+    ranked = self->swipe_state != SWIPE_NONE ? g_strdupv (self->ranked) : capitalize_ranked (self);
     for (guint i = 0; ranked && ranked[i]; i++)
       append_unique (words, ranked[i]);
     g_ptr_array_add (words, NULL);
@@ -181,6 +189,7 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
     /* Do not log the preedit or daemon error message (which may contain it). */
     if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
       g_debug ("Dictionary lookup unavailable; retaining literal input");
+    pos_completer_verbisage_cancel_swipe (self);
     return;
   }
 
@@ -197,6 +206,34 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
   g_ptr_array_add (words, NULL);
   g_strfreev (self->ranked);
   self->ranked = (GStrv) g_ptr_array_free (g_steal_pointer (&words), FALSE);
+  if (self->swipe_state == SWIPE_PENDING) {
+    g_clear_pointer (&self->swipe_parameters, g_variant_unref);
+    if (self->swipe_capitalization == 1) {
+      GStrv capitalized = pos_completer_capitalize_by_template ("A", self->ranked);
+
+      g_strfreev (self->ranked);
+      self->ranked = capitalized;
+    } else if (self->swipe_capitalization == 2) {
+      for (guint i = 0; self->ranked[i]; i++) {
+        char *upper = g_utf8_strup (self->ranked[i], -1);
+
+        g_free (self->ranked[i]);
+        self->ranked[i] = upper;
+      }
+    }
+    if (self->ranked[0]) {
+      self->swipe_state = SWIPE_PREEDIT;
+      g_string_assign (self->preedit, self->ranked[0]);
+      /* Notify only after both values are consistent. Surface eligibility may
+       * be recalculated synchronously by either notification. */
+      g_object_freeze_notify (G_OBJECT (self));
+      publish_completions (self);
+      g_object_notify_by_pspec (G_OBJECT (self), props[PROP_PREEDIT]);
+      g_object_thaw_notify (G_OBJECT (self));
+      return;
+    }
+    self->swipe_state = SWIPE_NONE;
+  }
   publish_completions (self);
 }
 
@@ -206,7 +243,7 @@ start_lookup (PosCompleterVerbisage *self)
 {
   g_autofree char *word = g_utf8_strdown (self->preedit->str, -1);
 
-  if (self->swipe) {
+  if (self->swipe_state == SWIPE_PENDING) {
     g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "RecognizeSwipe",
                              self->swipe_parameters, G_VARIANT_TYPE ("(a(sd))"),
                              G_DBUS_CALL_FLAGS_NONE, LOOKUP_TIMEOUT_MS, self->cancellable,
@@ -235,6 +272,7 @@ on_bus_ready (GObject *source, GAsyncResult *result, gpointer user_data)
     return;
   if (!connection) {
     g_debug ("Session bus unavailable; retaining literal input");
+    pos_completer_verbisage_cancel_swipe (self);
     return;
   }
 
@@ -298,14 +336,21 @@ static gboolean
 pos_completer_verbisage_feed_symbol (PosCompleter *iface, const char *symbol)
 {
   PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (iface);
-  g_autofree char *previous = g_strdup (self->preedit->str);
+  g_autofree char *previous = NULL;
 
-  if (self->swipe) {
+  if (self->swipe_state == SWIPE_PENDING) {
     pos_completer_verbisage_cancel_swipe (self);
-    /* Backspace dismisses an uncommitted gesture without deleting app text. */
+    /* Backspace cancels a pending request without deleting application text. */
     if (g_str_equal (symbol, "KEY_BACKSPACE"))
       return TRUE;
+  } else if (self->swipe_state == SWIPE_PREEDIT && *symbol &&
+             !g_str_has_prefix (symbol, "KEY_") &&
+             !pos_completer_symbol_is_word_separator (symbol, NULL)) {
+    /* A tap starts the next word. Separators instead commit this guess with
+     * the normal punctuation/Enter behavior; Backspace edits the guess. */
+    pos_completer_verbisage_accept_swipe (self);
   }
+  previous = g_strdup (self->preedit->str);
 
   if (pos_completer_add_preedit (iface, self->preedit, symbol)) {
     PosCompleterBase *base = POS_COMPLETER_BASE (self);
@@ -482,24 +527,26 @@ pos_completer_verbisage_new (GError **error)
 }
 
 
-/* Gesture candidates are deliberately not preedit: only an explicit candidate
- * selection can commit them. Ordinary typing/reset cancels their generation. */
+/* A pending request has no preedit. Its first result becomes an editable
+ * composition; accepting it is a separate operation before another gesture. */
 void
 pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
                                         GVariant *trace,
-                                        GVariant *keys)
+                                        GVariant *keys,
+                                        guint capitalization)
 {
   g_return_if_fail (POS_IS_COMPLETER_VERBISAGE (self));
   g_return_if_fail (g_variant_is_of_type (trace, G_VARIANT_TYPE ("a(ddu)")));
   g_return_if_fail (g_variant_is_of_type (keys, G_VARIANT_TYPE ("a(sdddd)")));
 
-  if (self->preedit->len || !self->language ||
+  if (self->preedit->len || !self->language || capitalization > 2 ||
       g_variant_n_children (trace) < 2 || g_variant_n_children (trace) > 512 ||
       g_variant_n_children (keys) == 0 || g_variant_n_children (keys) > 64)
     return;
 
   cancel_lookup (self);
-  self->swipe = TRUE;
+  self->swipe_state = SWIPE_PENDING;
+  self->swipe_capitalization = capitalization;
   self->swipe_parameters = g_variant_ref_sink (
     g_variant_new ("(@a(ddu)@a(sdddd)us)", g_variant_ref (trace), g_variant_ref (keys),
                      (guint) MAX_RESULTS, self->language));
@@ -513,8 +560,94 @@ pos_completer_verbisage_cancel_swipe (PosCompleterVerbisage *self)
 {
   g_return_if_fail (POS_IS_COMPLETER_VERBISAGE (self));
 
-  if (!self->swipe)
+  /* Widget cancellation concerns only a pending gesture. A completed guess
+   * is ordinary editable text and survives changes to gesture eligibility. */
+  if (self->swipe_state != SWIPE_PENDING)
     return;
   cancel_lookup (self);
   publish_completions (self);
+}
+
+
+/* The surface uses this to allow another whole-word gesture at the same
+ * underlying text boundary while the current guess is still preedit. */
+gboolean
+pos_completer_verbisage_has_swipe_preedit (PosCompleterVerbisage *self)
+{
+  g_return_val_if_fail (POS_IS_COMPLETER_VERBISAGE (self), FALSE);
+
+  return self->swipe_state == SWIPE_PREEDIT;
+}
+
+
+gboolean
+pos_completer_verbisage_accept_swipe (PosCompleterVerbisage *self)
+{
+  g_autofree char *text = NULL;
+
+  g_return_val_if_fail (POS_IS_COMPLETER_VERBISAGE (self), FALSE);
+
+  if (!pos_completer_verbisage_has_swipe_preedit (self))
+    return FALSE;
+
+  text = g_strconcat (self->preedit->str, " ", NULL);
+  /* Clear the composition marker before emitting to prevent a second accept
+   * from a synchronous signal handler. Match the ordinary commit ordering. */
+  cancel_lookup (self);
+  g_signal_emit_by_name (self, "commit-string", text, 0, 0);
+  pos_completer_verbisage_set_preedit (POS_COMPLETER (self), NULL);
+  return TRUE;
+}
+
+
+/* Opaque, owned state for the surface's single completion-selection undo. */
+GVariant *
+pos_completer_verbisage_snapshot_swipe (PosCompleterVerbisage *self)
+{
+  g_return_val_if_fail (POS_IS_COMPLETER_VERBISAGE (self), NULL);
+
+  if (!pos_completer_verbisage_has_swipe_preedit (self))
+    return NULL;
+
+  return g_variant_ref_sink (g_variant_new ("(ss^as)", self->language,
+                                           self->preedit->str, self->ranked));
+}
+
+
+gboolean
+pos_completer_verbisage_restore_swipe (PosCompleterVerbisage *self, GVariant *snapshot)
+{
+  const char *language, *preedit;
+  g_auto (GStrv) ranked = NULL;
+  gboolean changed;
+
+  g_return_val_if_fail (POS_IS_COMPLETER_VERBISAGE (self), FALSE);
+
+  if (!snapshot || !g_variant_is_of_type (snapshot, G_VARIANT_TYPE ("(ssas)")))
+    return FALSE;
+  g_variant_get (snapshot, "(&s&s^as)", &language, &preedit, &ranked);
+  if (g_strcmp0 (language, self->language) || !*preedit || !ranked[0] ||
+      g_strcmp0 (preedit, ranked[0]) || g_strv_length (ranked) > MAX_RESULTS)
+    return FALSE;
+  for (guint i = 0; ranked[i]; i++) {
+    if (!*ranked[i] || g_utf8_strlen (ranked[i], -1) > MAX_WORD_CHARS)
+      return FALSE;
+    for (guint j = 0; j < i; j++) {
+      if (g_str_equal (ranked[i], ranked[j]))
+        return FALSE;
+    }
+  }
+
+  changed = self->swipe_state != SWIPE_PREEDIT ||
+            g_strcmp0 (self->preedit->str, preedit) != 0;
+  cancel_lookup (self);
+  self->swipe_state = SWIPE_PREEDIT;
+  self->ranked = g_steal_pointer (&ranked);
+  g_string_assign (self->preedit, preedit);
+  g_object_freeze_notify (G_OBJECT (self));
+  publish_completions (self);
+  if (changed)
+    g_object_notify_by_pspec (G_OBJECT (self), props[PROP_PREEDIT]);
+  g_object_thaw_notify (G_OBJECT (self));
+  return TRUE;
 }
