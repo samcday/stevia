@@ -1,58 +1,75 @@
 # English swipe prototype
 
-This branch adds a default-off whole-word gesture path to the existing
-Verbisage completion backend. It requires the matching Verbisage
-`codex/swipe-prototype` service, which decodes with Drift Type and the English
-Patricia dictionary. Stevia has no Drift Type library dependency.
-
-The prototype accepts one finger or a primary-button pointer drag on the
-normal lowercase English-US layout. It starts only with empty preedit at an
-empty word position (beginning/end or whitespace on both sides), no selection,
-an active normal-purpose input field and enabled completion. Password/PIN,
-hidden/sensitive hints, other languages, uppercase/symbol layers and cursor
-mode do not start gestures. This is a deliberately narrow trial, with no claim
-of general recognition quality or multilingual support.
+This default-off branch sends whole-word gestures to the matching Verbisage
+`codex/swipe-prototype` service, using Drift Type and the English Patricia
+dictionary. The second trial adds immediate editable guesses, more responsive
+gesture capture, Shift/Caps Lock support and undo for a selected completion.
 
 ## Interaction
 
-A letter press remains a normal tap until movement exceeds 35% of that key's
-width (at least 12 logical pixels). Crossing that threshold cancels the pressed
-key before it can produce letters. The blue trail follows actual touch points;
-each segment fades over 1.5 seconds, including after release. Frame callbacks
-and trace storage are removed after fading, cancellation, disable or unmap.
+Start at a new word boundary in an English-US text field with Verbisage
+completion enabled. Touch or press a letter and move normally: there is no
+hold requirement. Crossing GTK's normal drag threshold starts the trail and
+cancels the character long-press recognizer. A stationary hold still opens
+alternate characters. Each blue trail segment fades over 1.5 seconds.
 
-Release sends one asynchronous recognition request. Up to six unique candidates
-appear in the existing bar. Selecting one uses the existing candidate commit
-path (word plus space); no candidate enters preedit or commits automatically.
-Starting a new letter, Backspace, reset or a new gesture dismisses old results.
-Space remains literal and never accepts a decoded candidate implicitly.
+Release shows the top recognized word immediately as editable preedit, with
+alternatives in the candidate bar. Space, punctuation and Enter use the normal
+word-ending behavior. Starting a tapped letter accepts the guess with a space
+and begins the next word. Completing another swipe accepts the preceding word,
+waits for the application's text acknowledgement, then recognizes the new one.
+Backspace on an unselected guess edits it as ordinary typed text.
 
-A second contact, touch cancellation, leaving the widget, excessive duration or
-sample count, focus/context changes, changing layout/size/layer, disabling the
-feature or hiding the keyboard cancels the gesture and stale replies. Ordinary
-taps, letter long press and space cursor mode retain their existing paths.
+Tapping a candidate commits that choice. An immediate Backspace restores the
+previous preedit and candidates, including the swipe alternatives. This single
+undo belongs to Stevia's direct selection path; engines that handle selections
+themselves retain control. Undo requires an exact acknowledgement of the
+inserted UTF-8 bytes, cursor and surrounding text. Focus changes, cursor moves,
+other input, mode/layout changes and backend changes invalidate it. If the app
+does not report matching surrounding text, Backspace retains its ordinary
+behavior. No guessed suffix deletion is used.
+
+One-shot Shift capitalizes the recognized word's initial and resets after the
+gesture. Caps Lock produces uppercase words and remains enabled. Actual key
+rectangles are sent with lowercase labels; capitalization stays in Stevia.
+
+## Scope and cancellation
+
+One finger or a primary-button drag is supported on English-US alphabet
+layouts. A new gesture requires an empty underlying word boundary, no selection,
+an eligible normal-purpose field and enabled completion. An existing completed
+swipe guess may precede another gesture. Password/PIN, hidden/sensitive hints,
+symbol layouts, cursor mode and mixed typed/swipe words are excluded.
+
+A second touch, focus/context change, leaving the widget, layout/size changes,
+disabling the feature or hiding the keyboard cancels an unfinished gesture and
+stale replies. A failed lookup leaves application text unchanged. A previous
+word already accepted before a subsequent lookup fails remains committed.
+There is no learning, trace persistence or multilingual accuracy claim.
 
 ## Protocol and bounds
 
-The existing `org.verbisage.Dictionary` session bus name, object
-`/org/verbisage/Dictionary` and `org.verbisage.Dictionary1` interface gain:
+The existing `org.verbisage.Dictionary1` interface provides:
 
 ```
 RecognizeSwipe(a(ddu) trace, a(sdddd) keys, u maximum, s language) -> a(sd)
 ```
 
-Trace records are logical widget x/y and elapsed milliseconds (first zero).
-Key records are lowercase ASCII label, left, top, width and height from the
-allocated keyboard, in the same coordinates. Stevia requires 26 letter keys,
-keeps at most 512 samples over 10 seconds, and requests six results for `en_US`.
-The service ranks candidates; the frontend treats returned scores as opaque.
-A one-second client timeout or unsupported/unavailable service leaves the
-application text untouched. No traces are persisted or learned by this UI.
+Trace entries are logical x/y and elapsed milliseconds, starting at zero. Key
+entries are label, left, top, width and height from the allocated layout in the
+same coordinates. Stevia requires 26 ASCII letter keys, keeps at most 512
+samples over ten seconds, and requests six results for `en_US`. Recognition
+and the acknowledgement between consecutive swipes each have a one-second
+limit. Case handling and completion undo do not change the service protocol.
 
-## Opt in on a test session
+## Opt in
 
-After installing matching prototype builds and schemas, record the prior
-values, select Verbisage and enable the feature:
+The versioned live trial helper uses an ephemeral `/usr` overlay and a schema
+default override, keeping saved preferences unchanged. Store its bundle under
+the user's home so the files survive reboot; rerun the helper to enable the
+experiment again. Reboot removes the active overlay.
+
+For an independently installed test build, record the prior values first:
 
 ```sh
 gsettings get mobi.phosh.osk.Completers default
@@ -61,21 +78,18 @@ gsettings set mobi.phosh.osk.Completers default verbisage
 gsettings set mobi.phosh.osk swipe-typing true
 ```
 
-Both settings apply live. Set `swipe-typing` back to `false` to disable and
-cancel the gesture path; restore the recorded completer if desired. Private
-tests can instead use a separate schema override and memory settings without
-changing the live keyboard.
+Restore the recorded values afterwards. Private tests use a separate schema
+copy and memory settings instead of changing the live keyboard.
 
 ## Validation
 
-The x86_64 Rawhide build passes all 72 Meson targets, including 20 fake-service
-adapter cases, eight widget cases and four input-surface cases. New coverage
-exercises single-call ordering/caps, explicit-only output, stale/canceled
-replies, context changes, unsupported service/recovery, pointer taps and
-swipes, touch and second-contact cancellation, long press, space cursor mode,
-size/layer/unmap cancellation, duration/sample bounds and trail decay/cleanup.
-The locale check uses the real English-US layout; input-boundary tests include
-Unicode cursor offsets and selections. Purpose tests check private wire hints.
+The integrated x86_64 build passes 73 Meson targets. Tests include real GTK event
+dispatch through long-press and ancestor gesture controllers, rapid touch
+motion, taps and alternate-character holds, Shift/Caps Lock, cancellation,
+trail cleanup, editable recognition, snapshot restoration and bounded exact
+UTF-8 undo acknowledgements. The private Phoc/GTK4 trial harness additionally
+checks the real keyboard and decoder together, including consecutive words,
+selection undo and focus changes. Device logs remain outside this source tree.
 
 ```sh
 meson setup _build-swipe -Dgtk_doc=false
@@ -83,9 +97,6 @@ meson compile -C _build-swipe
 LC_ALL=C.UTF-8 xwfb-run -c mutter -- meson test -C _build-swipe --print-errorlogs
 ```
 
-In a nested container, Glycin may need its process-only image-loader sandbox
-accommodation for graphical tests; this is not a production setting.
-Integration validation additionally uses the actual Stevia widget on private
-Phoc/GTK4 with the real decoder and dictionary: drawing a path, letting its
-trail decay, explicitly selecting `hello`, and canceling during focus change.
-Functional smoke tests do not establish recognition accuracy across users.
+Nested containers may need a process-only Glycin accommodation for graphical
+tests; it is not a production keyboard setting. Synthetic checks establish
+integration behavior, not recognition accuracy across people.

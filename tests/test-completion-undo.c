@@ -52,6 +52,27 @@ test_acknowledgement (void)
 
 
 static void
+test_preedit_ack_in_flight (void)
+{
+  g_autoptr (PosCompletionUndo) undo =
+    pos_completion_undo_new ("", 0, 0, "hello ", "hello", NULL, NULL, 10);
+
+  g_assert_true (pos_completion_undo_observe (undo, "", 0, 0, 11, TRUE));
+  g_assert_false (pos_completion_undo_matches (undo, "hello ", 6, 6));
+  g_assert_true (pos_completion_undo_observe (undo, "", 0, 0, 12, TRUE));
+  g_assert_false (pos_completion_undo_matches (undo, "", 0, 0));
+  g_assert_true (pos_completion_undo_observe (undo, "hello ", 6, 6, 13, TRUE));
+  g_assert_true (pos_completion_undo_matches (undo, "hello ", 6, 6));
+  g_assert_false (pos_completion_undo_observe (undo, "", 0, 0, 14, TRUE));
+
+  g_clear_pointer (&undo, pos_completion_undo_free);
+  undo = pos_completion_undo_new ("", 0, 0, "hello ", "hello", NULL, NULL, 10);
+  g_assert_true (pos_completion_undo_observe (undo, "", 0, 0, 12, TRUE));
+  g_assert_false (pos_completion_undo_observe (undo, "hello ", 6, 6, 11, TRUE));
+}
+
+
+static void
 test_serial_wrap (void)
 {
   g_autoptr (PosCompletionUndo) undo =
@@ -76,7 +97,7 @@ test_invalid_changes (void)
     { "hello ", 6, 0, 11, TRUE }, /* Selection. */
     { "Hello ", 6, 6, 11, TRUE }, /* Application normalization. */
     { "hello\302\240", 7, 7, 11, TRUE }, /* Changed separator. */
-    { "", 0, 0, 11, TRUE }, /* New state did not accept the insertion. */
+    { "x", 1, 1, 11, TRUE }, /* Unrelated insertion. */
     { "hello ", 6, 6, 10, TRUE }, /* Expected bytes without a newer serial. */
     { "hello ", 6, 6, 9, TRUE }, /* Stale event. */
     { NULL, 0, 0, 11, TRUE }, /* No surrounding-text support. */
@@ -149,6 +170,7 @@ main (int argc, char *argv[])
   g_test_init (&argc, &argv, NULL);
   g_test_add_func ("/pos/completion-undo/utf8-suffix-snapshot", test_utf8_and_suffix);
   g_test_add_func ("/pos/completion-undo/acknowledgement", test_acknowledgement);
+  g_test_add_func ("/pos/completion-undo/preedit-ack-in-flight", test_preedit_ack_in_flight);
   g_test_add_func ("/pos/completion-undo/serial-wrap", test_serial_wrap);
   g_test_add_func ("/pos/completion-undo/invalid-changes", test_invalid_changes);
   g_test_add_func ("/pos/completion-undo/constructor-rejections", test_constructor_rejections);

@@ -21,7 +21,8 @@ PosCompletionUndo *pos_completion_undo_new (const char *surrounding,
 void pos_completion_undo_free (PosCompletionUndo *self);
 
 /* FALSE permanently invalidates the snapshot. Before acknowledgement, the
- * original context at the original serial is retained without becoming ready.
+ * exact original context is retained without becoming ready, including older
+ * preedit-only acknowledgements that arrive with a newer serial.
  * The caller must also discard the snapshot on focus or local input changes. */
 gboolean pos_completion_undo_observe (PosCompletionUndo *self,
                                       const char *text,

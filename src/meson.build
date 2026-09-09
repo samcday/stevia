@@ -43,6 +43,8 @@ libpos_sources = files(
   'pos-completer-manager.h',
   'pos-completer.c',
   'pos-completer.h',
+  'pos-completion-undo.c',
+  'pos-completion-undo.h',
   'pos-completion-bar.c',
   'pos-completion-bar.h',
   'pos-completions-box.c',

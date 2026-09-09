@@ -46,7 +46,7 @@ test_swipe_layout (void)
   g_assert_true (pos_osk_widget_set_layout (osk, "us", "us", "English US", "us", NULL, NULL));
   g_assert_true (swipe_layout_supported (osk));
   pos_osk_widget_set_layer (osk, POS_OSK_WIDGET_LAYER_CAPS);
-  g_assert_false (swipe_layout_supported (osk));
+  g_assert_true (swipe_layout_supported (osk));
   pos_osk_widget_set_layer (osk, POS_OSK_WIDGET_LAYER_SYMBOLS);
   g_assert_false (swipe_layout_supported (osk));
   pos_osk_widget_set_layer (osk, POS_OSK_WIDGET_LAYER_NORMAL);

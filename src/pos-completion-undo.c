@@ -155,10 +155,16 @@ pos_completion_undo_observe (PosCompletionUndo *self,
       !valid_context (text, cursor, anchor, NULL))
     goto invalid;
 
-  if (!self->ready && advance == 0) {
-    if (cursor != self->original_cursor || strcmp (text, self->original))
+  if (!self->ready) {
+    /* A preedit-only acknowledgement already in flight can precede the
+     * insertion acknowledgement. Keep waiting at the exact original context;
+     * this never enables undo and cannot move confirmed state back to pending. */
+    if (cursor == self->original_cursor && strcmp (text, self->original) == 0) {
+      self->serial = serial;
+      return TRUE;
+    }
+    if (advance == 0)
       goto invalid;
-    return TRUE;
   }
 
   if (cursor != self->expected_cursor || strcmp (text, self->expected))
