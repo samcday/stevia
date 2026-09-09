@@ -26,6 +26,7 @@ typedef struct {
   const char *hold_word;
   gboolean fail;
   gboolean empty;
+  gboolean case_variants;
   gboolean accept_again;
   guint commits;
   guint requests;
@@ -169,7 +170,15 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
 
   if (fixture->hold_word && g_str_equal (word, fixture->hold_word))
     g_ptr_array_add (fixture->held, g_object_ref (invocation));
-  else if (fixture->empty)
+  else if (fixture->case_variants) {
+    GVariantBuilder builder;
+    const char *words[] = {"hello", "Hello", "help", "HELP", NULL};
+
+    g_variant_builder_init (&builder, G_VARIANT_TYPE ("a(sd)"));
+    for (guint i = 0; words[i]; i++)
+      g_variant_builder_add (&builder, "(sd)", words[i], 1.0 - i * 0.1);
+    g_dbus_method_invocation_return_value (invocation, g_variant_new ("(a(sd))", &builder));
+  } else if (fixture->empty)
     g_dbus_method_invocation_return_value (invocation,
       g_variant_new ("(@a(sd))", g_variant_new_array (G_VARIANT_TYPE ("(sd)"), NULL, 0)));
   else if (fixture->fail)
@@ -669,12 +678,17 @@ test_swipe_capitalization (Fixture *fixture, gconstpointer unused)
   PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
   g_autoptr (GVariant) snapshot = NULL;
 
+  fixture->case_variants = TRUE;
   request_swipe_capitalized (fixture, 1);
   wait_completion (fixture->completer, "Hello");
   g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "Hello");
   g_assert_true (has_completion (fixture->completer, "Help"));
   g_assert_false (has_completion (fixture->completer, "hello"));
   g_assert_false (has_completion (fixture->completer, "HELLO"));
+  snapshot = pos_completer_verbisage_snapshot_swipe (self);
+  pos_completer_set_preedit (fixture->completer, NULL);
+  g_assert_true (pos_completer_verbisage_restore_swipe (self, snapshot));
+  g_clear_pointer (&snapshot, g_variant_unref);
   g_assert_true (pos_completer_feed_symbol (fixture->completer, " "));
   g_assert_cmpstr (fixture->committed, ==, "Hello ");
 

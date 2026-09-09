@@ -221,6 +221,17 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
         self->ranked[i] = upper;
       }
     }
+    if (self->swipe_capitalization) {
+      g_autoptr (GPtrArray) unique = g_ptr_array_new_with_free_func (g_free);
+
+      /* Case conversion can merge distinct service spellings. Keep the stored
+       * list identical to the visible choices so its snapshot restores too. */
+      for (guint i = 0; self->ranked[i]; i++)
+        append_unique (unique, self->ranked[i]);
+      g_ptr_array_add (unique, NULL);
+      g_strfreev (self->ranked);
+      self->ranked = (GStrv) g_ptr_array_free (g_steal_pointer (&unique), FALSE);
+    }
     if (self->ranked[0]) {
       self->swipe_state = SWIPE_PREEDIT;
       g_string_assign (self->preedit, self->ranked[0]);
