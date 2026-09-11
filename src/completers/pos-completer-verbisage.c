@@ -52,6 +52,9 @@ struct _PosCompleterVerbisage {
   GCancellable *cancellable;
   guint64 generation;
   guint lookup_id;
+  gboolean enabled;
+  gboolean awaiting_context;
+  gboolean context_available;
 };
 
 typedef struct {
@@ -143,6 +146,88 @@ capitalize_ranked (PosCompleterVerbisage *self)
 }
 
 
+/* Context is a bounded snapshot supplied by the current input field. Never
+ * include the live preedit, or infer a sentence start from a truncated window. */
+static gboolean
+context_word_char (gunichar ch)
+{
+  return g_unichar_isalnum (ch) || g_unichar_ismark (ch) || ch == '\'' || ch == 0x2019;
+}
+
+
+static gboolean
+can_predict (PosCompleterVerbisage *self)
+{
+  const char *before = pos_completer_base_get_before_text (POS_COMPLETER_BASE (self));
+  const char *after = pos_completer_base_get_after_text (POS_COMPLETER_BASE (self));
+  const char *last;
+
+  if (!self->enabled || self->awaiting_context || !self->context_available)
+    return FALSE;
+  last = g_utf8_find_prev_char (before, before + strlen (before));
+  return (!last || !context_word_char (g_utf8_get_char (last))) &&
+    (!*after || !context_word_char (g_utf8_get_char (after)));
+}
+
+
+static GStrv
+build_context (PosCompleterVerbisage *self)
+{
+  g_autoptr (GPtrArray) words = g_ptr_array_new_with_free_func (g_free);
+  const char *before = pos_completer_base_get_before_text (POS_COMPLETER_BASE (self));
+  const char *start, *token = NULL;
+  gboolean bos = FALSE, token_has_letter = FALSE;
+  gsize len;
+
+  if (!self->enabled || self->awaiting_context || !self->context_available)
+    goto done;
+  len = strlen (before);
+  start = before;
+  if (len > 1024) {
+    start = before + len - 1024;
+    while ((*start & 0xc0) == 0x80)
+      start++;
+    /* The clipped initial word is not known to be complete. */
+    while (*start && context_word_char (g_utf8_get_char (start)))
+      start = g_utf8_next_char (start);
+  }
+  for (const char *p = start; ; p = g_utf8_next_char (p)) {
+    gunichar ch = g_utf8_get_char (p);
+
+    if (ch && context_word_char (ch)) {
+      if (!token)
+        token = p;
+      token_has_letter |= g_unichar_isalnum (ch);
+    } else {
+      /* A trailing fragment belongs to the word at the cursor, not history. */
+      if (ch && token && token_has_letter) {
+        if (g_utf8_pointer_to_offset (token, p) <= MAX_WORD_CHARS) {
+          g_ptr_array_add (words, g_strndup (token, p - token));
+          if (words->len > 3)
+            g_ptr_array_remove_index (words, 0);
+        } else {
+          g_ptr_array_set_size (words, 0);
+          bos = FALSE;
+        }
+      }
+      token = NULL;
+      token_has_letter = FALSE;
+      if (ch == '.' || ch == '!' || ch == '?' || ch == '\n' || ch == '\r') {
+        g_ptr_array_set_size (words, 0);
+        bos = TRUE;
+      }
+    }
+    if (!ch)
+      break;
+  }
+  if (bos && words->len < 3)
+    g_ptr_array_insert (words, 0, g_strdup ("<s>"));
+ done:
+  g_ptr_array_add (words, NULL);
+  return (GStrv) g_ptr_array_free (g_steal_pointer (&words), FALSE);
+}
+
+
 static void
 publish_completions (PosCompleterVerbisage *self)
 {
@@ -152,8 +237,8 @@ publish_completions (PosCompleterVerbisage *self)
 
   /* Typed text keeps its literal choice first. A completed swipe keeps the
    * service ranking while its first candidate is shown as editable preedit. */
-  if (self->preedit->len || self->swipe_state == SWIPE_PENDING) {
-    if (self->swipe_state == SWIPE_NONE)
+  if (self->preedit->len || self->swipe_state == SWIPE_PENDING || can_predict (self)) {
+    if (self->swipe_state == SWIPE_NONE && self->preedit->len)
       g_ptr_array_add (words, g_strdup (self->preedit->str));
     ranked = self->swipe_state != SWIPE_NONE ? g_strdupv (self->ranked) : capitalize_ranked (self);
     for (guint i = 0; ranked && ranked[i]; i++)
@@ -252,7 +337,7 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
 static void
 start_lookup (PosCompleterVerbisage *self)
 {
-  g_autofree char *word = g_utf8_strdown (self->preedit->str, -1);
+  g_auto (GStrv) context = build_context (self);
 
   if (self->swipe_state == SWIPE_PENDING) {
     g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "RecognizeSwipe",
@@ -262,13 +347,24 @@ start_lookup (PosCompleterVerbisage *self)
     return;
   }
 
-  /* One ranked reply prevents the candidate bar changing order as separate
-   * prefix and spelling calls finish. Older daemons fail safely to literal. */
-  g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "Complete",
-                           g_variant_new ("(sus)", word, (guint) MAX_RESULTS, self->language),
-                           G_VARIANT_TYPE ("(a(sd))"), G_DBUS_CALL_FLAGS_NONE,
-                           LOOKUP_TIMEOUT_MS, self->cancellable, on_lookup_finished,
-                           lookup_new (self));
+  /* The keyboard applies capitalization to display choices. Compare without
+   * a case bonus; context and input folding are explicit service parameters. */
+  if (self->preedit->len) {
+    g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "CompleteWith",
+                             g_variant_new ("(s^asus(ss)(ss)s)", self->preedit->str, context,
+                                              (guint) MAX_RESULTS, self->language,
+                                              "nfc", "full", "nfc", "full", "insensitive"),
+                             G_VARIANT_TYPE ("(a(sd))"), G_DBUS_CALL_FLAGS_NONE,
+                             LOOKUP_TIMEOUT_MS, self->cancellable, on_lookup_finished,
+                             lookup_new (self));
+  } else {
+    g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "PredictWith",
+                             g_variant_new ("(^asus(ss))", context, (guint) MAX_RESULTS,
+                                              self->language, "nfc", "full"),
+                             G_VARIANT_TYPE ("(a(sd))"), G_DBUS_CALL_FLAGS_NONE,
+                             LOOKUP_TIMEOUT_MS, self->cancellable, on_lookup_finished,
+                             lookup_new (self));
+  }
 }
 
 static void
@@ -316,7 +412,7 @@ update_lookup (PosCompleterVerbisage *self)
 {
   cancel_lookup (self);
   publish_completions (self);
-  if (self->preedit->len && self->language &&
+  if (self->enabled && (self->preedit->len || can_predict (self)) && self->language &&
       g_utf8_strlen (self->preedit->str, -1) <= MAX_WORD_CHARS)
     self->lookup_id = g_timeout_add (LOOKUP_DELAY_MS, lookup_timeout, self);
 }
@@ -389,12 +485,18 @@ pos_completer_verbisage_set_surrounding_text (PosCompleter *iface,
                                              const char *before,
                                              const char *after)
 {
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (iface);
   PosCompleterBase *base = POS_COMPLETER_BASE (iface);
 
-  if (g_strcmp0 (pos_completer_base_get_before_text (base), before) ||
-      g_strcmp0 (pos_completer_base_get_after_text (base), after))
-    pos_completer_verbisage_cancel_swipe (POS_COMPLETER_VERBISAGE (iface));
+  if (self->context_available == (before != NULL && after != NULL) &&
+      !g_strcmp0 (pos_completer_base_get_before_text (base), before ?: "") &&
+      !g_strcmp0 (pos_completer_base_get_after_text (base), after ?: ""))
+    return;
+  self->context_available = before != NULL && after != NULL;
+  pos_completer_verbisage_cancel_swipe (self);
   pos_completer_base_set_surrounding_text (base, before, after);
+  self->awaiting_context = FALSE;
+  update_lookup (self);
 }
 
 
@@ -525,6 +627,7 @@ pos_completer_verbisage_interface_init (PosCompleterInterface *iface)
 static void
 pos_completer_verbisage_init (PosCompleterVerbisage *self)
 {
+  self->enabled = TRUE;
   self->preedit = g_string_new (NULL);
   self->language = g_strdup ("en_US");
 }
@@ -661,4 +764,49 @@ pos_completer_verbisage_restore_swipe (PosCompleterVerbisage *self, GVariant *sn
     g_object_notify_by_pspec (G_OBJECT (self), props[PROP_PREEDIT]);
   g_object_thaw_notify (G_OBJECT (self));
   return TRUE;
+}
+
+/* The surface controls request lifetime independently from preedit changes. */
+void
+pos_completer_verbisage_set_enabled (PosCompleterVerbisage *self, gboolean enabled)
+{
+  g_return_if_fail (POS_IS_COMPLETER_VERBISAGE (self));
+
+  if (self->enabled == enabled)
+    return;
+  self->enabled = enabled;
+  if (!enabled) {
+    self->context_available = FALSE;
+    self->awaiting_context = FALSE;
+    pos_completer_base_set_surrounding_text (POS_COMPLETER_BASE (self), NULL, NULL);
+  }
+  update_lookup (self);
+}
+
+
+/* Called before a Wayland text edit. An acknowledgement refreshes context;
+ * until then prefix completion falls back to context-free ranking. */
+void
+pos_completer_verbisage_expect_commit (PosCompleterVerbisage *self)
+{
+  g_return_if_fail (POS_IS_COMPLETER_VERBISAGE (self));
+
+  self->awaiting_context = TRUE;
+  cancel_lookup (self);
+}
+
+
+/* The surface verified the exact acknowledgement of a swipe-selection undo.
+ * Update its context without replacing the restored gesture alternatives. */
+void
+pos_completer_verbisage_acknowledge_swipe (PosCompleterVerbisage *self,
+                                         const char *before,
+                                         const char *after)
+{
+  g_return_if_fail (POS_IS_COMPLETER_VERBISAGE (self));
+  g_return_if_fail (self->swipe_state == SWIPE_PREEDIT);
+
+  self->context_available = before != NULL && after != NULL;
+  self->awaiting_context = FALSE;
+  pos_completer_base_set_surrounding_text (POS_COMPLETER_BASE (self), before, after);
 }

@@ -94,7 +94,7 @@ pos_completion_undo_new (const char *surrounding,
 
   if (!valid_context (surrounding, cursor, anchor, &context_len) ||
       !valid_text (inserted, MAX_WORD_BYTES, &inserted_len) || !inserted_len ||
-      !valid_text (preedit, MAX_WORD_BYTES, &preedit_len) || !preedit_len ||
+      !valid_text (preedit, MAX_WORD_BYTES, &preedit_len) ||
       context_len + inserted_len > MAX_CONTEXT_BYTES ||
       !valid_candidates (candidates) ||
       (swipe_state && g_variant_get_size (swipe_state) > MAX_CONTEXT_BYTES))
@@ -190,6 +190,24 @@ pos_completion_undo_matches (PosCompletionUndo *self,
   return self && self->valid && self->ready &&
          valid_context (text, cursor, anchor, NULL) &&
          cursor == self->expected_cursor && strcmp (text, self->expected) == 0;
+}
+
+
+/* A restored composition survives only acknowledgement of our exact deletion.
+ * Focus changes and intervening local input discard this snapshot at the surface. */
+gboolean
+pos_completion_undo_matches_revert (PosCompletionUndo *self,
+                                    const char *text,
+                                    guint cursor,
+                                    guint anchor,
+                                    guint serial,
+                                    gboolean im_change)
+{
+  guint32 advance = self ? (guint32) serial - self->serial : 0;
+
+  return self && self->valid && self->ready && im_change && advance > 0 &&
+         advance <= G_MAXINT32 && valid_context (text, cursor, anchor, NULL) &&
+         cursor == self->original_cursor && strcmp (text, self->original) == 0;
 }
 
 

@@ -34,6 +34,12 @@ gboolean pos_completion_undo_matches (PosCompletionUndo *self,
                                       const char *text,
                                       guint cursor,
                                       guint anchor);
+gboolean pos_completion_undo_matches_revert (PosCompletionUndo *self,
+                                             const char *text,
+                                             guint cursor,
+                                             guint anchor,
+                                             guint serial,
+                                             gboolean im_change);
 
 /* All returned strings, arrays and variants are borrowed, immutable snapshots. */
 const char *pos_completion_undo_get_preedit (PosCompletionUndo *self);

@@ -13,6 +13,11 @@ static const char service_xml[] =
   "<method name='Complete'><arg type='s' direction='in'/>"
   "<arg type='u' direction='in'/><arg type='s' direction='in'/>"
   "<arg type='a(sd)' direction='out'/></method>"
+  "<method name='CompleteWith'><arg type='s' direction='in'/><arg type='as' direction='in'/>"
+  "<arg type='u' direction='in'/><arg type='s' direction='in'/><arg type='(ss)' direction='in'/>"
+  "<arg type='(ss)' direction='in'/><arg type='s' direction='in'/><arg type='a(sd)' direction='out'/></method>"
+  "<method name='PredictWith'><arg type='as' direction='in'/><arg type='u' direction='in'/>"
+  "<arg type='s' direction='in'/><arg type='(ss)' direction='in'/><arg type='a(sd)' direction='out'/></method>"
   "<method name='RecognizeSwipe'><arg type='a(ddu)' direction='in'/>"
   "<arg type='a(sdddd)' direction='in'/><arg type='u' direction='in'/>"
   "<arg type='s' direction='in'/><arg type='a(sd)' direction='out'/></method>"
@@ -31,6 +36,9 @@ typedef struct {
   guint commits;
   guint requests;
   guint swipe_requests;
+  guint prediction_requests;
+  GStrv last_context;
+  char *last_word;
   guint changes;
   gboolean unsupported;
   char *committed;
@@ -96,14 +104,32 @@ answer (GDBusMethodInvocation *invocation)
   GVariant *parameters = g_dbus_method_invocation_get_parameters (invocation);
   const char *word;
   g_autofree char *generated = NULL;
+  g_autofree char *folded = NULL;
+  g_auto (GStrv) context = NULL;
+  const char *method = g_dbus_method_invocation_get_method_name (invocation);
   GVariantBuilder builder;
 
-  if (g_str_equal (g_dbus_method_invocation_get_method_name (invocation), "RecognizeSwipe"))
+  if (g_str_equal (method, "RecognizeSwipe"))
     word = "swipe";
-  else
+  else if (g_str_equal (method, "PredictWith")) {
+    g_variant_get_child (parameters, 0, "^as", &context);
+    word = "";
+  } else {
     g_variant_get_child (parameters, 0, "&s", &word);
+    folded = g_utf8_strdown (word, -1);
+    word = folded;
+    g_variant_get_child (parameters, 1, "^as", &context);
+  }
   g_variant_builder_init (&builder, G_VARIANT_TYPE ("a(sd)"));
-  if (g_str_equal (word, "swipe")) {
+  if (!*word || (g_str_equal (word, "l") && context && g_strv_contains ((const char *const *) context, "you"))) {
+    const char *next = "next";
+
+    if (context && g_strv_contains ((const char *const *) context, "you"))
+      next = "later";
+    else if (context && g_strv_contains ((const char *const *) context, "see"))
+      next = "you";
+    g_variant_builder_add (&builder, "(sd)", next, 1.0);
+  } else if (g_str_equal (word, "swipe")) {
     const char *ranked[] = {"hello", "hello", "help", "held", "world", "word", "work", "extra", NULL};
     for (guint i = 0; ranked[i]; i++)
       g_variant_builder_add (&builder, "(sd)", ranked[i], 1.0 - i * 0.1);
@@ -150,6 +176,9 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
   const char *language;
   const char *word;
   guint max;
+  g_autofree char *folded = NULL;
+  g_auto (GStrv) context = NULL;
+  const char *normalization, *fold;
 
   fixture->requests++;
   if (g_str_equal (method, "RecognizeSwipe")) {
@@ -161,10 +190,30 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
     g_assert_cmpuint (g_variant_n_children (trace), ==, 3);
     g_assert_cmpuint (g_variant_n_children (keys), ==, 26);
     word = "swipe";
+  } else if (g_str_equal (method, "PredictWith")) {
+    fixture->prediction_requests++;
+    word = "";
+    g_variant_get (parameters, "(^asu&s(&s&s))", &context, &max, &language, &normalization, &fold);
+    g_assert_cmpstr (normalization, ==, "nfc");
+    g_assert_cmpstr (fold, ==, "full");
   } else {
-    g_assert_cmpstr (method, ==, "Complete");
-    g_variant_get (parameters, "(&su&s)", &word, &max, &language);
+    const char *input_normalization, *input_fold, *preference;
+
+    g_assert_cmpstr (method, ==, "CompleteWith");
+    g_variant_get (parameters, "(&s^asu&s(&s&s)(&s&s)&s)", &word, &context, &max, &language,
+                     &input_normalization, &input_fold, &normalization, &fold, &preference);
+    g_assert_cmpstr (input_normalization, ==, "nfc");
+    g_assert_cmpstr (input_fold, ==, "full");
+    g_assert_cmpstr (normalization, ==, "nfc");
+    g_assert_cmpstr (fold, ==, "full");
+    g_assert_cmpstr (preference, ==, "insensitive");
   }
+  g_strfreev (fixture->last_context);
+  fixture->last_context = g_strdupv (context);
+  g_free (fixture->last_word);
+  fixture->last_word = g_strdup (word);
+  folded = g_utf8_strdown (word, -1);
+  word = folded;
   g_assert_cmpstr (language, ==, "en_US");
   g_assert_cmpuint (max, ==, 6);
 
@@ -197,6 +246,7 @@ on_commit (PosCompleter *completer, const char *text, int before, int after, gpo
 {
   Fixture *fixture = user_data;
 
+  pos_completer_verbisage_expect_commit (POS_COMPLETER_VERBISAGE (completer));
   g_free (fixture->committed);
   fixture->committed = g_strdup (text);
   fixture->before = before;
@@ -263,6 +313,8 @@ teardown (Fixture *fixture, gconstpointer unused)
   g_dbus_connection_close_sync (fixture->service, NULL, NULL);
   g_clear_object (&fixture->service);
   g_free (fixture->committed);
+  g_free (fixture->last_word);
+  g_strfreev (fixture->last_context);
   spin (10);
 }
 
@@ -629,8 +681,12 @@ test_swipe_context (Fixture *fixture, gconstpointer unused)
   wait_held (fixture);
   pos_completer_set_surrounding_text (fixture->completer, "one two ", "");
   release_held (fixture);
-  spin (50);
-  g_assert_null (pos_completer_get_completions (fixture->completer));
+  /* The new context may predict, but the obsolete gesture must not return. */
+  wait_completion (fixture->completer, "next");
+  g_assert_false (has_completion (fixture->completer, "hello"));
+  g_assert_false (pos_completer_verbisage_has_swipe_preedit (
+    POS_COMPLETER_VERBISAGE (fixture->completer)));
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
   g_assert_null (fixture->committed);
 }
 
@@ -934,6 +990,75 @@ test_swipe_snapshot_invalid (Fixture *fixture, gconstpointer unused)
 
 
 static void
+test_prediction_chain (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  const char *expected[] = {"see", "you", NULL};
+  guint requests;
+
+  pos_completer_set_surrounding_text (fixture->completer, "see ", "");
+  wait_completion (fixture->completer, "you");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  requests = fixture->requests;
+  pos_completer_verbisage_expect_commit (self);
+  pos_completer_set_preedit (fixture->completer, NULL);
+  spin (120);
+  g_assert_cmpuint (fixture->requests, ==, requests);
+  pos_completer_set_surrounding_text (fixture->completer, "see you ", "");
+  wait_completion (fixture->completer, "later");
+  g_assert_cmpstrv (fixture->last_context, expected);
+  pos_completer_feed_symbol (fixture->completer, "l");
+  wait_completion (fixture->completer, "later");
+  g_assert_cmpstr (fixture->last_word, ==, "l");
+  g_assert_cmpstrv (fixture->last_context, expected);
+}
+
+
+static void
+test_context_boundaries (Fixture *fixture, gconstpointer unused)
+{
+  const char *expected[] = {"<s>", "See", "you", NULL};
+  const char *tail[] = {"two", "three", "four", NULL};
+  g_autofree char *padding = g_strnfill (2000, 'x');
+  g_autofree char *before = g_strconcat (padding, " old. See you ", NULL);
+
+  pos_completer_set_surrounding_text (fixture->completer, before, "");
+  pos_completer_set_preedit (fixture->completer, "l");
+  wait_completion (fixture->completer, "later");
+  g_assert_cmpstrv (fixture->last_context, expected);
+  pos_completer_set_surrounding_text (fixture->completer, "one two three four ", "");
+  wait_completion (fixture->completer, "lword");
+  g_assert_cmpstrv (fixture->last_context, tail);
+  pos_completer_set_preedit (fixture->completer, NULL);
+  pos_completer_set_surrounding_text (fixture->completer, "inside", "word");
+  spin (120);
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+}
+
+
+static void
+test_prediction_stale_and_disabled (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_word = "";
+  pos_completer_set_surrounding_text (fixture->completer, "see ", "");
+  wait_held (fixture);
+  fixture->hold_word = NULL;
+  pos_completer_set_surrounding_text (fixture->completer, "you ", "");
+  wait_completion (fixture->completer, "later");
+  release_held (fixture);
+  spin (100);
+  g_assert_false (has_completion (fixture->completer, "you"));
+  pos_completer_verbisage_set_enabled (self, FALSE);
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+  pos_completer_verbisage_set_enabled (self, TRUE);
+  spin (100);
+  g_assert_null (pos_completer_get_completions (fixture->completer));
+}
+
+
+static void
 test_real_service (void)
 {
   g_autoptr (PosCompleter) completer = pos_completer_verbisage_new (NULL);
@@ -977,6 +1102,9 @@ main (int argc, char **argv)
   g_test_dbus_up (bus);
 #define ADD_TEST(name, function) \
   g_test_add ("/pos/completer/verbisage/" name, Fixture, NULL, setup, function, teardown)
+  ADD_TEST ("prediction-chain", test_prediction_chain);
+  ADD_TEST ("context-boundaries", test_context_boundaries);
+  ADD_TEST ("prediction-stale-disabled", test_prediction_stale_and_disabled);
   ADD_TEST ("completion", test_completion);
   ADD_TEST ("ranked", test_ranked);
   ADD_TEST ("known-word", test_known_word);

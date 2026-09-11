@@ -123,6 +123,7 @@ struct _PosInputSurface {
 
   /* Wayland input-method */
   PosInputMethod             *input_method;
+  gboolean                    context_suspended;
 
   /* OSK */
   GPtrArray                  *osks;
@@ -169,6 +170,7 @@ struct _PosInputSurface {
   guint                       next_swipe_capitalization;
   guint                       next_swipe_timeout;
   PosCompletionUndo          *completion_undo;
+  PosCompletionUndo          *completion_restore;
 
   /* emission hook for clicks */
   gulong                      clicked_id;
@@ -200,6 +202,7 @@ static void
 clear_completion_undo (PosInputSurface *self)
 {
   g_clear_pointer (&self->completion_undo, pos_completion_undo_free);
+  g_clear_pointer (&self->completion_restore, pos_completion_undo_free);
 }
 
 
@@ -541,8 +544,35 @@ swipe_eligible (PosInputSurface *self, GtkWidget *widget)
 
 
 static void
+update_verbisage_context (PosInputSurface *self)
+{
+  const char *text;
+  guint anchor, cursor;
+  gboolean enabled;
+  g_autofree char *before = NULL;
+
+  if (!self->input_method || !POS_IS_COMPLETER_VERBISAGE (self->completer))
+    return;
+  text = pos_input_method_get_surrounding_text (self->input_method, &anchor, &cursor);
+  enabled = !self->context_suspended && pos_input_method_get_active (self->input_method) &&
+    pos_input_surface_is_completion_mode (self) && anchor == cursor &&
+    swipe_purpose_supported (pos_input_method_get_purpose (self->input_method),
+                              pos_input_method_get_hint (self->input_method));
+  if (text && (cursor > strlen (text) || !g_utf8_validate (text, cursor, NULL)))
+    enabled = FALSE;
+  pos_completer_verbisage_set_enabled (POS_COMPLETER_VERBISAGE (self->completer), enabled);
+  if (enabled) {
+    if (text)
+      before = g_strndup (text, cursor);
+    pos_completer_set_surrounding_text (self->completer, before, text ? text + cursor : NULL);
+  }
+}
+
+
+static void
 update_swipe_enabled (PosInputSurface *self)
 {
+  update_verbisage_context (self);
   if (!self->osks)
     return;
   for (guint i = 0; i < self->osks->len; i++) {
@@ -659,6 +689,8 @@ on_completion_selected (PosInputSurface *self, const char *completion)
   /* UIM and other engines that process selection themselves own their edits. */
   if (pos_completer_set_selected (self->completer, completion) == FALSE) {
     self->completion_undo = g_steal_pointer (&undo);
+    if (POS_IS_COMPLETER_VERBISAGE (self->completer))
+      pos_completer_verbisage_expect_commit (POS_COMPLETER_VERBISAGE (self->completer));
     pos_input_method_send_preedit (self->input_method, "", 0, 0, FALSE);
     pos_input_method_send_string (self->input_method, send, TRUE);
   }
@@ -734,6 +766,8 @@ undo_completion (PosInputSurface *self)
 
   /* Change the completer first with its preedit callback blocked, then submit
    * deletion and restored preedit together in exactly one Wayland commit. */
+  if (POS_IS_COMPLETER_VERBISAGE (self->completer))
+    pos_completer_verbisage_expect_commit (POS_COMPLETER_VERBISAGE (self->completer));
   g_signal_handlers_block_by_func (self->completer, on_completer_preedit_changed, self);
   if (swipe) {
     restored = POS_IS_COMPLETER_VERBISAGE (self->completer) &&
@@ -750,6 +784,8 @@ undo_completion (PosInputSurface *self)
   pos_input_method_send_preedit (self->input_method, preedit, position, position, TRUE);
   pos_completion_bar_set_completions (POS_COMPLETION_BAR (self->completion_bar),
                                       pos_completion_undo_get_candidates (undo));
+  if (swipe)
+    self->completion_restore = g_steal_pointer (&undo);
   update_swipe_enabled (self);
   return TRUE;
 }
@@ -761,6 +797,8 @@ on_completer_commit_string (PosInputSurface *self,
                             int              before,
                             int              after)
 {
+  if (POS_IS_COMPLETER_VERBISAGE (self->completer))
+    pos_completer_verbisage_expect_commit (POS_COMPLETER_VERBISAGE (self->completer));
   clear_completion_undo (self);
   g_debug ("%s: %s, (%d,%d)", __func__, text, before, after);
   if (before || after)
@@ -1868,6 +1906,23 @@ on_im_done (PosInputSurface *self)
   serial = pos_input_method_get_serial (self->input_method);
   im_change = pos_input_method_get_active (self->input_method) &&
     pos_input_method_get_text_change_cause (self->input_method) == POS_INPUT_METHOD_TEXT_CHANGE_CAUSE_IM;
+  if (self->completion_restore) {
+    if (!self->context_suspended && POS_IS_COMPLETER_VERBISAGE (self->completer) &&
+        pos_completer_verbisage_has_swipe_preedit (POS_COMPLETER_VERBISAGE (self->completer)) &&
+        pos_completion_undo_matches_revert (self->completion_restore, text, cursor, anchor,
+                                            serial, im_change)) {
+      g_autofree char *before = g_strndup (text, cursor);
+
+      pos_completer_verbisage_acknowledge_swipe (POS_COMPLETER_VERBISAGE (self->completer),
+                                                 before, text + cursor);
+      g_clear_pointer (&self->completion_restore, pos_completion_undo_free);
+    } else if (!pos_completion_undo_observe (self->completion_restore, text, cursor, anchor,
+                                             serial, im_change)) {
+      g_clear_pointer (&self->completion_restore, pos_completion_undo_free);
+    }
+  }
+  self->context_suspended = !pos_input_method_get_active (self->input_method);
+  update_verbisage_context (self);
   if (self->completion_undo &&
       !pos_completion_undo_observe (self->completion_undo, text, cursor, anchor, serial, im_change))
     clear_completion_undo (self);
@@ -1883,6 +1938,9 @@ on_im_pending_changed (PosInputSurface *self, PosImState *state)
   /* A deactivate/reactivate pair can be batched into one done event without
    * changing notify::active. Never carry composition or undo across it. */
   if (!state->active) {
+    self->context_suspended = TRUE;
+    if (POS_IS_COMPLETER_VERBISAGE (self->completer))
+      pos_completer_verbisage_set_enabled (POS_COMPLETER_VERBISAGE (self->completer), FALSE);
     clear_edit_history (self);
     if (POS_IS_COMPLETER_VERBISAGE (self->completer)) {
       g_signal_handlers_block_by_func (self->completer, on_completer_preedit_changed, self);
@@ -1915,6 +1973,8 @@ on_im_active_changed (PosInputSurface *self, GParamSpec *pspec, PosInputMethod *
     if (pos_input_surface_is_completer_active (self))
       pos_completer_set_preedit (self->completer, NULL);
   }
+
+  update_verbisage_context (self);
 
   /* Completer can only be active with input method, not vk */
   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_COMPLETER_ACTIVE]);

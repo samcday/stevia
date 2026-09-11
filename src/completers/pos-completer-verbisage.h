@@ -27,4 +27,10 @@ GVariant     *pos_completer_verbisage_snapshot_swipe (PosCompleterVerbisage *sel
 gboolean      pos_completer_verbisage_restore_swipe (PosCompleterVerbisage *self,
                                                      GVariant *snapshot);
 
+void pos_completer_verbisage_set_enabled (PosCompleterVerbisage *self, gboolean enabled);
+void pos_completer_verbisage_expect_commit (PosCompleterVerbisage *self);
+void pos_completer_verbisage_acknowledge_swipe (PosCompleterVerbisage *self,
+                                               const char *before,
+                                               const char *after);
+
 G_END_DECLS

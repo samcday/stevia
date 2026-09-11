@@ -30,6 +30,11 @@ test_utf8_and_suffix (void)
   g_assert_false (pos_completion_undo_matches (undo, "é café suffix", 8, 8));
   g_assert_false (pos_completion_undo_matches (undo, "é café other", 9, 9));
   g_assert_false (pos_completion_undo_matches (undo, "x café suffix", 8, 8));
+  g_assert_true (pos_completion_undo_matches_revert (undo, "é suffix", 3, 3, 9, TRUE));
+  g_assert_false (pos_completion_undo_matches_revert (undo, "é suffix", 3, 3, 8, TRUE));
+  g_assert_false (pos_completion_undo_matches_revert (undo, "é suffix", 3, 3, 9, FALSE));
+  g_assert_false (pos_completion_undo_matches_revert (undo, "é suffix", 3, 4, 9, TRUE));
+  g_assert_false (pos_completion_undo_matches_revert (undo, "é other", 3, 3, 9, TRUE));
 }
 
 
@@ -134,7 +139,16 @@ test_constructor_rejections (void)
     g_assert_null (pos_completion_undo_new ("", 0, 0, "a", invalid[i], NULL, NULL, 0));
   }
   g_assert_null (pos_completion_undo_new ("", 0, 0, "", "a", NULL, NULL, 0));
-  g_assert_null (pos_completion_undo_new ("", 0, 0, "a", "", NULL, NULL, 0));
+  /* A next-word prediction has no preedit to restore. */
+  {
+    g_autoptr (PosCompletionUndo) prediction =
+      pos_completion_undo_new ("see ", 4, 4, "you ", "", NULL, NULL, 0);
+
+    g_assert_nonnull (prediction);
+    g_assert_cmpstr (pos_completion_undo_get_preedit (prediction), ==, "");
+    g_assert_true (pos_completion_undo_observe (prediction, "see you ", 8, 8, 1, TRUE));
+    g_assert_true (pos_completion_undo_matches (prediction, "see you ", 8, 8));
+  }
   g_assert_null (pos_completion_undo_new ("abc", 1, 2, "a", "a", NULL, NULL, 0));
   g_assert_null (pos_completion_undo_new ("é", 1, 1, "a", "a", NULL, NULL, 0));
   g_assert_null (pos_completion_undo_new ("é", 3, 3, "a", "a", NULL, NULL, 0));
