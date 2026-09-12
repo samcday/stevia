@@ -152,6 +152,44 @@ def click(x, y):
     time.sleep(.08)
 
 
+def visible_completions():
+    """The completion bar's current contents, as {name: (x, y, width, height)}.
+
+    Stevia logs each completion's placement as it allocates them, so a case can
+    select the correction it means by name instead of by a slot that a ranking
+    change would silently move.
+    """
+    log = output / "stevia.log"
+    if not log.exists():
+        return {}
+    pattern = re.compile(r"completion (\d+) '([^']*)' x: (-?\d+), width: (\d+), "
+                         r"y: (-?\d+), height: (\d+)")
+    rows = [m.groups() for m in pattern.finditer(log.read_text(errors="replace"))]
+    # Each allocation logs the whole bar starting at index 0; keep the last one.
+    start = max((i for i, row in enumerate(rows) if row[0] == "0"), default=None)
+    if start is None:
+        return {}
+    return {row[1]: tuple(int(v) for v in row[2:]) for row in rows[start:]}
+
+
+# The completion row's own position is fixed by the surface layout; only which
+# word sits where depends on the ranking, and that is what is looked up.
+COMPLETION_ROW_Y = 493
+
+
+def click_completion(name):
+    """Click the named completion wherever the bar currently places it."""
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        box = visible_completions().get(name)
+        if box:
+            click(box[0] + box[2] // 2, COMPLETION_ROW_Y)
+            return
+        time.sleep(.05)
+    raise RuntimeError(f"Completion {name!r} is not offered; "
+                       f"visible: {sorted(visible_completions())}")
+
+
 def key(char):
     # The pinned us layout has ten equal columns and four 50px rows.
     rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
@@ -386,7 +424,9 @@ try:
             key(" ")
             wait_state("hello ", "", "ordinary literal commit")
         else:
-            click(125, 493)  # literal 'helo' followed by ranked correction 'hello'.
+            # Selected by name: the correction's rank among the offered words
+            # is a quality question, measured separately.
+            click_completion("hello")
             wait_state("hello ", "", "typed correction selected")
             if args.case == "undo-focus":
                 focus(True)
@@ -400,7 +440,7 @@ try:
                 screenshot("undo-restored.png", settle=True)
                 if args.case == "typed-reselect":
                     time.sleep(.15)
-                    click(125, 493)
+                    click_completion("hello")
                     wait_state("hello ", "", "restored typed correction selected again")
                 else:
                     key("BACKSPACE")
