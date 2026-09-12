@@ -1925,6 +1925,42 @@ test_queue_empty_result_is_a_failure (Fixture *fixture, gconstpointer unused)
 }
 
 
+/* The daemon going away leaves bounded state: the unplayed words are cancelled
+ * with feedback, committed text is untouched, and gestures work again when it
+ * comes back. */
+static void
+test_queue_daemon_disappearance (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GVariant) reply = NULL;
+
+  reply = g_dbus_connection_call_sync (fixture->service, "org.freedesktop.DBus",
+    "/org/freedesktop/DBus", "org.freedesktop.DBus", "ReleaseName",
+    g_variant_new ("(s)", "org.verbisage.Dictionary"), G_VARIANT_TYPE ("(u)"),
+    G_DBUS_CALL_FLAGS_NONE, 1000, NULL, &error);
+  g_assert_no_error (error);
+
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_pending_swipes (fixture, 0);
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 0);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_cmpuint (fixture->feedback->len, >, 0);
+
+  g_clear_pointer (&reply, g_variant_unref);
+  reply = g_dbus_connection_call_sync (fixture->service, "org.freedesktop.DBus",
+    "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName",
+    g_variant_new ("(su)", "org.verbisage.Dictionary", 0u), G_VARIANT_TYPE ("(u)"),
+    G_DBUS_CALL_FLAGS_NONE, 1000, NULL, &error);
+  g_assert_no_error (error);
+
+  g_assert_true (request_marked_swipe (fixture, 3, 0));
+  wait_completion (fixture->completer, "w3");
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+}
+
+
 static void
 test_swipe_snapshot (Fixture *fixture, gconstpointer unused)
 {
@@ -2150,6 +2186,7 @@ main (int argc, char **argv)
   ADD_TEST ("queue-capitalization", test_queue_keeps_captured_capitalization);
   ADD_TEST ("queue-busy-retry", test_queue_busy_is_retried);
   ADD_TEST ("queue-empty-result", test_queue_empty_result_is_a_failure);
+  ADD_TEST ("queue-daemon-gone", test_queue_daemon_disappearance);
   ADD_TEST ("swipe-snapshot", test_swipe_snapshot);
   ADD_TEST ("swipe-snapshot-invalid", test_swipe_snapshot_invalid);
 #undef ADD_TEST

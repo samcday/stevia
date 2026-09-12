@@ -16,8 +16,46 @@ alternate characters. Each blue trail segment fades over 1.5 seconds.
 Release shows the top recognized word immediately as editable preedit, with
 alternatives in the candidate bar. Space, punctuation and Enter use the normal
 word-ending behavior. Starting a tapped letter accepts the guess with a space
-and begins the next word. Completing another swipe accepts the preceding word,
-waits for the application's text acknowledgement, then recognizes the new one.
+and begins the next word.
+
+## Buffered gestures
+
+Up to five accepted gestures are held at once, counting everything that has not
+been fully replayed: waiting, being recognized, finished out of order, and
+waiting for a commit to be acknowledged. Two recognitions run at a time. Each
+gesture captures its own trace, the key rectangles as allocated, the language
+and the capitalization when it is accepted, so a later resize, Shift release or
+layer change cannot alter a word already taken.
+
+Replay is strictly in input order. A word with anything behind it is committed
+with one separator and waits for the application to show exactly that text
+before the next word is played; the last word becomes the ordinary editable
+guess and stops occupying a slot at that point, keeping its alternatives and
+the existing one-step selection undo. Recognition finishing early frees
+nothing and reorders nothing.
+
+Keys typed while gestures are still unplayed are ordered barriers: the words go
+in first, then the key with its usual meaning, so an Enter cannot submit ahead
+of them. Backspace instead takes back the newest unplayed gesture, consuming
+that Backspace rather than deleting committed text; its late result is ignored.
+
+When the queue is full the newest gesture is refused with feedback and every
+word already accepted is kept. A busy service is treated as temporary
+backpressure and retried with bounded backoff, since the keyboard is not
+necessarily its only client. A terminal failure, an empty recognition or a
+missing acknowledgement stops replay at that position: the unplayed words after
+it are cancelled with feedback, including any key deferred behind them, rather
+than being silently moved up into the failed word's place. Text that is already
+committed is never touched.
+
+Cancelling the gesture being drawn is not the same as invalidating the session.
+An aborted drag, an automatic one-shot Shift release and a benign resize leave
+accepted words alone. A changed field, cursor or selection, an incompatible
+input purpose, completion being turned off and an explicit layout or language
+switch drop the unplayed words, because they were taken somewhere else.
+
+Recognition requests carry no word context, so gestures recognized in parallel
+are independent; nothing here reranks a gesture from its neighbours.
 Backspace on an unselected guess edits it as ordinary typed text.
 
 Tapping a candidate commits that choice. An immediate Backspace restores the

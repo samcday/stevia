@@ -20,7 +20,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--output", required=True)
 parser.add_argument("--stevia", default="/usr/bin/phosh-osk-stevia",
                     help="Stevia executable (can be extracted from a trial RPM)")
-parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swipe-undo", "swipe-edit", "swipe-focus", "swipe-shift", "typed-undo", "typed-reselect", "undo-focus", "literal", "context-chain", "context-prefix", "context-swipe", "context-undo"], default="literal")
+parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swipe-rapid", "swipe-undo", "swipe-edit", "swipe-focus", "swipe-shift", "typed-undo", "typed-reselect", "undo-focus", "literal", "context-chain", "context-prefix", "context-swipe", "context-undo"], default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
                     help="Dictionary used by the service; recorded for provenance")
@@ -220,8 +220,8 @@ def state(event):
     return next((e["text"] for e in reversed(events()) if e["event"] == event), "")
 
 
-def wait_state(buffer, preedit, label):
-    wait_for(lambda: state("buffer") == buffer and state("preedit") == preedit, label)
+def wait_state(buffer, preedit, label, timeout=5):
+    wait_for(lambda: state("buffer") == buffer and state("preedit") == preedit, label, timeout)
     result["actions"].append({"step": label, "buffer": buffer, "preedit": preedit,
                               "time": time.monotonic()})
 
@@ -241,7 +241,7 @@ def focus(away):
     time.sleep(.25)
 
 
-def drag_word(word, expected, *, focus_away=False, trail=False):
+def drag_word(word, expected, *, focus_away=False, trail=False, wait=True, allow_words=None):
     before_buffer, before_preedit = state("buffer"), state("preedit")
     rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
     controls = []
@@ -272,8 +272,17 @@ def drag_word(word, expected, *, focus_away=False, trail=False):
         if line.strip() == "POINT 20":
             # Prior completed preedit may be present during the next gesture.
             # The current drag must never type its crossed-key sequence.
-            assert state("buffer") == before_buffer and state("preedit") == before_preedit, \
-                "Gesture inserted text before release"
+            if allow_words is None:
+                assert state("buffer") == before_buffer and state("preedit") == before_preedit, \
+                    "Gesture inserted text before release"
+            else:
+                # Gestures still being replayed may add whole recognized words
+                # meanwhile, but nothing else may appear.
+                buffer_words = state("buffer").split(" ") if state("buffer") else []
+                assert all(w in allow_words for w in buffer_words if w), \
+                    f"Unexpected text during gesture: {state('buffer')!r}"
+                assert state("preedit") in ("", *allow_words), \
+                    f"Gesture typed keys instead of a word: {state('preedit')!r}"
             screenshot(f"swipe-{number}-moving.png")
             if focus_away:
                 focus(True)
@@ -283,6 +292,9 @@ def drag_word(word, expected, *, focus_away=False, trail=False):
     if focus_away:
         time.sleep(1.2)
         wait_state(before_buffer, "", "focus cancels unfinished swipe")
+        return
+    if not wait:
+        # Gesture the next word without waiting for this one to be recognized.
         return
     expected_buffer = before_buffer + (before_preedit + " " if before_preedit else "")
     wait_state(expected_buffer, expected, f"swipe editable guess {expected}")
@@ -398,6 +410,16 @@ try:
             wait_state("hello ", "world", "next swipe accepted previous guess")
             key(" ")
             wait_state("hello world ", "", "Space accepts second swipe")
+        elif args.case == "swipe-rapid":
+            # Three gestures with no pause: recognition runs concurrently and
+            # may finish out of order, but the words must land in input order.
+            allowed = ("hello", "world")
+            drag_word("world", "world", wait=False, allow_words=allowed)
+            drag_word("hello", "hello", wait=False, allow_words=allowed)
+            # The common first gesture, then two more with no pause between.
+            wait_state("hello world ", "hello", "rapid gestures replayed in order", timeout=15)
+            key(" ")
+            wait_state("hello world hello ", "", "Space accepts the last rapid gesture")
         elif args.case == "swipe-edit":
             key("BACKSPACE")
             wait_state("", "hell", "Backspace edits swipe guess")
