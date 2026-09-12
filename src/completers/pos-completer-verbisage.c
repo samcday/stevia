@@ -545,9 +545,15 @@ pos_completer_verbisage_set_layout (PosCompleterVerbisage *self, GVariant *geome
  *
  * Returns: %TRUE when the request should simply be made again. */
 static gboolean
-recover_unknown_layout (PosCompleterVerbisage *self, const GError *error)
+recover_unknown_layout (PosCompleterVerbisage *self, const Lookup *lookup, const GError *error)
 {
   if (!error || self->layout_upload == NULL || self->layout_blocked)
+    return FALSE;
+  /* Only the request that actually quoted the layout now registered can say
+   * anything about it. A rejection of a token that has since been replaced
+   * describes a layout the keyboard no longer shows, and must not spend this
+   * layout's one recovery or drop its working token. */
+  if (!lookup->used_layout || lookup->layout_generation != self->layout_generation)
     return FALSE;
   if (!g_dbus_error_is_remote_error (error))
     return FALSE;
@@ -619,7 +625,7 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
     /* Do not log the preedit or daemon error message (which may contain it). */
     if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
       g_debug ("Dictionary lookup unavailable; retaining literal input");
-    if (recover_unknown_layout (self, error)) {
+    if (recover_unknown_layout (self, lookup, error)) {
       /* The shared layout entry is gone. Ask again without it; the new token
        * applies to later requests. */
       g_debug ("Registered layout is unknown to the service; re-registering");
@@ -631,8 +637,10 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
   }
 
   /* The recovered token produced an answer, so this layout is healthy again
-   * and a later, unrelated eviction may be recovered from as well. A reply
-   * from before a layout change says nothing about the current one. */
+   * and a later, unrelated eviction may be recovered from as well. The layout
+   * generation is checked for the same reason as on the error path; every
+   * typed change also cancels the previous lookup, so today that check only
+   * guards against a future caller that changes the layout mid-request. */
   if (lookup->used_layout && lookup->layout_generation == self->layout_generation)
     self->layout_recovering = FALSE;
 
