@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -96,6 +97,53 @@ def wait_for(check, label, timeout=5):
 
 def observed(event, text):
     return any(e["event"] == event and e["text"] == text for e in events())
+
+
+def bus_call(method, argument):
+    """Call the bus daemon itself, which never starts an installed service."""
+    return subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus",
+                           "--object-path", "/org/freedesktop/DBus", "--method", method,
+                           argument],
+                          env=env, capture_output=True, text=True).stdout
+
+
+def bus_owner_pid(name):
+    if "true" not in bus_call("org.freedesktop.DBus.NameHasOwner", name):
+        return None
+    match = re.search(r"(\d+),\s*\)", bus_call("org.freedesktop.DBus.GetConnectionUnixProcessID",
+                                                name))
+    return int(match.group(1)) if match else None
+
+
+def process_command(pid):
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().decode().replace("\0", " ").strip()
+    except OSError:
+        return "unknown"
+
+
+def wait_for_service(process, name, timeout=10):
+    """Wait until the daemon started for this test owns the bus name.
+
+    Only the bus daemon is polled: any readiness call to the service itself
+    would activate whatever is installed for this name, and that instance would
+    then answer the test instead of the build under test.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"{process.args[0]} exited {process.returncode} "
+                               f"before owning {name}")
+        pid = bus_owner_pid(name)
+        if pid == process.pid:
+            return pid
+        if pid is not None:
+            raise RuntimeError(
+                f"{name} is owned by pid {pid} ({process_command(pid)}), not the daemon started "
+                f"for this test (pid {process.pid}, {' '.join(process.args)}). An installed, "
+                f"D-Bus activated service would answer instead of the build under test.")
+        time.sleep(.05)
+    raise RuntimeError(f"Timed out waiting for {name} to be owned by pid {process.pid}")
 
 
 def click(x, y):
@@ -248,9 +296,10 @@ try:
         result["dictionary_sha256"] = hashlib.sha256(dictionary.read_bytes()).hexdigest()
     start(["phoc", "--no-xwayland", "--socket=stevia-test", "-C", str(config)], "phoc.log")
     wait_for(lambda: (runtime / "stevia-test").exists(), "headless output")
-    start(result["service_command"], "verbisage.log")
-    subprocess.run(["gdbus", "wait", "--session", "--timeout", "5", "org.verbisage.Dictionary"],
-                   env=env, check=True, timeout=6)
+    service = start(result["service_command"], "verbisage.log")
+    result["service_pid"] = service.pid
+    result["service_bus_owner_pid"] = wait_for_service(service, "org.verbisage.Dictionary")
+    result["service_bus_owner_command"] = process_command(result["service_bus_owner_pid"])
     osk_env = dict(env, G_MESSAGES_DEBUG="all", WAYLAND_DEBUG="client")
     start([args.stevia], "stevia.log", osk_env)
     probe = start([sys.executable, str(Path(args.probe).resolve())], "probe.log")
@@ -359,6 +408,12 @@ try:
                     key(" ")
                     wait_state("hel ", "", "Space accepts edited restored literal")
     screenshot("final.png", settle=True)
+    final_owner = bus_owner_pid("org.verbisage.Dictionary")
+    if final_owner != service.pid:
+        raise RuntimeError(
+            f"org.verbisage.Dictionary changed owner during the run: started with pid "
+            f"{service.pid}, ended with {final_owner} ({process_command(final_owner)}). "
+            f"The recorded result would not describe the build under test.")
     result["events"] = events()
     result["status"] = "pending-pixel-check" if args.case == "swipe" and args.defer_pixel_check else "passed"
 except Exception as error:
