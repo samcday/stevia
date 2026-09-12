@@ -620,6 +620,217 @@ test_swipe_dispatch_space (SwipeFixture *fixture, gconstpointer unused)
 }
 
 
+typedef struct {
+  GtkWidget *window;
+  PosOskWidget *osk;
+  guint geometry_changes;
+} GeometryFixture;
+
+
+static void
+count_geometry_change (GeometryFixture *fixture)
+{
+  fixture->geometry_changes++;
+}
+
+
+static void
+geometry_setup_layout (GeometryFixture *fixture, const char *layout)
+{
+  GdkRectangle allocation = {0, 0, 360, 208};
+
+  fixture->window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
+  fixture->osk = pos_osk_widget_new (PHOSH_OSK_FEATURE_DEFAULT);
+  g_assert_true (pos_osk_widget_set_layout (fixture->osk, layout, layout, layout, layout,
+                                            NULL, NULL));
+  gtk_container_add (GTK_CONTAINER (fixture->window), GTK_WIDGET (fixture->osk));
+  gtk_widget_show_all (fixture->window);
+  g_signal_connect_swapped (fixture->osk, "geometry-changed",
+                            G_CALLBACK (count_geometry_change), fixture);
+  pos_osk_widget_size_allocate (GTK_WIDGET (fixture->osk), &allocation);
+}
+
+
+static void
+geometry_setup (GeometryFixture *fixture, gconstpointer unused)
+{
+  geometry_setup_layout (fixture, "us");
+}
+
+
+static void
+geometry_teardown (GeometryFixture *fixture, gconstpointer unused)
+{
+  gtk_widget_destroy (fixture->window);
+}
+
+
+static gboolean
+geometry_has_symbol (GVariant *geometry, const char *symbol)
+{
+  GVariantIter iter;
+  GVariantIter *alternates;
+  const char *label;
+  double x, y, width, height;
+  gboolean found = FALSE;
+
+  g_variant_iter_init (&iter, geometry);
+  while (g_variant_iter_next (&iter, "(&sasdddd)", &label, &alternates,
+                              &x, &y, &width, &height)) {
+    if (g_str_equal (label, symbol))
+      found = TRUE;
+    g_variant_iter_free (alternates);
+  }
+  return found;
+}
+
+
+/* Every character key of the shown layer is exported with its real rectangle,
+ * without the gesture helper's ASCII and 26-key restrictions. */
+static void
+test_geometry_export (GeometryFixture *fixture, gconstpointer unused)
+{
+  g_autoptr (GVariant) geometry = pos_osk_widget_get_layout_geometry (fixture->osk);
+  GVariantIter iter;
+  GVariantIter *alternates;
+  const char *symbol;
+  double x, y, width, height;
+  guint keys = 0;
+
+  g_assert_nonnull (geometry);
+  g_assert_true (g_variant_is_of_type (geometry, G_VARIANT_TYPE ("a(sasdddd)")));
+
+  g_variant_iter_init (&iter, geometry);
+  while (g_variant_iter_next (&iter, "(&sasdddd)", &symbol, &alternates,
+                              &x, &y, &width, &height)) {
+    g_assert_cmpstr (symbol, !=, "");
+    g_assert_false (g_str_has_prefix (symbol, "KEY_"));
+    g_assert_cmpfloat (width, >, 0.0);
+    g_assert_cmpfloat (height, >, 0.0);
+    g_assert_cmpfloat (x, >=, 0.0);
+    g_assert_cmpfloat (y, >=, 0.0);
+    g_assert_cmpfloat (x + width, <=, 360.0);
+    g_assert_cmpfloat (y + height, <=, 208.0);
+    g_variant_iter_free (alternates);
+    keys++;
+  }
+
+  /* The us layout carries more than the letters alone, so a 26-key
+   * expectation would drop the layout that the keyboard really shows. */
+  g_assert_cmpuint (keys, >, 26);
+  g_assert_true (geometry_has_symbol (geometry, "q"));
+  g_assert_true (geometry_has_symbol (geometry, "m"));
+  /* Toggles and editing keys have no character to contribute. */
+  g_assert_false (geometry_has_symbol (geometry, "KEY_BACKSPACE"));
+}
+
+
+/* Long-press characters are exported with the key that carries them. */
+static void
+test_geometry_alternates (GeometryFixture *fixture, gconstpointer unused)
+{
+  g_autoptr (GVariant) geometry = pos_osk_widget_get_layout_geometry (fixture->osk);
+  GVariantIter iter;
+  GVariantIter *alternates;
+  const char *symbol, *alternate;
+  double x, y, width, height;
+  guint with_alternates = 0;
+
+  g_variant_iter_init (&iter, geometry);
+  while (g_variant_iter_next (&iter, "(&sasdddd)", &symbol, &alternates,
+                              &x, &y, &width, &height)) {
+    gboolean any = FALSE;
+
+    while (g_variant_iter_next (alternates, "&s", &alternate)) {
+      g_assert_cmpstr (alternate, !=, "");
+      any = TRUE;
+    }
+    if (any)
+      with_alternates++;
+    g_variant_iter_free (alternates);
+  }
+
+  g_assert_cmpuint (with_alternates, >, 0);
+}
+
+
+/* The shown layer is exported as it is, in its own spelling. */
+static void
+test_geometry_layer (GeometryFixture *fixture, gconstpointer unused)
+{
+  g_autoptr (GVariant) normal = pos_osk_widget_get_layout_geometry (fixture->osk);
+  g_autoptr (GVariant) shifted = NULL;
+  g_autoptr (GVariant) symbols = NULL;
+  guint changes;
+
+  g_assert_true (geometry_has_symbol (normal, "q"));
+  g_assert_false (geometry_has_symbol (normal, "Q"));
+
+  changes = fixture->geometry_changes;
+  pos_osk_widget_set_layer (fixture->osk, POS_OSK_WIDGET_LAYER_CAPS);
+  g_assert_cmpuint (fixture->geometry_changes, >, changes);
+  shifted = pos_osk_widget_get_layout_geometry (fixture->osk);
+  g_assert_true (geometry_has_symbol (shifted, "Q"));
+  g_assert_false (geometry_has_symbol (shifted, "q"));
+
+  pos_osk_widget_set_layer (fixture->osk, POS_OSK_WIDGET_LAYER_SYMBOLS);
+  symbols = pos_osk_widget_get_layout_geometry (fixture->osk);
+  g_assert_true (geometry_has_symbol (symbols, "1"));
+  g_assert_false (geometry_has_symbol (symbols, "q"));
+}
+
+
+/* A resize moves the keys, so the exported rectangles move with them. */
+static void
+test_geometry_resize (GeometryFixture *fixture, gconstpointer unused)
+{
+  GdkRectangle wider = {0, 0, 720, 208};
+  g_autoptr (GVariant) before = pos_osk_widget_get_layout_geometry (fixture->osk);
+  g_autoptr (GVariant) after = NULL;
+  guint changes = fixture->geometry_changes;
+
+  pos_osk_widget_size_allocate (GTK_WIDGET (fixture->osk), &wider);
+  g_assert_cmpuint (fixture->geometry_changes, >, changes);
+
+  after = pos_osk_widget_get_layout_geometry (fixture->osk);
+  g_assert_nonnull (after);
+  g_assert_cmpuint (g_variant_n_children (after), ==, g_variant_n_children (before));
+  g_assert_false (g_variant_equal (before, after));
+}
+
+
+/* A layout with neither an ASCII alphabet nor 26 letters is exported as it
+ * is, rather than being dropped. */
+static void
+test_geometry_non_qwerty (void)
+{
+  GeometryFixture fixture = {0};
+  g_autoptr (GVariant) geometry = NULL;
+
+  geometry_setup_layout (&fixture, "ru");
+  geometry = pos_osk_widget_get_layout_geometry (fixture.osk);
+
+  g_assert_nonnull (geometry);
+  g_assert_cmpuint (g_variant_n_children (geometry), >, 26);
+  g_assert_true (geometry_has_symbol (geometry, "й"));
+  g_assert_true (geometry_has_symbol (geometry, "ж"));
+  g_assert_false (geometry_has_symbol (geometry, "q"));
+
+  gtk_widget_destroy (fixture.window);
+}
+
+
+/* Before the first allocation there are no rectangles to describe. */
+static void
+test_geometry_unallocated (void)
+{
+  g_autoptr (PosOskWidget) osk = g_object_ref_sink (pos_osk_widget_new (PHOSH_OSK_FEATURE_DEFAULT));
+
+  g_assert_true (pos_osk_widget_set_layout (osk, "us", "us", "English (US)", "us", NULL, NULL));
+  g_assert_null (pos_osk_widget_get_layout_geometry (osk));
+}
+
+
 int
 main (int argc, char *argv[])
 {
@@ -631,6 +842,17 @@ main (int argc, char *argv[])
   gtk_icon_theme_add_resource_path (gtk_icon_theme_get_default (), "/mobi/phosh/stevia/icons");
 
   g_test_add_func ("/pos/osk-widget/switch_layer", test_switch_layer);
+  g_test_add_func ("/pos/osk-widget/geometry/non-qwerty", test_geometry_non_qwerty);
+  g_test_add_func ("/pos/osk-widget/geometry/unallocated", test_geometry_unallocated);
+
+#define GEOMETRY_TEST(name, function) \
+  g_test_add ("/pos/osk-widget/geometry/" name, GeometryFixture, NULL, \
+              geometry_setup, function, geometry_teardown)
+  GEOMETRY_TEST ("export", test_geometry_export);
+  GEOMETRY_TEST ("alternates", test_geometry_alternates);
+  GEOMETRY_TEST ("layer", test_geometry_layer);
+  GEOMETRY_TEST ("resize", test_geometry_resize);
+#undef GEOMETRY_TEST
 
 #define SWIPE_TEST(name, function) \
   g_test_add ("/pos/osk-widget/swipe/" name, SwipeFixture, NULL, swipe_setup, function, swipe_teardown)

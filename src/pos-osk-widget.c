@@ -49,6 +49,7 @@ enum {
   OSK_POPOVER_HIDDEN,
   OSK_SWIPE,
   OSK_SWIPE_CANCELLED,
+  OSK_GEOMETRY_CHANGED,
   N_SIGNALS
 };
 static guint signals[N_SIGNALS];
@@ -1283,6 +1284,80 @@ pos_osk_widget_get_swipe_capitalization (PosOskWidget *self)
 }
 
 
+/**
+ * pos_osk_widget_get_layout_geometry:
+ * @self: The keyboard
+ *
+ * Export the allocated geometry of the layer that is currently displayed.
+ *
+ * Every character key of the active layer is reported with the symbol it
+ * actually emits, its long-press alternates and its rectangle in widget
+ * coordinates, which is the same space as pointer and touch event positions.
+ * Unlike the gesture-typing helper this imposes no alphabet, script or key
+ * count restriction, so a shifted, non-Latin or symbol layer is described as
+ * it is rather than being dropped.
+ *
+ * Returns: (transfer full)(nullable): The keys as `a(sasdddd)`
+ *   (symbol, alternates, x, y, width, height), or %NULL when the widget has no
+ *   usable allocated character keys.
+ */
+GVariant *
+pos_osk_widget_get_layout_geometry (PosOskWidget *self)
+{
+  GVariantBuilder keys;
+  PosOskWidgetKeyboardLayer *layer;
+  guint count = 0;
+
+  g_return_val_if_fail (POS_IS_OSK_WIDGET (self), NULL);
+
+  if (self->mode != POS_OSK_WIDGET_MODE_KEYBOARD)
+    return NULL;
+
+  layer = pos_osk_widget_get_current_layer (self);
+  g_variant_builder_init (&keys, G_VARIANT_TYPE ("a(sasdddd)"));
+  for (guint r = 0; r < layer->n_rows; r++) {
+    PosOskWidgetRow *row = pos_osk_widget_get_row (self, r);
+
+    for (guint k = 0; k < row->keys->len; k++) {
+      PosOskKey *key = pos_osk_widget_row_get_key (row, k);
+      const char *symbol = pos_osk_key_get_symbol (key);
+      const GdkRectangle *box = pos_osk_key_get_box (key);
+      GStrv symbols = pos_osk_key_get_symbols (key);
+      GVariantBuilder alternates;
+
+      /* Only keys that insert text carry a position a completer can use. */
+      if (pos_osk_key_get_use (key) != POS_OSK_KEY_USE_KEY)
+        continue;
+      if (gm_str_is_null_or_empty (symbol) || g_str_has_prefix (symbol, "KEY_"))
+        continue;
+      /* Before the first allocation the boxes are not computed yet. */
+      if (box->width <= 0 || box->height <= 0)
+        continue;
+
+      g_variant_builder_init (&alternates, G_VARIANT_TYPE ("as"));
+      for (guint i = 0; symbols && symbols[i]; i++) {
+        if (gm_str_is_null_or_empty (symbols[i]) || g_str_has_prefix (symbols[i], "KEY_"))
+          continue;
+        g_variant_builder_add (&alternates, "s", symbols[i]);
+      }
+
+      g_variant_builder_add (&keys, "(s@asdddd)", symbol,
+                             g_variant_builder_end (&alternates),
+                             (double) box->x + layer->offset_x, (double) box->y,
+                             (double) box->width, (double) box->height);
+      count++;
+    }
+  }
+
+  if (count == 0) {
+    g_variant_builder_clear (&keys);
+    return NULL;
+  }
+
+  return g_variant_ref_sink (g_variant_builder_end (&keys));
+}
+
+
 static GVariant *
 swipe_layout (PosOskWidget *self)
 {
@@ -1898,6 +1973,8 @@ pos_osk_widget_size_allocate (GtkWidget *widget, GdkRectangle *allocation)
   /* On key size changes we adjust the font and icon size */
   update_key_scale (self);
 
+  g_signal_emit (self, signals[OSK_GEOMETRY_CHANGED], 0);
+
   GTK_WIDGET_CLASS (pos_osk_widget_parent_class)->size_allocate (widget, allocation);
 }
 
@@ -2039,6 +2116,16 @@ pos_osk_widget_class_init (PosOskWidgetClass *klass)
   signals[OSK_SWIPE] = g_signal_new ("swipe", G_TYPE_FROM_CLASS (klass),
                                      G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
                                      G_TYPE_NONE, 2, G_TYPE_VARIANT, G_TYPE_VARIANT);
+  /**
+   * PosOskWidget::geometry-changed
+   *
+   * The allocated geometry or the displayed layer of the keyboard changed, so
+   * a previously exported layout description is out of date. See
+   * [method@Pos.OskWidget.get_layout_geometry].
+   */
+  signals[OSK_GEOMETRY_CHANGED] = g_signal_new ("geometry-changed", G_TYPE_FROM_CLASS (klass),
+                                                G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
+                                                G_TYPE_NONE, 0);
   signals[OSK_SWIPE_CANCELLED] = g_signal_new ("swipe-cancelled", G_TYPE_FROM_CLASS (klass),
                                                G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
                                                G_TYPE_NONE, 0);
@@ -2307,6 +2394,8 @@ pos_osk_widget_set_layer (PosOskWidget *self, PosOskWidgetLayer layer)
       pos_osk_widget_set_key_pressed (self, akey, pressed);
     }
   }
+
+  g_signal_emit (self, signals[OSK_GEOMETRY_CHANGED], 0);
 }
 
 
@@ -2404,6 +2493,7 @@ pos_osk_widget_set_layout (PosOskWidget *self,
   parse_lang (self, layout, variant);
 
   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_NAME]);
+  g_signal_emit (self, signals[OSK_GEOMETRY_CHANGED], 0);
 
   return ret;
 }
