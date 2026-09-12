@@ -55,6 +55,7 @@ typedef struct {
   char *last_upload;
   char *last_token;
   gboolean reject_tokens;
+  guint reject_token_requests;
   GPtrArray *held_registrations;
 } Fixture;
 
@@ -277,6 +278,16 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
     g_assert_cmpuint (g_variant_n_children (points), ==, 0);
     g_free (fixture->last_token);
     fixture->last_token = g_strdup (token);
+
+    if (fixture->reject_token_requests && *token) {
+      g_autofree char *message = g_strdup_printf ("unknown layout token '%s'", token);
+
+      fixture->reject_token_requests--;
+      g_dbus_method_invocation_return_dbus_error (invocation,
+                                                  "org.freedesktop.DBus.Error.InvalidArgs",
+                                                  message);
+      return;
+    }
 
     if (fixture->reject_tokens && *token) {
       g_autofree char *message = g_strdup_printf ("unknown layout token '%s'", token);
@@ -814,6 +825,72 @@ test_layout_evicted_token (Fixture *fixture, gconstpointer unused)
     wait_completion (fixture->completer, "hello");
     g_assert_cmpstr (fixture->last_token, !=, "");
   }
+}
+
+
+/* Each independent eviction gets its own recovery. A token that has since
+ * answered a request proves the layout is healthy again, so the one-shot bound
+ * against a persistently rejecting service must not carry over to it. */
+static void
+test_layout_repeated_eviction (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) layout = normal_geometry ();
+  g_autofree char *token = NULL;
+
+  pos_completer_verbisage_set_layout (self, layout);
+  wait_registration (fixture, 1);
+  token = token_for (fixture->last_upload);
+
+  for (guint round = 1; round <= 2; round++) {
+    /* The shared cache entry is dropped exactly once. */
+    fixture->reject_token_requests = 1;
+    pos_completer_set_preedit (fixture->completer, "hel");
+    wait_completion (fixture->completer, "hello");
+    wait_registration (fixture, round + 1);
+
+    /* The re-registered token is quoted again and answers, in both rounds. */
+    pos_completer_set_preedit (fixture->completer, NULL);
+    pos_completer_set_preedit (fixture->completer, "wor");
+    wait_completion (fixture->completer, "world");
+    g_assert_cmpstr (fixture->last_token, ==, token);
+    pos_completer_set_preedit (fixture->completer, NULL);
+  }
+}
+
+
+/* A reply that predates a layout change must not report on the current
+ * layout's health. */
+static void
+test_layout_stale_reply_keeps_recovery_bound (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) normal = normal_geometry ();
+  g_autoptr (GVariant) shifted = shifted_geometry ();
+
+  pos_completer_verbisage_set_layout (self, normal);
+  wait_registration (fixture, 1);
+
+  /* Hold a completion that quotes the current token. */
+  fixture->hold_word = "hel";
+  pos_completer_set_preedit (fixture->completer, "hel");
+  wait_held (fixture);
+  fixture->hold_word = NULL;
+
+  /* The keyboard changes layer, then the held reply finally arrives. */
+  pos_completer_verbisage_set_layout (self, shifted);
+  wait_registration (fixture, 2);
+  release_held (fixture);
+  spin (60);
+
+  /* The shifted layout is now rejected persistently: the stale success must
+   * not have re-armed recovery, so this still converges to no geometry. */
+  fixture->reject_tokens = TRUE;
+  pos_completer_set_preedit (fixture->completer, NULL);
+  pos_completer_set_preedit (fixture->completer, "wor");
+  wait_completion (fixture->completer, "world");
+  g_assert_cmpstr (fixture->last_token, ==, "");
+  g_assert_cmpuint (fixture->layout_registrations, ==, 3);
 }
 
 
@@ -1500,6 +1577,8 @@ main (int argc, char **argv)
   ADD_TEST ("layout-resize", test_layout_resize);
   ADD_TEST ("layout-stale-registration", test_layout_stale_registration);
   ADD_TEST ("layout-evicted-token", test_layout_evicted_token);
+  ADD_TEST ("layout-repeated-eviction", test_layout_repeated_eviction);
+  ADD_TEST ("layout-stale-reply-bound", test_layout_stale_reply_keeps_recovery_bound);
   ADD_TEST ("layout-service-error", test_layout_kept_on_service_error);
   ADD_TEST ("layout-daemon-restart", test_layout_daemon_restart);
   ADD_TEST ("editing", test_editing);

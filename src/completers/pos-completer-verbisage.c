@@ -77,6 +77,10 @@ struct _PosCompleterVerbisage {
 typedef struct {
   GWeakRef completer;
   guint64 generation;
+  /* The layout state this request was actually made with, so a reply that
+   * crosses a layout change cannot report on the current one. */
+  guint64 layout_generation;
+  gboolean used_layout;
 } Lookup;
 
 typedef struct {
@@ -99,6 +103,7 @@ lookup_new (PosCompleterVerbisage *self)
 
   g_weak_ref_init (&lookup->completer, self);
   lookup->generation = self->generation;
+  lookup->layout_generation = self->layout_generation;
   return lookup;
 }
 
@@ -533,9 +538,10 @@ pos_completer_verbisage_set_layout (PosCompleterVerbisage *self, GVariant *geome
 
 
 /* The token is a shared, evictable entry in the service's cache: a restart or
- * another client's uploads can invalidate it. Recover once per layout, and
- * only for that specific error, since a busy or timed-out service says
- * nothing at all about the token.
+ * another client's uploads can invalidate it. Recover from consecutive
+ * rejections once, and only for that specific error, since a busy or timed-out
+ * service says nothing at all about the token. A token that has since answered
+ * a request clears the bound, so independent evictions each get one recovery.
  *
  * Returns: %TRUE when the request should simply be made again. */
 static gboolean
@@ -624,6 +630,12 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
     return;
   }
 
+  /* The recovered token produced an answer, so this layout is healthy again
+   * and a later, unrelated eviction may be recovered from as well. A reply
+   * from before a layout change says nothing about the current one. */
+  if (lookup->used_layout && lookup->layout_generation == self->layout_generation)
+    self->layout_recovering = FALSE;
+
   {
     g_autoptr (GVariantIter) iter = NULL;
     const char *word;
@@ -696,7 +708,10 @@ start_lookup (PosCompleterVerbisage *self)
   /* The keyboard applies capitalization to display choices. Compare without
    * a case bonus; context and input folding are explicit service parameters. */
   if (self->preedit->len) {
+    Lookup *lookup = lookup_new (self);
     GVariantBuilder points;
+
+    lookup->used_layout = self->layout_token != NULL;
 
     /* Per-character touch coordinates are a separate change: they need proven
      * alignment with the prepared preedit across normalization, folding,
@@ -711,7 +726,7 @@ start_lookup (PosCompleterVerbisage *self)
                                               g_variant_builder_end (&points)),
                              G_VARIANT_TYPE ("(a(sd))"), G_DBUS_CALL_FLAGS_NONE,
                              LOOKUP_TIMEOUT_MS, self->cancellable, on_lookup_finished,
-                             lookup_new (self));
+                             lookup);
   } else {
     g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "PredictWith",
                              g_variant_new ("(^asus(ss))", context, (guint) MAX_RESULTS,
