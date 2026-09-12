@@ -15,7 +15,12 @@ static const char service_xml[] =
   "<arg type='a(sd)' direction='out'/></method>"
   "<method name='CompleteWith'><arg type='s' direction='in'/><arg type='as' direction='in'/>"
   "<arg type='u' direction='in'/><arg type='s' direction='in'/><arg type='(ss)' direction='in'/>"
-  "<arg type='(ss)' direction='in'/><arg type='s' direction='in'/><arg type='a(sd)' direction='out'/></method>"
+  "<arg type='(ss)' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/>"
+  "<arg type='a(dd)' direction='in'/><arg type='a(sd)' direction='out'/></method>"
+  "<method name='RegisterLayout'><arg type='s' direction='in'/>"
+  "<arg type='s' direction='out'/></method>"
+  "<method name='ForgetLayout'><arg type='s' direction='in'/>"
+  "<arg type='b' direction='out'/></method>"
   "<method name='PredictWith'><arg type='as' direction='in'/><arg type='u' direction='in'/>"
   "<arg type='s' direction='in'/><arg type='(ss)' direction='in'/><arg type='a(sd)' direction='out'/></method>"
   "<method name='RecognizeSwipe'><arg type='a(ddu)' direction='in'/>"
@@ -44,6 +49,13 @@ typedef struct {
   char *committed;
   int before;
   int after;
+  /* Layout registry mirror of the service's content-hash cache. */
+  guint layout_registrations;
+  guint forget_requests;
+  char *last_upload;
+  char *last_token;
+  gboolean reject_tokens;
+  GPtrArray *held_registrations;
 } Fixture;
 
 static GTestDBus *bus;
@@ -167,6 +179,38 @@ answer (GDBusMethodInvocation *invocation)
 }
 
 
+/* The service dedupes by content, so equal uploads must map to equal tokens. */
+static char *
+token_for (const char *upload)
+{
+  g_autofree char *digest = g_compute_checksum_for_string (G_CHECKSUM_SHA256, upload, -1);
+
+  return g_strndup (digest, 16);
+}
+
+
+static void
+answer_registration (Fixture *fixture, GDBusMethodInvocation *invocation)
+{
+  GVariant *parameters = g_dbus_method_invocation_get_parameters (invocation);
+  g_autofree char *token = NULL;
+  const char *upload;
+
+  g_variant_get (parameters, "(&s)", &upload);
+  token = token_for (upload);
+  g_dbus_method_invocation_return_value (invocation, g_variant_new ("(s)", token));
+}
+
+
+static void
+release_held_registrations (Fixture *fixture)
+{
+  for (guint i = 0; i < fixture->held_registrations->len; i++)
+    answer_registration (fixture, g_ptr_array_index (fixture->held_registrations, i));
+  g_ptr_array_set_size (fixture->held_registrations, 0);
+}
+
+
 static void
 on_call (GDBusConnection *connection, const char *sender, const char *path,
            const char *interface, const char *method, GVariant *parameters,
@@ -179,6 +223,26 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
   g_autofree char *folded = NULL;
   g_auto (GStrv) context = NULL;
   const char *normalization, *fold;
+
+  if (g_str_equal (method, "RegisterLayout")) {
+    const char *upload;
+
+    fixture->layout_registrations++;
+    g_variant_get (parameters, "(&s)", &upload);
+    g_free (fixture->last_upload);
+    fixture->last_upload = g_strdup (upload);
+    if (fixture->hold_word && g_str_equal (fixture->hold_word, "layout"))
+      g_ptr_array_add (fixture->held_registrations, g_object_ref (invocation));
+    else
+      answer_registration (fixture, invocation);
+    return;
+  }
+  if (g_str_equal (method, "ForgetLayout")) {
+    /* A shared cache entry must never be dropped on another client's behalf. */
+    fixture->forget_requests++;
+    g_dbus_method_invocation_return_value (invocation, g_variant_new ("(b)", TRUE));
+    return;
+  }
 
   fixture->requests++;
   if (g_str_equal (method, "RecognizeSwipe")) {
@@ -197,16 +261,31 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
     g_assert_cmpstr (normalization, ==, "nfc");
     g_assert_cmpstr (fold, ==, "full");
   } else {
-    const char *input_normalization, *input_fold, *preference;
+    const char *input_normalization, *input_fold, *preference, *token;
+    g_autoptr (GVariant) points = NULL;
 
     g_assert_cmpstr (method, ==, "CompleteWith");
-    g_variant_get (parameters, "(&s^asu&s(&s&s)(&s&s)&s)", &word, &context, &max, &language,
-                     &input_normalization, &input_fold, &normalization, &fold, &preference);
+    g_variant_get (parameters, "(&s^asu&s(&s&s)(&s&s)&s&s@a(dd))", &word, &context, &max, &language,
+                     &input_normalization, &input_fold, &normalization, &fold, &preference,
+                     &token, &points);
     g_assert_cmpstr (input_normalization, ==, "nfc");
     g_assert_cmpstr (input_fold, ==, "full");
     g_assert_cmpstr (normalization, ==, "nfc");
     g_assert_cmpstr (fold, ==, "full");
     g_assert_cmpstr (preference, ==, "insensitive");
+    /* This batch is layout-only: no fabricated touch coordinates. */
+    g_assert_cmpuint (g_variant_n_children (points), ==, 0);
+    g_free (fixture->last_token);
+    fixture->last_token = g_strdup (token);
+
+    if (fixture->reject_tokens && *token) {
+      g_autofree char *message = g_strdup_printf ("unknown layout token '%s'", token);
+
+      g_dbus_method_invocation_return_dbus_error (invocation,
+                                                  "org.freedesktop.DBus.Error.InvalidArgs",
+                                                  message);
+      return;
+    }
   }
   g_strfreev (fixture->last_context);
   fixture->last_context = g_strdupv (context);
@@ -274,6 +353,7 @@ setup (Fixture *fixture, gconstpointer unused)
 
   g_assert_no_error (error);
   fixture->held = g_ptr_array_new_with_free_func (g_object_unref);
+  fixture->held_registrations = g_ptr_array_new_with_free_func (g_object_unref);
   fixture->service = g_dbus_connection_new_for_address_sync (
     g_test_dbus_get_bus_address (bus),
     G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION,
@@ -309,11 +389,15 @@ teardown (Fixture *fixture, gconstpointer unused)
   g_clear_object (&fixture->completer);
   release_held (fixture);
   g_ptr_array_unref (fixture->held);
+  g_ptr_array_set_size (fixture->held_registrations, 0);
+  g_ptr_array_unref (fixture->held_registrations);
   g_dbus_connection_unregister_object (fixture->service, fixture->registration);
   g_dbus_connection_close_sync (fixture->service, NULL, NULL);
   g_clear_object (&fixture->service);
   g_free (fixture->committed);
   g_free (fixture->last_word);
+  g_free (fixture->last_upload);
+  g_free (fixture->last_token);
   g_strfreev (fixture->last_context);
   spin (10);
 }
@@ -498,6 +582,300 @@ test_timeout (Fixture *fixture, gconstpointer unused)
   release_held (fixture);
   pos_completer_set_preedit (fixture->completer, "hel");
   wait_completion (fixture->completer, "hello");
+}
+
+
+/* Geometry as the keyboard exports it: symbol, alternates, rectangle. */
+static GVariant *
+geometry (double origin_x, const char *const *labels)
+{
+  GVariantBuilder keys;
+
+  g_variant_builder_init (&keys, G_VARIANT_TYPE ("a(sasdddd)"));
+  for (guint i = 0; labels[i]; i++) {
+    GVariantBuilder alternates;
+
+    g_variant_builder_init (&alternates, G_VARIANT_TYPE ("as"));
+    if (g_str_equal (labels[i], "e"))
+      g_variant_builder_add (&alternates, "s", "é");
+    g_variant_builder_add (&keys, "(s@asdddd)", labels[i],
+                           g_variant_builder_end (&alternates),
+                           origin_x + i * 30.0, 0.0, 30.0, 40.0);
+  }
+  return g_variant_ref_sink (g_variant_builder_end (&keys));
+}
+
+
+static GVariant *
+normal_geometry (void)
+{
+  const char *const labels[] = {"q", "w", "e", "r", "t", "y", NULL};
+
+  return geometry (0.0, labels);
+}
+
+
+static GVariant *
+shifted_geometry (void)
+{
+  const char *const labels[] = {"Q", "W", "E", "R", "T", "Y", NULL};
+
+  return geometry (0.0, labels);
+}
+
+
+static void
+wait_registration (Fixture *fixture, guint expected)
+{
+  gint64 deadline = g_get_monotonic_time () + 3 * G_TIME_SPAN_SECOND;
+
+  while (fixture->layout_registrations < expected && g_get_monotonic_time () < deadline)
+    spin (5);
+  g_assert_cmpuint (fixture->layout_registrations, ==, expected);
+}
+
+
+/* The completer registers what the keyboard actually shows and quotes the
+ * resulting token on completion requests. Predictions use PredictWith, which
+ * has no layout argument at all. */
+static void
+test_layout_registration (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) layout = normal_geometry ();
+  g_autofree char *expected = NULL;
+
+  pos_completer_verbisage_set_layout (self, layout);
+  wait_registration (fixture, 1);
+  g_assert_nonnull (strstr (fixture->last_upload, "\"label\":\"q\""));
+  /* Rectangles travel in the keyboard's own coordinate space. */
+  g_assert_nonnull (strstr (fixture->last_upload, "\"width\":30"));
+  /* Alternates travel with their key so accented words keep a position. */
+  g_assert_nonnull (strstr (fixture->last_upload, "é"));
+  expected = token_for (fixture->last_upload);
+
+  pos_completer_set_preedit (fixture->completer, "hel");
+  wait_completion (fixture->completer, "hello");
+  g_assert_cmpstr (fixture->last_token, ==, expected);
+
+  pos_completer_set_preedit (fixture->completer, NULL);
+  pos_completer_set_surrounding_text (fixture->completer, "see you ", "");
+  wait_completion (fixture->completer, "later");
+  g_assert_cmpuint (fixture->prediction_requests, ==, 1);
+  /* Nothing is ever forgotten: the entry is shared with other clients. */
+  g_assert_cmpuint (fixture->forget_requests, ==, 0);
+}
+
+
+/* Without geometry the request is made without a token rather than withheld. */
+static void
+test_layout_absent (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  pos_completer_verbisage_set_layout (self, NULL);
+  pos_completer_set_preedit (fixture->completer, "hel");
+  wait_completion (fixture->completer, "hello");
+  g_assert_cmpuint (fixture->layout_registrations, ==, 0);
+  g_assert_cmpstr (fixture->last_token, ==, "");
+}
+
+
+/* An active Shift layer is a different layout and gets its own token; flipping
+ * back to a layer already registered costs no further round trip. */
+static void
+test_layout_layer_change (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) normal = normal_geometry ();
+  g_autoptr (GVariant) shifted = shifted_geometry ();
+  g_autofree char *normal_token = NULL;
+  g_autofree char *shifted_token = NULL;
+
+  pos_completer_verbisage_set_layout (self, normal);
+  wait_registration (fixture, 1);
+  normal_token = token_for (fixture->last_upload);
+
+  pos_completer_verbisage_set_layout (self, shifted);
+  wait_registration (fixture, 2);
+  shifted_token = token_for (fixture->last_upload);
+  g_assert_cmpstr (shifted_token, !=, normal_token);
+  pos_completer_set_preedit (fixture->completer, "hel");
+  wait_completion (fixture->completer, "hello");
+  g_assert_cmpstr (fixture->last_token, ==, shifted_token);
+
+  /* Back to the unshifted layer: served from the client-side cache. */
+  pos_completer_set_preedit (fixture->completer, NULL);
+  pos_completer_verbisage_set_layout (self, normal);
+  pos_completer_set_preedit (fixture->completer, "wor");
+  wait_completion (fixture->completer, "world");
+  g_assert_cmpstr (fixture->last_token, ==, normal_token);
+  g_assert_cmpuint (fixture->layout_registrations, ==, 2);
+}
+
+
+/* A resize changes the rectangles, so the previous token no longer describes
+ * the keyboard and must not be quoted. */
+static void
+test_layout_resize (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) first = normal_geometry ();
+  const char *const labels[] = {"q", "w", "e", "r", "t", "y", NULL};
+  g_autoptr (GVariant) moved = geometry (12.0, labels);
+  g_autofree char *first_token = NULL;
+  g_autofree char *moved_token = NULL;
+
+  pos_completer_verbisage_set_layout (self, first);
+  wait_registration (fixture, 1);
+  first_token = token_for (fixture->last_upload);
+
+  pos_completer_verbisage_set_layout (self, moved);
+  wait_registration (fixture, 2);
+  moved_token = token_for (fixture->last_upload);
+  g_assert_cmpstr (moved_token, !=, first_token);
+
+  pos_completer_set_preedit (fixture->completer, "hel");
+  wait_completion (fixture->completer, "hello");
+  g_assert_cmpstr (fixture->last_token, ==, moved_token);
+}
+
+
+/* A registration reply that arrives after the geometry moved on describes a
+ * layout the keyboard no longer shows and must be discarded. */
+static void
+test_layout_stale_registration (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) first = normal_geometry ();
+  g_autoptr (GVariant) second = shifted_geometry ();
+  g_autofree char *first_token = NULL;
+  g_autofree char *second_token = NULL;
+
+  fixture->hold_word = "layout";
+  pos_completer_verbisage_set_layout (self, first);
+  wait_registration (fixture, 1);
+  g_assert_cmpuint (fixture->held_registrations->len, ==, 1);
+  first_token = token_for (fixture->last_upload);
+
+  /* The keyboard changes before the first registration is answered. */
+  fixture->hold_word = NULL;
+  pos_completer_verbisage_set_layout (self, second);
+  wait_registration (fixture, 2);
+  second_token = token_for (fixture->last_upload);
+  release_held_registrations (fixture);
+  spin (60);
+
+  pos_completer_set_preedit (fixture->completer, "hel");
+  wait_completion (fixture->completer, "hello");
+  g_assert_cmpstr (first_token, !=, second_token);
+  g_assert_cmpstr (fixture->last_token, ==, second_token);
+}
+
+
+/* The token is a shared, evictable cache entry. When the service reports it as
+ * unknown the completer registers again, exactly once, and input keeps
+ * working in the meantime. */
+static void
+test_layout_evicted_token (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) layout = normal_geometry ();
+
+  pos_completer_verbisage_set_layout (self, layout);
+  wait_registration (fixture, 1);
+
+  /* The service no longer knows the shared entry. */
+  fixture->reject_tokens = TRUE;
+  pos_completer_set_preedit (fixture->completer, "hel");
+  wait_completion (fixture->completer, "hello");
+  /* It registered once more, and once that was rejected too it completed
+   * without geometry instead of alternating. */
+  g_assert_cmpuint (fixture->layout_registrations, ==, 2);
+  g_assert_cmpstr (fixture->last_token, ==, "");
+
+  /* Further input stays usable and provokes no further registrations. */
+  pos_completer_set_preedit (fixture->completer, NULL);
+  pos_completer_set_preedit (fixture->completer, "wor");
+  wait_completion (fixture->completer, "world");
+  spin (150);
+  g_assert_cmpuint (fixture->layout_registrations, ==, 2);
+  g_assert_cmpstr (fixture->last_token, ==, "");
+
+  /* A new layout is new evidence: the client tries again. */
+  fixture->reject_tokens = FALSE;
+  {
+    g_autoptr (GVariant) shifted = shifted_geometry ();
+
+    pos_completer_verbisage_set_layout (self, shifted);
+    wait_registration (fixture, 3);
+    pos_completer_set_preedit (fixture->completer, NULL);
+    pos_completer_set_preedit (fixture->completer, "hel");
+    wait_completion (fixture->completer, "hello");
+    g_assert_cmpstr (fixture->last_token, !=, "");
+  }
+}
+
+
+/* An ordinary failure says nothing about the token, so it must not trigger a
+ * re-registration. */
+static void
+test_layout_kept_on_service_error (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) layout = normal_geometry ();
+  g_autofree char *expected = NULL;
+
+  pos_completer_verbisage_set_layout (self, layout);
+  wait_registration (fixture, 1);
+  expected = token_for (fixture->last_upload);
+
+  fixture->fail = TRUE;
+  pos_completer_set_preedit (fixture->completer, "hel");
+  spin (200);
+  g_assert_true (has_completion (fixture->completer, "hel"));
+  g_assert_cmpuint (fixture->layout_registrations, ==, 1);
+
+  fixture->fail = FALSE;
+  pos_completer_set_preedit (fixture->completer, NULL);
+  pos_completer_set_preedit (fixture->completer, "wor");
+  wait_completion (fixture->completer, "world");
+  g_assert_cmpstr (fixture->last_token, ==, expected);
+}
+
+
+/* A restarted daemon has an empty registry, so every token we hold is stale
+ * and the layout is registered with the new owner. */
+static void
+test_layout_daemon_restart (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) layout = normal_geometry ();
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GVariant) reply = NULL;
+  g_autofree char *expected = NULL;
+
+  pos_completer_verbisage_set_layout (self, layout);
+  wait_registration (fixture, 1);
+  expected = token_for (fixture->last_upload);
+
+  reply = g_dbus_connection_call_sync (fixture->service, "org.freedesktop.DBus",
+    "/org/freedesktop/DBus", "org.freedesktop.DBus", "ReleaseName",
+    g_variant_new ("(s)", "org.verbisage.Dictionary"), G_VARIANT_TYPE ("(u)"),
+    G_DBUS_CALL_FLAGS_NONE, 1000, NULL, &error);
+  g_assert_no_error (error);
+  spin (60);
+  g_clear_pointer (&reply, g_variant_unref);
+  reply = g_dbus_connection_call_sync (fixture->service, "org.freedesktop.DBus",
+    "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName",
+    g_variant_new ("(su)", "org.verbisage.Dictionary", 0u), G_VARIANT_TYPE ("(u)"),
+    G_DBUS_CALL_FLAGS_NONE, 1000, NULL, &error);
+  g_assert_no_error (error);
+
+  wait_registration (fixture, 2);
+  pos_completer_set_preedit (fixture->completer, "hel");
+  wait_completion (fixture->completer, "hello");
+  g_assert_cmpstr (fixture->last_token, ==, expected);
 }
 
 
@@ -1116,6 +1494,14 @@ main (int argc, char **argv)
   ADD_TEST ("error-recovery", test_error_recovery);
   ADD_TEST ("timeout", test_timeout);
   ADD_TEST ("daemon-restart", test_daemon_restart);
+  ADD_TEST ("layout-registration", test_layout_registration);
+  ADD_TEST ("layout-absent", test_layout_absent);
+  ADD_TEST ("layout-layer-change", test_layout_layer_change);
+  ADD_TEST ("layout-resize", test_layout_resize);
+  ADD_TEST ("layout-stale-registration", test_layout_stale_registration);
+  ADD_TEST ("layout-evicted-token", test_layout_evicted_token);
+  ADD_TEST ("layout-service-error", test_layout_kept_on_service_error);
+  ADD_TEST ("layout-daemon-restart", test_layout_daemon_restart);
   ADD_TEST ("editing", test_editing);
   ADD_TEST ("dispose-pending", test_dispose_pending);
   ADD_TEST ("input-limit", test_input_limit);

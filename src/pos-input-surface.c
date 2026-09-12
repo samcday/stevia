@@ -875,6 +875,37 @@ on_osk_key_cancelled (PosInputSurface *self)
 }
 
 
+/* Give the completer the geometry of the layer the keyboard is really
+ * showing. The completer owns how (and whether) the service is told. */
+static void
+publish_layout_geometry (PosInputSurface *self)
+{
+  g_autoptr (GVariant) geometry = NULL;
+  GtkWidget *child;
+
+  if (!POS_IS_COMPLETER_VERBISAGE (self->completer) || self->deck == NULL)
+    return;
+
+  child = hdy_deck_get_visible_child (self->deck);
+  if (POS_IS_OSK_WIDGET (child) && POS_INPUT_SURFACE_IS_LANG_LAYOUT (child))
+    geometry = pos_osk_widget_get_layout_geometry (POS_OSK_WIDGET (child));
+
+  pos_completer_verbisage_set_layout (POS_COMPLETER_VERBISAGE (self->completer), geometry);
+}
+
+
+static void
+on_osk_geometry_changed (PosInputSurface *self, GtkWidget *osk_widget)
+{
+  g_assert (POS_IS_INPUT_SURFACE (self));
+
+  if (osk_widget != hdy_deck_get_visible_child (self->deck))
+    return;
+
+  publish_layout_geometry (self);
+}
+
+
 static void
 on_osk_key_symbol (PosInputSurface *self, const char *symbol)
 {
@@ -1363,6 +1394,9 @@ on_visible_child_changed (PosInputSurface *self)
 
   /* Recheck completion bar visibility */
   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_COMPLETER_ACTIVE]);
+
+  /* A different layout, and possibly a different completer. */
+  publish_layout_geometry (self);
 }
 
 static void
@@ -1496,6 +1530,9 @@ pos_input_surface_set_completer (PosInputSurface *self, PosCompleter *completer)
   }
   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_COMPLETER]);
   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_COMPLETER_ACTIVE]);
+
+  /* A new completer starts without geometry. */
+  publish_layout_geometry (self);
 }
 
 
@@ -2459,6 +2496,7 @@ insert_osk (PosInputSurface   *self,
   g_debug ("Adding osk for layout '%s'", name);
   gtk_widget_set_visible (GTK_WIDGET (osk_widget), TRUE);
   g_object_connect (osk_widget,
+                    "swapped-signal::geometry-changed", G_CALLBACK (on_osk_geometry_changed), self,
                     "swapped-signal::swipe", G_CALLBACK (on_osk_swipe), self,
                     "swapped-signal::swipe-cancelled", G_CALLBACK (on_osk_swipe_cancelled), self,
                     "swapped-signal::notify::layer", G_CALLBACK (update_swipe_enabled), self,

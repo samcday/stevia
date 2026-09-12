@@ -27,6 +27,10 @@ GVariant     *pos_completer_verbisage_snapshot_swipe (PosCompleterVerbisage *sel
 gboolean      pos_completer_verbisage_restore_swipe (PosCompleterVerbisage *self,
                                                      GVariant *snapshot);
 
+/* The keyboard's actually displayed geometry, as `a(sasdddd)` from
+ * [method@Pos.OskWidget.get_layout_geometry]; %NULL disables layout use. */
+void pos_completer_verbisage_set_layout (PosCompleterVerbisage *self, GVariant *geometry);
+
 void pos_completer_verbisage_set_enabled (PosCompleterVerbisage *self, gboolean enabled);
 void pos_completer_verbisage_expect_commit (PosCompleterVerbisage *self);
 void pos_completer_verbisage_acknowledge_swipe (PosCompleterVerbisage *self,

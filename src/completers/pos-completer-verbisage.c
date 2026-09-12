@@ -10,6 +10,8 @@
 #include "pos-completer-verbisage.h"
 
 #include <gio/gio.h>
+#include <gmobile.h>
+#include <json-glib/json-glib.h>
 
 #define BUS_NAME "org.verbisage.Dictionary"
 #define OBJECT_PATH "/org/verbisage/Dictionary"
@@ -18,6 +20,9 @@
 #define MAX_WORD_CHARS 128
 #define LOOKUP_DELAY_MS 60
 #define LOOKUP_TIMEOUT_MS 1000
+/* Enough to keep the layers a user alternates between (normal, shifted,
+ * symbols) without a round trip; the service deduplicates by content anyway. */
+#define MAX_CACHED_LAYOUTS 6
 
 enum {
   PROP_0,
@@ -55,12 +60,30 @@ struct _PosCompleterVerbisage {
   gboolean enabled;
   gboolean awaiting_context;
   gboolean context_available;
+  /* The keyboard's actual allocated layout, as uploaded to the service. The
+   * upload is retained so an evicted token or a restarted daemon can be
+   * recovered without asking the keyboard again. */
+  char *layout_upload;
+  char *layout_token;
+  char *name_owner;
+  guint64 layout_generation;
+  gboolean layout_pending;
+  gboolean layout_recovering;
+  gboolean layout_blocked;
+  GHashTable *layout_tokens;
+  guint name_watch;
 };
 
 typedef struct {
   GWeakRef completer;
   guint64 generation;
 } Lookup;
+
+typedef struct {
+  GWeakRef completer;
+  guint64 generation;
+  char *upload;
+} LayoutRegistration;
 
 static void pos_completer_verbisage_interface_init (PosCompleterInterface *iface);
 
@@ -88,6 +111,29 @@ lookup_free (Lookup *lookup)
 }
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (Lookup, lookup_free)
+
+
+static LayoutRegistration *
+layout_registration_new (PosCompleterVerbisage *self, const char *upload)
+{
+  LayoutRegistration *registration = g_new0 (LayoutRegistration, 1);
+
+  g_weak_ref_init (&registration->completer, self);
+  registration->generation = self->layout_generation;
+  registration->upload = g_strdup (upload);
+  return registration;
+}
+
+
+static void
+layout_registration_free (LayoutRegistration *registration)
+{
+  g_weak_ref_clear (&registration->completer);
+  g_free (registration->upload);
+  g_free (registration);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (LayoutRegistration, layout_registration_free)
 
 
 static void
@@ -228,6 +274,299 @@ build_context (PosCompleterVerbisage *self)
 }
 
 
+/* ── Keyboard layout registration ──────────────────────────────────────────
+ *
+ * The service keeps registered layouts in a bounded, process-global cache
+ * keyed by a content hash, not per client. A token can therefore disappear
+ * when the daemon restarts or when the entry is evicted, and it may be shared
+ * with another client, so it is never explicitly forgotten here.
+ */
+
+static void register_layout (PosCompleterVerbisage *self);
+static void update_lookup (PosCompleterVerbisage *self);
+
+
+/* Serialize exported keyboard geometry as a Verbisage layout upload. The
+ * rectangles stay in the keyboard's own coordinate space; the service
+ * normalizes internally. */
+static char *
+layout_upload_json (GVariant *geometry)
+{
+  g_autoptr (JsonBuilder) builder = NULL;
+  g_autoptr (JsonGenerator) generator = NULL;
+  g_autoptr (JsonNode) root = NULL;
+  GVariantIter iter;
+  GVariantIter *alternates;
+  const char *symbol;
+  double x, y, width, height;
+  guint count = 0;
+
+  if (geometry == NULL)
+    return NULL;
+
+  builder = json_builder_new ();
+  json_builder_begin_object (builder);
+  json_builder_set_member_name (builder, "keys");
+  json_builder_begin_array (builder);
+
+  g_variant_iter_init (&iter, geometry);
+  while (g_variant_iter_next (&iter, "(&sasdddd)", &symbol, &alternates,
+                              &x, &y, &width, &height)) {
+    const char *alternate;
+
+    json_builder_begin_object (builder);
+    json_builder_set_member_name (builder, "label");
+    json_builder_add_string_value (builder, symbol);
+    if (g_variant_iter_n_children (alternates)) {
+      json_builder_set_member_name (builder, "alt_labels");
+      json_builder_begin_array (builder);
+      while (g_variant_iter_next (alternates, "&s", &alternate))
+        json_builder_add_string_value (builder, alternate);
+      json_builder_end_array (builder);
+    }
+    json_builder_set_member_name (builder, "left");
+    json_builder_add_double_value (builder, x);
+    json_builder_set_member_name (builder, "top");
+    json_builder_add_double_value (builder, y);
+    json_builder_set_member_name (builder, "width");
+    json_builder_add_double_value (builder, width);
+    json_builder_set_member_name (builder, "height");
+    json_builder_add_double_value (builder, height);
+    json_builder_end_object (builder);
+    g_variant_iter_free (alternates);
+    count++;
+  }
+
+  json_builder_end_array (builder);
+  json_builder_end_object (builder);
+  if (count == 0)
+    return NULL;
+
+  generator = json_generator_new ();
+  root = json_builder_get_root (builder);
+  json_generator_set_root (generator, root);
+  return json_generator_to_data (generator, NULL);
+}
+
+
+/* Drop the current token and invalidate replies still in flight. Tokens for
+ * other layers stay usable unless the service itself changed, in which case
+ * every token it issued is gone. */
+static void
+invalidate_layout (PosCompleterVerbisage *self, gboolean forget_tokens)
+{
+  self->layout_generation++;
+  self->layout_pending = FALSE;
+  self->layout_recovering = FALSE;
+  self->layout_blocked = FALSE;
+  g_clear_pointer (&self->layout_token, g_free);
+  if (forget_tokens && self->layout_tokens)
+    g_hash_table_remove_all (self->layout_tokens);
+}
+
+
+static void
+on_layout_registered (GObject *source, GAsyncResult *result, gpointer user_data)
+{
+  g_autoptr (LayoutRegistration) registration = user_data;
+  g_autoptr (PosCompleterVerbisage) self = g_weak_ref_get (&registration->completer);
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GVariant) reply =
+    g_dbus_connection_call_finish (G_DBUS_CONNECTION (source), result, &error);
+  const char *token;
+
+  /* The geometry changed while this was in flight, so the reply describes a
+   * layout the keyboard no longer shows. */
+  if (!self || registration->generation != self->layout_generation)
+    return;
+
+  self->layout_pending = FALSE;
+  if (!reply) {
+    /* Ordinary input keeps working without geometry. */
+    g_debug ("Layout registration unavailable; completing without geometry");
+    return;
+  }
+
+  g_variant_get (reply, "(&s)", &token);
+  if (gm_str_is_null_or_empty (token))
+    return;
+
+  g_free (self->layout_token);
+  self->layout_token = g_strdup (token);
+  if (g_hash_table_size (self->layout_tokens) >= MAX_CACHED_LAYOUTS)
+    g_hash_table_remove_all (self->layout_tokens);
+  g_hash_table_insert (self->layout_tokens, g_strdup (registration->upload),
+                       g_strdup (token));
+}
+
+
+static void
+on_layout_bus_ready (GObject *source, GAsyncResult *result, gpointer user_data)
+{
+  g_autoptr (LayoutRegistration) registration = user_data;
+  g_autoptr (PosCompleterVerbisage) self = g_weak_ref_get (&registration->completer);
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GDBusConnection) connection = g_bus_get_finish (result, &error);
+
+  if (!self || registration->generation != self->layout_generation)
+    return;
+  if (!connection)
+    return;
+
+  g_set_object (&self->connection, connection);
+  register_layout (self);
+}
+
+
+static void
+register_layout (PosCompleterVerbisage *self)
+{
+  const char *cached;
+
+  if (self->layout_upload == NULL || self->layout_blocked)
+    return;
+
+  cached = g_hash_table_lookup (self->layout_tokens, self->layout_upload);
+  if (cached) {
+    g_free (self->layout_token);
+    self->layout_token = g_strdup (cached);
+    return;
+  }
+
+  if (self->connection && g_dbus_connection_is_closed (self->connection))
+    g_clear_object (&self->connection);
+  if (!self->connection) {
+    self->layout_pending = TRUE;
+    g_bus_get (G_BUS_TYPE_SESSION, NULL, on_layout_bus_ready,
+               layout_registration_new (self, self->layout_upload));
+    return;
+  }
+
+  self->layout_pending = TRUE;
+  g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE,
+                          "RegisterLayout", g_variant_new ("(s)", self->layout_upload),
+                          G_VARIANT_TYPE ("(s)"), G_DBUS_CALL_FLAGS_NONE, LOOKUP_TIMEOUT_MS,
+                          NULL, on_layout_registered,
+                          layout_registration_new (self, self->layout_upload));
+}
+
+
+static void
+on_service_name_changed (GDBusConnection *connection,
+                         const char *name,
+                         const char *name_owner,
+                         gpointer user_data)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (user_data);
+  gboolean had_owner = self->name_owner != NULL;
+
+  if (g_strcmp0 (self->name_owner, name_owner) == 0)
+    return;
+  g_free (self->name_owner);
+  self->name_owner = g_strdup (name_owner);
+
+  if (name_owner == NULL) {
+    /* Everything this daemon issued died with it. */
+    invalidate_layout (self, TRUE);
+    return;
+  }
+
+  if (had_owner) {
+    /* A different daemon starts with an empty registry. */
+    invalidate_layout (self, TRUE);
+  } else if (self->layout_token || self->layout_pending) {
+    /* First sighting of the daemon we are already talking to. */
+    return;
+  }
+
+  register_layout (self);
+}
+
+
+static void
+on_service_name_vanished (GDBusConnection *connection, const char *name, gpointer user_data)
+{
+  on_service_name_changed (connection, name, NULL, user_data);
+}
+
+
+/**
+ * pos_completer_verbisage_set_layout:
+ * @self: The completer
+ * @geometry:(nullable): Exported keyboard geometry as `a(sasdddd)`
+ *
+ * Register the keyboard's actually displayed layout with the service, so
+ * completions and corrections can use real key positions. Passing %NULL (no
+ * usable geometry) reverts to geometry-free requests.
+ */
+void
+pos_completer_verbisage_set_layout (PosCompleterVerbisage *self, GVariant *geometry)
+{
+  g_autofree char *upload = NULL;
+
+  g_return_if_fail (POS_IS_COMPLETER_VERBISAGE (self));
+  g_return_if_fail (geometry == NULL ||
+                    g_variant_is_of_type (geometry, G_VARIANT_TYPE ("a(sasdddd)")));
+
+  upload = layout_upload_json (geometry);
+  if (g_strcmp0 (upload, self->layout_upload) == 0)
+    return;
+
+  /* Any reply still in flight describes the previous geometry. Tokens for
+   * other layers remain valid with this daemon. */
+  invalidate_layout (self, FALSE);
+  g_free (self->layout_upload);
+  self->layout_upload = g_steal_pointer (&upload);
+
+  if (self->layout_upload == NULL)
+    return;
+
+  if (self->name_watch == 0) {
+    self->name_watch = g_bus_watch_name (G_BUS_TYPE_SESSION, BUS_NAME,
+                                         G_BUS_NAME_WATCHER_FLAGS_NONE,
+                                         on_service_name_changed,
+                                         on_service_name_vanished,
+                                         self, NULL);
+  }
+  register_layout (self);
+}
+
+
+/* The token is a shared, evictable entry in the service's cache: a restart or
+ * another client's uploads can invalidate it. Recover once per layout, and
+ * only for that specific error, since a busy or timed-out service says
+ * nothing at all about the token.
+ *
+ * Returns: %TRUE when the request should simply be made again. */
+static gboolean
+recover_unknown_layout (PosCompleterVerbisage *self, const GError *error)
+{
+  if (!error || self->layout_upload == NULL || self->layout_blocked)
+    return FALSE;
+  if (!g_dbus_error_is_remote_error (error))
+    return FALSE;
+  if (strstr (error->message, "unknown layout token") == NULL)
+    return FALSE;
+
+  if (self->layout_recovering) {
+    /* Registering again did not help. Complete without geometry rather than
+     * alternate between registering and being rejected; a new layout or a new
+     * daemon is what re-arms this. */
+    g_debug ("Re-registered layout is still unknown; completing without geometry");
+    self->layout_generation++;
+    self->layout_pending = FALSE;
+    self->layout_blocked = TRUE;
+    g_clear_pointer (&self->layout_token, g_free);
+    return TRUE;
+  }
+
+  invalidate_layout (self, TRUE);
+  self->layout_recovering = TRUE;
+  register_layout (self);
+  return TRUE;
+}
+
+
 static void
 publish_completions (PosCompleterVerbisage *self)
 {
@@ -274,6 +613,13 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
     /* Do not log the preedit or daemon error message (which may contain it). */
     if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
       g_debug ("Dictionary lookup unavailable; retaining literal input");
+    if (recover_unknown_layout (self, error)) {
+      /* The shared layout entry is gone. Ask again without it; the new token
+       * applies to later requests. */
+      g_debug ("Registered layout is unknown to the service; re-registering");
+      update_lookup (self);
+      return;
+    }
     pos_completer_verbisage_cancel_swipe (self);
     return;
   }
@@ -350,10 +696,19 @@ start_lookup (PosCompleterVerbisage *self)
   /* The keyboard applies capitalization to display choices. Compare without
    * a case bonus; context and input folding are explicit service parameters. */
   if (self->preedit->len) {
+    GVariantBuilder points;
+
+    /* Per-character touch coordinates are a separate change: they need proven
+     * alignment with the prepared preedit across normalization, folding,
+     * multi-character symbols and undo. An empty list requests the
+     * layout-only spatial model. */
+    g_variant_builder_init (&points, G_VARIANT_TYPE ("a(dd)"));
     g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "CompleteWith",
-                             g_variant_new ("(s^asus(ss)(ss)s)", self->preedit->str, context,
+                             g_variant_new ("(s^asus(ss)(ss)ss@a(dd))", self->preedit->str, context,
                                               (guint) MAX_RESULTS, self->language,
-                                              "nfc", "full", "nfc", "full", "insensitive"),
+                                              "nfc", "full", "nfc", "full", "insensitive",
+                                              self->layout_token ?: "",
+                                              g_variant_builder_end (&points)),
                              G_VARIANT_TYPE ("(a(sd))"), G_DBUS_CALL_FLAGS_NONE,
                              LOOKUP_TIMEOUT_MS, self->cancellable, on_lookup_finished,
                              lookup_new (self));
@@ -577,6 +932,10 @@ pos_completer_verbisage_dispose (GObject *object)
   PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (object);
 
   cancel_lookup (self);
+  /* Registered layouts are shared entries in the service's cache and may be
+   * in use by another client, so they are not forgotten here. */
+  self->layout_generation++;
+  g_clear_handle_id (&self->name_watch, g_bus_unwatch_name);
   g_clear_object (&self->connection);
   G_OBJECT_CLASS (pos_completer_verbisage_parent_class)->dispose (object);
 }
@@ -590,6 +949,10 @@ pos_completer_verbisage_finalize (GObject *object)
   g_string_free (self->preedit, TRUE);
   g_strfreev (self->completions);
   g_free (self->language);
+  g_free (self->layout_upload);
+  g_free (self->layout_token);
+  g_free (self->name_owner);
+  g_clear_pointer (&self->layout_tokens, g_hash_table_unref);
   G_OBJECT_CLASS (pos_completer_verbisage_parent_class)->finalize (object);
 }
 
@@ -630,6 +993,7 @@ pos_completer_verbisage_init (PosCompleterVerbisage *self)
   self->enabled = TRUE;
   self->preedit = g_string_new (NULL);
   self->language = g_strdup ("en_US");
+  self->layout_tokens = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
 }
 
 
