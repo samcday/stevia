@@ -1856,6 +1856,41 @@ test_queue_failure_cancels_the_suffix (Fixture *fixture, gconstpointer unused)
 }
 
 
+/* A failure in the middle stops replay there: the words before it are already
+ * committed and stay, the words after it are cancelled rather than moved up. */
+static void
+test_queue_middle_failure_keeps_played_words (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_swipes = TRUE;
+  for (int mark = 1; mark <= 3; mark++)
+    g_assert_true (request_marked_swipe (fixture, mark, 0));
+  wait_held_count (fixture, 2);
+
+  /* The first word succeeds and is played. */
+  release_held_at (fixture, 0);
+  wait_commits (fixture, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 0), ==, "w1 ");
+
+  /* The second fails, with the third already waiting behind it. */
+  wait_held_count (fixture, 2);
+  g_dbus_method_invocation_return_dbus_error (g_ptr_array_index (fixture->held, 0),
+                                              "org.freedesktop.DBus.Error.Failed",
+                                              "recognition unavailable");
+  g_ptr_array_remove_index (fixture->held, 0);
+  fixture->hold_swipes = FALSE;
+  wait_pending_swipes (fixture, 0);
+
+  /* w1 stays committed; w2 and w3 are gone rather than w3 taking w2's place. */
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 1);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_cmpuint (fixture->feedback->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->feedback, 0), ==, "recognition-failed");
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+}
+
+
 /* Capitalization is captured with the gesture, so a Shift release afterwards
  * cannot change a word that was already taken. */
 static void
@@ -2183,6 +2218,7 @@ main (int argc, char **argv)
   ADD_TEST ("queue-backspace", test_queue_backspace_cancels_newest);
   ADD_TEST ("queue-missing-ack", test_queue_missing_acknowledgement_stops_replay);
   ADD_TEST ("queue-failure", test_queue_failure_cancels_the_suffix);
+  ADD_TEST ("queue-middle-failure", test_queue_middle_failure_keeps_played_words);
   ADD_TEST ("queue-capitalization", test_queue_keeps_captured_capitalization);
   ADD_TEST ("queue-busy-retry", test_queue_busy_is_retried);
   ADD_TEST ("queue-empty-result", test_queue_empty_result_is_a_failure);
