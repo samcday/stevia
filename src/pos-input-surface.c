@@ -164,11 +164,10 @@ struct _PosInputSurface {
   /* Swipe gesture */
   GtkGesture                 *swipe_down;
   gboolean                    swipe_typing;
-  PosCompletionUndo          *swipe_accept;
-  GVariant                   *next_swipe_trace;
-  GVariant                   *next_swipe_keys;
-  guint                       next_swipe_capitalization;
-  guint                       next_swipe_timeout;
+  /* The commit the gesture queue is currently waiting to see land. The queue
+   * itself owns the accepted gestures; this is only the text-state
+   * expectation for the one word being replayed. */
+  PosCompletionUndo          *swipe_replay_ack;
   PosCompletionUndo          *completion_undo;
   PosCompletionUndo          *completion_restore;
 
@@ -206,21 +205,23 @@ clear_completion_undo (PosInputSurface *self)
 }
 
 
-static void
-clear_next_swipe (PosInputSurface *self)
-{
-  g_clear_handle_id (&self->next_swipe_timeout, g_source_remove);
-  g_clear_pointer (&self->swipe_accept, pos_completion_undo_free);
-  g_clear_pointer (&self->next_swipe_trace, g_variant_unref);
-  g_clear_pointer (&self->next_swipe_keys, g_variant_unref);
-}
-
-
+/* Editing history is about undo, not about gestures that were accepted and
+ * are waiting to be played: those survive until the session itself changes. */
 static void
 clear_edit_history (PosInputSurface *self)
 {
   clear_completion_undo (self);
-  clear_next_swipe (self);
+}
+
+
+/* The input session changed under us, so no accepted gesture may still be
+ * played into it. */
+static void
+invalidate_swipe_queue (PosInputSurface *self)
+{
+  g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
+  if (POS_IS_COMPLETER_VERBISAGE (self->completer))
+    pos_completer_verbisage_invalidate_swipes (POS_COMPLETER_VERBISAGE (self->completer));
 }
 
 
@@ -582,26 +583,14 @@ update_swipe_enabled (PosInputSurface *self)
 }
 
 
+/* The keyboard cancels the gesture being drawn, and emits this for an aborted
+ * drag, an automatic Shift release and a resize as well. None of those say
+ * anything about gestures that were already accepted. */
 static void
 on_osk_swipe_cancelled (PosInputSurface *self)
 {
-  clear_next_swipe (self);
   if (POS_IS_COMPLETER_VERBISAGE (self->completer))
     pos_completer_verbisage_cancel_swipe (POS_COMPLETER_VERBISAGE (self->completer));
-}
-
-
-/* The preceding swipe word is still editable. Commit it only when another
- * gesture finishes, then wait for the application's exact acknowledgement
- * before recognizing the new word against that insertion point. */
-static gboolean
-next_swipe_timeout (gpointer data)
-{
-  PosInputSurface *self = data;
-
-  self->next_swipe_timeout = 0;
-  clear_next_swipe (self);
-  return G_SOURCE_REMOVE;
 }
 
 
@@ -611,33 +600,16 @@ on_osk_swipe (PosInputSurface *self, GVariant *trace, GVariant *keys, GtkWidget 
   PosCompleterVerbisage *completer;
   guint capitalization;
 
-  clear_edit_history (self);
+  clear_completion_undo (self);
   if (!swipe_eligible (self, osk))
     return;
 
   completer = POS_COMPLETER_VERBISAGE (self->completer);
   capitalization = pos_osk_widget_get_swipe_capitalization (POS_OSK_WIDGET (osk));
-  if (pos_completer_verbisage_has_swipe_preedit (completer)) {
-    const char *text, *preedit = pos_completer_get_preedit (self->completer);
-    g_autofree char *send = g_strdup_printf ("%s ", preedit);
-    guint anchor, cursor;
-
-    text = pos_input_method_get_surrounding_text (self->input_method, &anchor, &cursor);
-    self->swipe_accept = pos_completion_undo_new (text, cursor, anchor, send, preedit,
-                                                 NULL, NULL,
-                                                 pos_input_method_get_serial (self->input_method));
-    if (!self->swipe_accept)
-      return;
-    self->next_swipe_trace = g_variant_ref (trace);
-    self->next_swipe_keys = g_variant_ref (keys);
-    self->next_swipe_capitalization = capitalization;
-    self->next_swipe_timeout = g_timeout_add (1000, next_swipe_timeout, self);
-    if (!pos_completer_verbisage_accept_swipe (completer))
-      clear_next_swipe (self);
-    return;
-  }
-
-  pos_completer_verbisage_recognize_swipe (completer, trace, keys, capitalization);
+  /* The queue owns ordering: it commits the word on screen and any words
+   * before this one first, each waiting for its acknowledgement. */
+  if (!pos_completer_verbisage_recognize_swipe (completer, trace, keys, capitalization))
+    pos_input_surface_trigger_feedback (self, KEY_PRESS_EVENT);
 }
 
 
@@ -797,10 +769,29 @@ on_completer_commit_string (PosInputSurface *self,
                             int              before,
                             int              after)
 {
+  gboolean replaying = POS_IS_COMPLETER_VERBISAGE (self->completer) &&
+    pos_completer_verbisage_replay_pending (POS_COMPLETER_VERBISAGE (self->completer));
+
   if (POS_IS_COMPLETER_VERBISAGE (self->completer))
     pos_completer_verbisage_expect_commit (POS_COMPLETER_VERBISAGE (self->completer));
   clear_completion_undo (self);
   g_debug ("%s: %s, (%d,%d)", __func__, text, before, after);
+
+  /* A replayed word only counts once the application shows it, so record the
+   * exact text state to wait for before the next word is played. */
+  g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
+  if (replaying && !before && !after) {
+    const char *surrounding;
+    guint anchor, cursor;
+
+    surrounding = pos_input_method_get_surrounding_text (self->input_method, &anchor, &cursor);
+    /* No preedit is restored from this: it only records the text state the
+     * replayed word must produce. */
+    self->swipe_replay_ack =
+      pos_completion_undo_new (surrounding, cursor, anchor, text, "", NULL, NULL,
+                               pos_input_method_get_serial (self->input_method));
+  }
+
   if (before || after)
     pos_input_method_delete_surrounding_text (self->input_method, before, after, FALSE);
   pos_input_method_send_string (self->input_method, text, TRUE);
@@ -850,7 +841,6 @@ on_osk_key_down (PosInputSurface *self, const char *symbol, GtkWidget *osk_widge
 
   if (g_strcmp0 (symbol, "KEY_BACKSPACE") != 0)
     clear_completion_undo (self);
-  clear_next_swipe (self);
   pos_input_surface_trigger_feedback (self, KEY_PRESS_EVENT);
 
   pos_input_surface_set_backspace_pressed (self, symbol);
@@ -923,7 +913,6 @@ pos_input_surface_submit_symbol (PosInputSurface *self, const char *symbol)
   g_debug ("Key: '%s' symbol", symbol);
 
   is_bs = pos_input_surface_set_backspace_pressed (self, symbol);
-  clear_next_swipe (self);
   if (is_bs && !self->latched_modifiers && undo_completion (self))
     return;
   clear_completion_undo (self);
@@ -1395,7 +1384,9 @@ on_visible_child_changed (PosInputSurface *self)
   /* Recheck completion bar visibility */
   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_COMPLETER_ACTIVE]);
 
-  /* A different layout, and possibly a different completer. */
+  /* A different layout, and possibly a different completer: the geometry and
+   * language a queued gesture was taken under no longer apply. */
+  invalidate_swipe_queue (self);
   publish_layout_geometry (self);
 }
 
@@ -1601,6 +1592,8 @@ reverse_ease_out_cubic (double t)
 static void
 pos_input_surface_set_completion_enabled (PosInputSurface *self, gboolean enable)
 {
+  if (!enable)
+    invalidate_swipe_queue (self);
   if (self->completion_enabled == enable)
     return;
 
@@ -1837,6 +1830,8 @@ select_layout_by_im_purpose (PosInputSurface *self)
 static void
 on_im_purpose_changed (PosInputSurface *self, GParamSpec *pspec, PosInputMethod *im)
 {
+  /* A purpose that does not take gestures cannot receive queued words. */
+  invalidate_swipe_queue (self);
   g_assert (POS_IS_INPUT_SURFACE (self));
   g_assert (POS_IS_INPUT_METHOD (im));
   g_assert (self->input_method == im);
@@ -1893,8 +1888,8 @@ on_im_surrounding_text_changed (PosInputSurface *self, GParamSpec *pspec, PosInp
   g_assert (POS_IS_INPUT_METHOD (im));
 
   text = pos_input_method_get_surrounding_text (im, &anchor, &cursor);
-  accepted_previous = self->swipe_accept &&
-    pos_completion_undo_matches (self->swipe_accept, text, cursor, anchor);
+  accepted_previous = self->swipe_replay_ack &&
+    pos_completion_undo_matches (self->swipe_replay_ack, text, cursor, anchor);
 
   /* PosInputMethod only notifies when text, cursor or anchor actually changes.
    * Moving between two otherwise eligible insertion points still invalidates
@@ -1919,15 +1914,11 @@ on_im_surrounding_text_changed (PosInputSurface *self, GParamSpec *pspec, PosInp
                                       self->surround_before,
                                       after);
   if (accepted_previous) {
-    g_autoptr (GVariant) trace = g_steal_pointer (&self->next_swipe_trace);
-    g_autoptr (GVariant) keys = g_steal_pointer (&self->next_swipe_keys);
-    guint capitalization = self->next_swipe_capitalization;
-    GtkWidget *osk = hdy_deck_get_visible_child (self->deck);
-
-    clear_next_swipe (self);
-    if (trace && keys && swipe_eligible (self, osk))
-      pos_completer_verbisage_recognize_swipe (POS_COMPLETER_VERBISAGE (self->completer),
-                                             trace, keys, capitalization);
+    /* The replayed word is really in the text, so the queue may play the next
+     * one. The completer is told after it has seen the new context. */
+    g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
+    if (POS_IS_COMPLETER_VERBISAGE (self->completer))
+      pos_completer_verbisage_replay_acknowledged (POS_COMPLETER_VERBISAGE (self->completer));
   }
 }
 
@@ -1963,9 +1954,9 @@ on_im_done (PosInputSurface *self)
   if (self->completion_undo &&
       !pos_completion_undo_observe (self->completion_undo, text, cursor, anchor, serial, im_change))
     clear_completion_undo (self);
-  if (self->swipe_accept &&
-      !pos_completion_undo_observe (self->swipe_accept, text, cursor, anchor, serial, im_change))
-    clear_next_swipe (self);
+  if (self->swipe_replay_ack &&
+      !pos_completion_undo_observe (self->swipe_replay_ack, text, cursor, anchor, serial, im_change))
+    g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
 }
 
 
@@ -1996,6 +1987,8 @@ on_im_active_changed (PosInputSurface *self, GParamSpec *pspec, PosInputMethod *
   g_assert (POS_IS_INPUT_SURFACE (self));
   g_assert (POS_IS_INPUT_METHOD (im));
 
+  /* A different field, or none: nothing accepted here may be played there. */
+  invalidate_swipe_queue (self);
   clear_edit_history (self);
   active = pos_input_method_get_active (im);
   g_debug ("IM active: %d", active);
