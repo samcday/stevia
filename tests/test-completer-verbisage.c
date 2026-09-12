@@ -55,6 +55,16 @@ typedef struct {
   char *last_upload;
   char *last_token;
   gboolean reject_tokens;
+  /* Stands in for the input surface: acknowledge replayed commits unless a
+   * case is specifically about a missing acknowledgement. */
+  gboolean hold_ack;
+  gboolean hold_swipes;
+  gboolean fail_swipes;
+  gboolean busy_swipes;
+  guint busy_replies;
+  guint acks;
+  GPtrArray *commits_seen;
+  GPtrArray *feedback;
   guint reject_token_requests;
   GPtrArray *held_registrations;
 } Fixture;
@@ -122,8 +132,28 @@ answer (GDBusMethodInvocation *invocation)
   const char *method = g_dbus_method_invocation_get_method_name (invocation);
   GVariantBuilder builder;
 
-  if (g_str_equal (method, "RecognizeSwipe"))
+  if (g_str_equal (method, "RecognizeSwipe")) {
+    g_autoptr (GVariant) trace = NULL;
+    double x, y;
+    guint millis;
+
+    /* The standard fixture gesture keeps the historical ranked list; a gesture
+     * marked with another origin answers with a word naming that mark, so an
+     * ordered replay can be checked word by word. */
+    g_variant_get_child (parameters, 0, "@a(ddu)", &trace);
+    g_variant_get_child (trace, 0, "(ddu)", &x, &y, &millis);
+    if (x != 10.0) {
+      GVariantBuilder marked;
+
+      g_variant_builder_init (&marked, G_VARIANT_TYPE ("a(sd)"));
+      generated = g_strdup_printf ("w%d", (int) x);
+      g_variant_builder_add (&marked, "(sd)", generated, 1.0);
+      g_dbus_method_invocation_return_value (invocation,
+                                             g_variant_new ("(a(sd))", &marked));
+      return;
+    }
     word = "swipe";
+  }
   else if (g_str_equal (method, "PredictWith")) {
     g_variant_get_child (parameters, 0, "^as", &context);
     word = "";
@@ -307,7 +337,23 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
   g_assert_cmpstr (language, ==, "en_US");
   g_assert_cmpuint (max, ==, 6);
 
-  if (fixture->hold_word && g_str_equal (word, fixture->hold_word))
+  if (fixture->busy_replies && g_str_equal (method, "RecognizeSwipe")) {
+    /* Temporary backpressure, exactly as the service reports it. */
+    fixture->busy_replies--;
+    fixture->busy_swipes = TRUE;
+    g_dbus_method_invocation_return_dbus_error (invocation,
+                                                "org.freedesktop.DBus.Error.Failed",
+                                                "swipe recognition is busy");
+    return;
+  }
+  if (fixture->empty && g_str_equal (method, "RecognizeSwipe")) {
+    g_dbus_method_invocation_return_value (invocation,
+      g_variant_new ("(@a(sd))", g_variant_new_array (G_VARIANT_TYPE ("(sd)"), NULL, 0)));
+    return;
+  }
+  if (fixture->hold_swipes && g_str_equal (method, "RecognizeSwipe"))
+    g_ptr_array_add (fixture->held, g_object_ref (invocation));
+  else if (fixture->hold_word && g_str_equal (word, fixture->hold_word))
     g_ptr_array_add (fixture->held, g_object_ref (invocation));
   else if (fixture->case_variants) {
     GVariantBuilder builder;
@@ -331,6 +377,19 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
 static const GDBusInterfaceVTable vtable = {.method_call = on_call};
 
 
+static gboolean
+acknowledge_replay (gpointer data)
+{
+  Fixture *fixture = data;
+
+  if (pos_completer_verbisage_replay_pending (POS_COMPLETER_VERBISAGE (fixture->completer))) {
+    fixture->acks++;
+    pos_completer_verbisage_replay_acknowledged (POS_COMPLETER_VERBISAGE (fixture->completer));
+  }
+  return G_SOURCE_REMOVE;
+}
+
+
 static void
 on_commit (PosCompleter *completer, const char *text, int before, int after, gpointer user_data)
 {
@@ -342,6 +401,11 @@ on_commit (PosCompleter *completer, const char *text, int before, int after, gpo
   fixture->before = before;
   fixture->after = after;
   fixture->commits++;
+  g_ptr_array_add (fixture->commits_seen, g_strdup (text));
+  /* The application acknowledges the commit on its own turn of the loop. */
+  if (!fixture->hold_ack &&
+      pos_completer_verbisage_replay_pending (POS_COMPLETER_VERBISAGE (completer)))
+    g_idle_add (acknowledge_replay, fixture);
   if (fixture->accept_again)
     g_assert_false (pos_completer_verbisage_accept_swipe (
       POS_COMPLETER_VERBISAGE (completer)));
@@ -356,6 +420,13 @@ on_completions_changed (PosCompleter *completer, GParamSpec *pspec, Fixture *fix
 
 
 static void
+on_swipe_feedback (PosCompleter *completer, const char *reason, Fixture *fixture)
+{
+  g_ptr_array_add (fixture->feedback, g_strdup (reason));
+}
+
+
+static void
 setup (Fixture *fixture, gconstpointer unused)
 {
   g_autoptr (GError) error = NULL;
@@ -365,6 +436,8 @@ setup (Fixture *fixture, gconstpointer unused)
   g_assert_no_error (error);
   fixture->held = g_ptr_array_new_with_free_func (g_object_unref);
   fixture->held_registrations = g_ptr_array_new_with_free_func (g_object_unref);
+  fixture->commits_seen = g_ptr_array_new_with_free_func (g_free);
+  fixture->feedback = g_ptr_array_new_with_free_func (g_free);
   fixture->service = g_dbus_connection_new_for_address_sync (
     g_test_dbus_get_bus_address (bus),
     G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION,
@@ -382,6 +455,7 @@ setup (Fixture *fixture, gconstpointer unused)
   g_assert_no_error (error);
   g_signal_connect (fixture->completer, "commit-string", G_CALLBACK (on_commit), fixture);
   g_signal_connect (fixture->completer, "notify::completions", G_CALLBACK (on_completions_changed), fixture);
+  g_signal_connect (fixture->completer, "swipe-feedback", G_CALLBACK (on_swipe_feedback), fixture);
 }
 
 
@@ -396,6 +470,20 @@ release_held_rejected (Fixture *fixture)
                                                 "unknown layout token 'held'");
   }
   g_ptr_array_set_size (fixture->held, 0);
+}
+
+
+/* Answer one held request, leaving the others held: recognition may finish in
+ * any order. */
+static void
+release_held_at (Fixture *fixture, guint position)
+{
+  GDBusMethodInvocation *invocation;
+
+  g_assert_cmpuint (position, <, fixture->held->len);
+  invocation = g_ptr_array_index (fixture->held, position);
+  answer (invocation);
+  g_ptr_array_remove_index (fixture->held, position);
 }
 
 
@@ -419,6 +507,8 @@ teardown (Fixture *fixture, gconstpointer unused)
   g_dbus_connection_unregister_object (fixture->service, fixture->registration);
   g_dbus_connection_close_sync (fixture->service, NULL, NULL);
   g_clear_object (&fixture->service);
+  g_ptr_array_unref (fixture->commits_seen);
+  g_ptr_array_unref (fixture->feedback);
   g_free (fixture->committed);
   g_free (fixture->last_word);
   g_free (fixture->last_upload);
@@ -1143,6 +1233,79 @@ request_swipe (Fixture *fixture)
 }
 
 
+/* A gesture marked with @mark, which the service answers with "w<mark>". */
+static gboolean
+request_marked_swipe (Fixture *fixture, int mark, guint capitalization)
+{
+  GVariantBuilder trace, keys;
+  g_autoptr (GVariant) points = NULL;
+  g_autoptr (GVariant) geometry = NULL;
+
+  g_assert_cmpint (mark, !=, 10);
+  g_variant_builder_init (&trace, G_VARIANT_TYPE ("a(ddu)"));
+  g_variant_builder_add (&trace, "(ddu)", (double) mark, 20.0, 0u);
+  g_variant_builder_add (&trace, "(ddu)", 80.0, 40.0, 70u);
+  g_variant_builder_add (&trace, "(ddu)", 120.0, 20.0, 140u);
+  g_variant_builder_init (&keys, G_VARIANT_TYPE ("a(sdddd)"));
+  for (char c = 'a'; c <= 'z'; c++) {
+    char label[] = {c, 0};
+    g_variant_builder_add (&keys, "(sdddd)", label,
+                           (double) ((c - 'a') % 10 * 30),
+                           (double) ((c - 'a') / 10 * 50), 30.0, 50.0);
+  }
+  points = g_variant_ref_sink (g_variant_builder_end (&trace));
+  geometry = g_variant_ref_sink (g_variant_builder_end (&keys));
+  return pos_completer_verbisage_recognize_swipe (POS_COMPLETER_VERBISAGE (fixture->completer),
+                                                  points, geometry, capitalization);
+}
+
+
+static void
+wait_held_count (Fixture *fixture, guint expected)
+{
+  gint64 deadline = g_get_monotonic_time () + 3 * G_TIME_SPAN_SECOND;
+
+  while (fixture->held->len != expected && g_get_monotonic_time () < deadline)
+    spin (5);
+  g_assert_cmpuint (fixture->held->len, ==, expected);
+}
+
+
+static void
+wait_commits (Fixture *fixture, guint expected)
+{
+  gint64 deadline = g_get_monotonic_time () + 3 * G_TIME_SPAN_SECOND;
+
+  while (fixture->commits_seen->len < expected && g_get_monotonic_time () < deadline)
+    spin (5);
+  g_assert_cmpuint (fixture->commits_seen->len, ==, expected);
+}
+
+
+static void
+wait_pending_swipes (Fixture *fixture, guint expected)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  gint64 deadline = g_get_monotonic_time () + 3 * G_TIME_SPAN_SECOND;
+
+  while (pos_completer_verbisage_pending_swipes (self) != expected &&
+         g_get_monotonic_time () < deadline)
+    spin (5);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, expected);
+}
+
+
+static void
+assert_commits (Fixture *fixture, const char *const *expected)
+{
+  for (guint i = 0; expected[i]; i++) {
+    g_assert_cmpuint (fixture->commits_seen->len, >, i);
+    g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, i), ==, expected[i]);
+  }
+  g_assert_cmpuint (fixture->commits_seen->len, ==, g_strv_length ((GStrv) expected));
+}
+
+
 static void
 test_swipe_results (Fixture *fixture, gconstpointer unused)
 {
@@ -1175,29 +1338,58 @@ test_swipe_results (Fixture *fixture, gconstpointer unused)
 
 
 static void
+/* A key typed while a gesture is still unplayed is a barrier, not a
+ * cancellation: the gesture's word is played first, then the key is applied
+ * with the ordinary semantics. Before the queue this cancelled the gesture and
+ * lost the word. */
 test_swipe_stale (Fixture *fixture, gconstpointer unused)
 {
   fixture->hold_word = "swipe";
   request_swipe (fixture);
   wait_held (fixture);
   pos_completer_feed_symbol (fixture->completer, "w");
+  /* The key waits behind the gesture rather than becoming preedit. */
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
   release_held (fixture);
   wait_completion (fixture->completer, "wword");
-  g_assert_false (has_completion (fixture->completer, "hello"));
   g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "w");
-  g_assert_null (fixture->committed);
+  /* The recognized word was committed before the typed key, exactly once. */
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 0), ==, "hello ");
+  g_assert_cmpuint (fixture->acks, ==, 1);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (
+                      POS_COMPLETER_VERBISAGE (fixture->completer)), ==, 0);
 }
 
 
 static void
+/* Cancelling the gesture being drawn says nothing about a gesture that was
+ * already accepted; the keyboard emits it for an aborted drag, an automatic
+ * Shift release and a resize. Invalidating the input session does drop it. */
 test_swipe_cancel (Fixture *fixture, gconstpointer unused)
 {
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
   fixture->hold_word = "swipe";
   request_swipe (fixture);
   wait_held (fixture);
-  pos_completer_verbisage_cancel_swipe (POS_COMPLETER_VERBISAGE (fixture->completer));
+  pos_completer_verbisage_cancel_swipe (self);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 1);
   release_held (fixture);
-  spin (50);
+  wait_completion (fixture->completer, "hello");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "hello");
+  g_assert_null (fixture->committed);
+
+  /* A session change is what drops accepted work. */
+  fixture->hold_word = "swipe";
+  pos_completer_set_preedit (fixture->completer, NULL);
+  request_swipe (fixture);
+  wait_held (fixture);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 1);
+  pos_completer_verbisage_invalidate_swipes (self);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+  release_held (fixture);
+  spin (60);
   g_assert_null (pos_completer_get_completions (fixture->completer));
   g_assert_null (fixture->committed);
 }
@@ -1467,6 +1659,272 @@ test_swipe_composition_cancel (Fixture *fixture, gconstpointer unused)
 }
 
 
+/* Five gestures, answered in reverse order, replay in input order with one
+ * separator each, each waiting for its acknowledgement, and the last becomes
+ * the editable guess. */
+static void
+test_queue_ordered_replay (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  const char *const expected[] = {"w1 ", "w2 ", "w3 ", "w4 ", NULL};
+
+  fixture->hold_swipes = TRUE;
+  for (int mark = 1; mark <= 5; mark++)
+    g_assert_true (request_marked_swipe (fixture, mark, 0));
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 5);
+  /* Two recognitions run at once; the rest wait their turn. */
+  wait_held_count (fixture, 2);
+
+  /* Answer everything, newest first. Finishing early frees nothing and
+   * replays nothing: only the head may be played. */
+  while (fixture->held->len) {
+    release_held_at (fixture, fixture->held->len - 1);
+    spin (20);
+  }
+  fixture->hold_swipes = FALSE;
+  wait_commits (fixture, 4);
+
+  assert_commits (fixture, expected);
+  g_assert_cmpuint (fixture->acks, ==, 4);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "w5");
+  g_assert_true (pos_completer_verbisage_has_swipe_preedit (self));
+  /* The final guess is ordinary editable text, so it holds no slot. */
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+}
+
+
+/* A sixth gesture is refused while five are outstanding, and every accepted
+ * word survives. A slot frees when one is really replayed, not when a later
+ * recognition happens to finish first. */
+static void
+test_queue_rejects_when_full (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_swipes = TRUE;
+  for (int mark = 1; mark <= 5; mark++)
+    g_assert_true (request_marked_swipe (fixture, mark, 0));
+  wait_held_count (fixture, 2);
+
+  g_assert_false (request_marked_swipe (fixture, 6, 0));
+  g_assert_cmpuint (fixture->feedback->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->feedback, 0), ==, "queue-full");
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 5);
+
+  /* The second gesture finishing first frees nothing. */
+  release_held_at (fixture, 1);
+  spin (40);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 5);
+  g_assert_false (request_marked_swipe (fixture, 6, 0));
+
+  /* Replaying the head does free a slot; the entry that finished early is
+   * then played in its own turn, in order. */
+  release_held_at (fixture, 0);
+  wait_pending_swipes (fixture, 3);
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 0), ==, "w1 ");
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 1), ==, "w2 ");
+  g_assert_true (request_marked_swipe (fixture, 6, 0));
+  g_assert_true (request_marked_swipe (fixture, 7, 0));
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 5);
+  g_assert_false (request_marked_swipe (fixture, 8, 0));
+}
+
+
+/* Keys typed behind unplayed gestures are ordered barriers: the words go in
+ * first, then the keys, and an Enter cannot submit ahead of them. */
+static void
+test_queue_deferred_input_order (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_swipes = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_held_count (fixture, 2);
+
+  pos_completer_feed_symbol (fixture->completer, "o");
+  pos_completer_feed_symbol (fixture->completer, "k");
+  pos_completer_feed_symbol (fixture->completer, " ");
+  pos_completer_feed_symbol (fixture->completer, "!");
+  pos_completer_feed_symbol (fixture->completer, "KEY_ENTER");
+  /* Nothing may happen before the gestures are played. */
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 0);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+
+  release_held_at (fixture, 0);
+  spin (30);
+  release_held_at (fixture, 0);
+  fixture->hold_swipes = FALSE;
+  wait_commits (fixture, 5);
+
+  /* Both words, then the typed word, then the punctuation, then Enter. */
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 0), ==, "w1 ");
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 1), ==, "w2 ");
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 2), ==, "ok ");
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 3), ==, "! ");
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+}
+
+
+/* Backspace takes back the newest unplayed gesture without touching committed
+ * text, and its late result is ignored. */
+static void
+test_queue_backspace_cancels_newest (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_swipes = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_held_count (fixture, 2);
+
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, "KEY_BACKSPACE"));
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 1);
+
+  /* The cancelled gesture's reply arrives late and must insert nothing. */
+  release_held_at (fixture, 1);
+  spin (40);
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 0);
+
+  release_held_at (fixture, 0);
+  fixture->hold_swipes = FALSE;
+  wait_completion (fixture->completer, "w1");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "w1");
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 0);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+
+  /* After the queue drains, ordinary editing continues. */
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, "KEY_BACKSPACE"));
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "w");
+}
+
+
+/* Without the application's acknowledgement, replay stops where it is. */
+static void
+test_queue_missing_acknowledgement_stops_replay (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_ack = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_commits (fixture, 1);
+
+  spin (150);
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 1);
+  g_assert_true (pos_completer_verbisage_replay_pending (self));
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 2);
+
+  /* The acknowledgement releases exactly the next word. */
+  fixture->hold_ack = FALSE;
+  pos_completer_verbisage_replay_acknowledged (self);
+  spin (60);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "w2");
+}
+
+
+/* A word that cannot be recognized stops replay at that position: the words
+ * behind it are cancelled with feedback rather than silently moved up, and a
+ * key deferred behind them does not run either. */
+static void
+test_queue_failure_cancels_the_suffix (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_swipes = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_held_count (fixture, 2);
+  pos_completer_feed_symbol (fixture->completer, "KEY_ENTER");
+
+  /* The head fails; the second gesture had already succeeded. */
+  release_held_at (fixture, 1);
+  spin (20);
+  g_dbus_method_invocation_return_dbus_error (g_ptr_array_index (fixture->held, 0),
+                                              "org.freedesktop.DBus.Error.Failed",
+                                              "recognition unavailable");
+  g_ptr_array_remove_index (fixture->held, 0);
+  fixture->hold_swipes = FALSE;
+  spin (120);
+
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 0);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+  g_assert_cmpuint (fixture->feedback->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->feedback, 0), ==, "recognition-failed");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+}
+
+
+/* Capitalization is captured with the gesture, so a Shift release afterwards
+ * cannot change a word that was already taken. */
+static void
+test_queue_keeps_captured_capitalization (Fixture *fixture, gconstpointer unused)
+{
+  fixture->hold_swipes = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 1));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_held_count (fixture, 2);
+
+  /* An automatic Shift release is not a cancellation. */
+  pos_completer_verbisage_cancel_swipe (POS_COMPLETER_VERBISAGE (fixture->completer));
+  release_held_at (fixture, 0);
+  spin (30);
+  release_held_at (fixture, 0);
+  fixture->hold_swipes = FALSE;
+  wait_commits (fixture, 1);
+
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 0), ==, "W1 ");
+  wait_completion (fixture->completer, "w2");
+}
+
+
+/* A busy service is backpressure: the gesture is retried with backoff and its
+ * word still arrives in its own place. */
+static void
+test_queue_busy_is_retried (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->busy_replies = 2;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  wait_completion (fixture->completer, "w1");
+
+  g_assert_true (fixture->busy_swipes);
+  g_assert_cmpuint (fixture->busy_replies, ==, 0);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "w1");
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+  g_assert_cmpuint (fixture->feedback->len, ==, 0);
+}
+
+
+/* An empty recognition is a failure for that position, never a word to skip. */
+static void
+test_queue_empty_result_is_a_failure (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_swipes = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_held_count (fixture, 2);
+  /* The head comes back empty while the word behind it is fine. */
+  fixture->empty = TRUE;
+  fixture->hold_swipes = FALSE;
+  release_held_at (fixture, 1);
+  spin (20);
+  g_ptr_array_set_size (fixture->held, 0);
+  fixture->empty = FALSE;
+
+  wait_pending_swipes (fixture, 0);
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 0);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_cmpuint (fixture->feedback->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->feedback, 0), ==, "recognition-failed");
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+}
+
+
 static void
 test_swipe_snapshot (Fixture *fixture, gconstpointer unused)
 {
@@ -1683,6 +2141,15 @@ main (int argc, char **argv)
   ADD_TEST ("swipe-empty", test_swipe_empty);
   ADD_TEST ("swipe-timeout", test_swipe_timeout);
   ADD_TEST ("swipe-composition-cancel", test_swipe_composition_cancel);
+  ADD_TEST ("queue-ordered-replay", test_queue_ordered_replay);
+  ADD_TEST ("queue-full", test_queue_rejects_when_full);
+  ADD_TEST ("queue-deferred-input", test_queue_deferred_input_order);
+  ADD_TEST ("queue-backspace", test_queue_backspace_cancels_newest);
+  ADD_TEST ("queue-missing-ack", test_queue_missing_acknowledgement_stops_replay);
+  ADD_TEST ("queue-failure", test_queue_failure_cancels_the_suffix);
+  ADD_TEST ("queue-capitalization", test_queue_keeps_captured_capitalization);
+  ADD_TEST ("queue-busy-retry", test_queue_busy_is_retried);
+  ADD_TEST ("queue-empty-result", test_queue_empty_result_is_a_failure);
   ADD_TEST ("swipe-snapshot", test_swipe_snapshot);
   ADD_TEST ("swipe-snapshot-invalid", test_swipe_snapshot_invalid);
 #undef ADD_TEST

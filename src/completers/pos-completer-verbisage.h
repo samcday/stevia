@@ -12,11 +12,19 @@ G_DECLARE_FINAL_TYPE (PosCompleterVerbisage, pos_completer_verbisage, POS, COMPL
 PosCompleter *pos_completer_verbisage_new (GError **error);
 
 
-/* Capitalization is captured at gesture start: 0 lower, 1 initial, 2 upper. */
-void pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
-                                             GVariant *trace,
-                                             GVariant *keys,
-                                             guint capitalization);
+/* Accept one gesture into the ordered queue. Capitalization is captured at
+ * gesture start: 0 lower, 1 initial, 2 upper. Returns %FALSE when the queue is
+ * full or the gesture cannot be accepted, and the caller gives feedback. */
+gboolean pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
+                                                 GVariant *trace,
+                                                 GVariant *keys,
+                                                 guint capitalization);
+
+guint    pos_completer_verbisage_pending_swipes (PosCompleterVerbisage *self);
+gboolean pos_completer_verbisage_replay_pending (PosCompleterVerbisage *self);
+void     pos_completer_verbisage_replay_acknowledged (PosCompleterVerbisage *self);
+gboolean pos_completer_verbisage_cancel_newest_swipe (PosCompleterVerbisage *self);
+void     pos_completer_verbisage_invalidate_swipes (PosCompleterVerbisage *self);
 void pos_completer_verbisage_cancel_swipe (PosCompleterVerbisage *self);
 
 gboolean      pos_completer_verbisage_has_swipe_preedit (PosCompleterVerbisage *self);
