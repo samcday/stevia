@@ -901,6 +901,12 @@ on_completer_swipe_feedback (PosInputSurface *self, const char *reason)
   g_debug ("Gesture queue: %s", reason);
   /* Deliberately not the ordinary key feedback: nothing was typed. */
   pos_input_surface_trigger_feedback (self, BUTTON_PRESS_EVENT);
+
+  /* If the queue gave up waiting - an acknowledgement that never came, a
+   * failure - this side must not keep expecting that text either. */
+  if (POS_IS_COMPLETER_VERBISAGE (self->completer) &&
+      !pos_completer_verbisage_replay_pending (POS_COMPLETER_VERBISAGE (self->completer)))
+    g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
 }
 
 

@@ -6,6 +6,7 @@ The pointer clicks the real keyboard. This does not emulate an input method or
 write text into the application. Run the helper build commands in README first.
 """
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -20,7 +21,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--output", required=True)
 parser.add_argument("--stevia", default="/usr/bin/phosh-osk-stevia",
                     help="Stevia executable (can be extracted from a trial RPM)")
-parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swipe-rapid", "swipe-undo", "swipe-edit", "swipe-focus", "swipe-shift", "typed-undo", "typed-reselect", "undo-focus", "literal", "context-chain", "context-prefix", "context-swipe", "context-undo", "queue-overlap", "queue-enter", "queue-field-switch", "queue-failure", "queue-barrier", "queue-midword", "queue-second-field", "queue-cursor-move", "queue-hide", "queue-middle-failure", "queue-backspace-repeat", "queue-geometry", "queue-overflow"], default="literal")
+parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swipe-rapid", "swipe-undo", "swipe-edit", "swipe-focus", "swipe-shift", "typed-undo", "typed-reselect", "undo-focus", "literal", "context-chain", "context-prefix", "context-swipe", "context-undo", "queue-overlap", "queue-enter", "queue-field-switch", "queue-failure", "queue-barrier", "queue-midword", "queue-second-field", "queue-cursor-move", "queue-hide", "queue-middle-failure", "queue-backspace-repeat", "queue-geometry", "queue-overflow", "queue-ack-expiry"], default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
                     help="Dictionary used by the service; recorded for provenance")
@@ -35,11 +36,30 @@ parser.add_argument("--defer-pixel-check", action="store_true",
 parser.add_argument("--private-bus-child", action="store_true", help=argparse.SUPPRESS)
 args = parser.parse_args()
 if not args.private_bus_child:
+    # The private bus starts services of its own (portals, feedbackd, dconf).
+    # They outlive the bus and, in a container whose PID 1 does not reap, they
+    # would accumulate as zombies for as long as it runs. Become the subreaper
+    # so this run can clean up after itself below.
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(36, 1, 0, 0, 0)
+    except OSError:
+        pass
     child = subprocess.run(["dbus-run-session", "--", sys.executable, str(Path(__file__).resolve()),
                             *sys.argv[1:], "--private-bus-child"], capture_output=True, text=True)
     if Path(args.output).exists():
         (Path(args.output) / "dbus.log").write_text(child.stderr)
     print(child.stdout, end="")
+
+    # Reap whatever the private bus left behind. Anything still running loses
+    # its bus with the session and exits on its own.
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            reaped, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if reaped == 0:
+            time.sleep(.1)
     raise SystemExit(child.returncode)
 
 base = Path(args.tools_dir).resolve()
@@ -599,6 +619,32 @@ try:
             service_control("Release", "1", "beta")
             service_control("Release", "0", "alpha")
             wait_state("alpha ", "Beta", "each gesture kept the case it was drawn with")
+        elif args.case == "queue-ack-expiry":
+            # An application that never shows the committed word must not wedge
+            # the queue: the bounded deadline gives up, says so, and the
+            # keyboard keeps working.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            drag_word("world", None, wait=False, allow_words=allowed)
+            wait_held_requests(2, "both recognitions outstanding")
+
+            freeze_probe()
+            service_control("Release", "0", "alpha")
+            service_control("Release", "0", "beta")
+            # Longer than the queue's acknowledgement deadline.
+            time.sleep(3.5)
+            thaw_probe()
+            time.sleep(.8)
+
+            # The word committed before the freeze is there; the one behind it
+            # was dropped rather than played into an unknown text state.
+            assert state("buffer") == "alpha ", \
+                f"unexpected text after the deadline: {state('buffer')!r}"
+            assert state("preedit") == "", \
+                f"a word was played after the deadline: {state('preedit')!r}"
+
+            service_control("Hold", "false")
+            drag_word("hello", "word3")
+            wait_state("alpha ", "word3", "fresh gesture works after the deadline")
         elif args.case == "queue-overflow":
             drag_word("hello", None, wait=False, allow_words=allowed)
             wait_held_requests(1, "recognition outstanding")
