@@ -388,7 +388,8 @@ on_layout_registered (GObject *source, GAsyncResult *result, gpointer user_data)
   self->layout_pending = FALSE;
   if (!reply) {
     /* Ordinary input keeps working without geometry. */
-    g_debug ("Layout registration unavailable; completing without geometry");
+    g_debug ("Layout registration unavailable; completing without geometry: %s",
+             error->message);
     return;
   }
 
@@ -622,9 +623,9 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
     return;
 
   if (!reply) {
-    /* Do not log the preedit or daemon error message (which may contain it). */
     if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-      g_debug ("Dictionary lookup unavailable; retaining literal input");
+      g_debug ("Dictionary lookup unavailable; retaining literal input: %s",
+               error->message);
     if (recover_unknown_layout (self, lookup, error)) {
       /* The shared layout entry is gone. Ask again without it; the new token
        * applies to later requests. */
