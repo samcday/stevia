@@ -553,7 +553,7 @@ on_swipe_job_finished (GObject *source, GAsyncResult *result, gpointer user_data
                                           swipe_retry_timeout, retry, swipe_retry_free);
       return;
     }
-    /* The service's own message; it never contains user text. */
+    /* Log the service's own message; it may echo request data. */
     g_debug ("Recognition failed for gesture %" G_GUINT64_FORMAT ": %s", job->id,
              error ? error->message : "no reply");
     job->state = SWIPE_JOB_FAILED;

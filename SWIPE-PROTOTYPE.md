@@ -100,6 +100,14 @@ samples over ten seconds, and requests six results for `en_US`. Recognition
 and the acknowledgement between consecutive swipes each have a one-second
 limit. Case handling and completion undo do not change the service protocol.
 
+## Diagnostics
+
+At the failure sites for recognition, layout registration and completion the
+keyboard logs the service's own D-Bus error text verbatim at debug level. That
+text is produced by the service and may echo request data, so a debug capture
+can contain typed input. Captures are a local development aid: review and trim
+them before attaching them to a report, and do not publish raw logs.
+
 ## Opt in
 
 The versioned live trial helper uses an ephemeral `/usr` overlay and a schema
