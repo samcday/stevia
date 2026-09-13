@@ -18,6 +18,31 @@ PosCompletionUndo *pos_completion_undo_new (const char *surrounding,
                                              GStrv candidates,
                                              GVariant *swipe_state,
                                              guint serial);
+/* Like pos_completion_undo_new(), but the commit also deletes @before bytes
+ * before the caret and @after bytes after it. The stored original context stays
+ * @surrounding at @cursor, while the expected text applies the deletion and
+ * then inserts @inserted. The inserted text must not be empty. */
+PosCompletionUndo *pos_completion_undo_new_replacing (const char *surrounding,
+                                                      guint cursor,
+                                                      guint anchor,
+                                                      int before,
+                                                      int after,
+                                                      const char *inserted,
+                                                      const char *preedit,
+                                                      GStrv candidates,
+                                                      GVariant *swipe_state,
+                                                      guint serial);
+/* A text edit performed through the virtual keyboard rather than the input
+ * method, so no input-method commit describes it. @inserted may be empty (a
+ * deletion) and an application report of the expected text is accepted even
+ * when it is not an input-method change. */
+PosCompletionUndo *pos_completion_undo_new_virtual (const char *surrounding,
+                                                    guint cursor,
+                                                    guint anchor,
+                                                    int before,
+                                                    int after,
+                                                    const char *inserted,
+                                                    guint serial);
 void pos_completion_undo_free (PosCompletionUndo *self);
 
 /* FALSE permanently invalidates the snapshot. Before acknowledgement, the

@@ -1733,6 +1733,23 @@ pos_completer_verbisage_replay_untracked (PosCompleterVerbisage *self)
 
 
 /**
+ * pos_completer_verbisage_replay_application_edit:
+ *
+ * A replayed key did not go through the completer's own commit, but the
+ * surface performed it through the virtual keyboard and recorded the text
+ * state it must produce. Keep the wait so dependent input is not replayed
+ * against the text from before the edit.
+ */
+void
+pos_completer_verbisage_replay_application_edit (PosCompleterVerbisage *self)
+{
+  g_return_if_fail (POS_IS_COMPLETER_VERBISAGE (self));
+
+  self->replay_commit_seen = TRUE;
+}
+
+
+/**
  * pos_completer_verbisage_replay_acknowledged:
  *
  * The application acknowledged the exact commit the replay expected, so the

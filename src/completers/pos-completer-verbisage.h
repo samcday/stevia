@@ -25,6 +25,10 @@ guint    pos_completer_verbisage_pending_swipes (PosCompleterVerbisage *self);
 gboolean pos_completer_verbisage_replay_pending (PosCompleterVerbisage *self);
 void     pos_completer_verbisage_replay_acknowledged (PosCompleterVerbisage *self);
 void     pos_completer_verbisage_replay_untracked (PosCompleterVerbisage *self);
+/* A replayed key that changed the application's own text through the virtual
+ * keyboard instead of a completer commit. The surface has recorded the state
+ * it must produce, so the queue keeps waiting for it. */
+void     pos_completer_verbisage_replay_application_edit (PosCompleterVerbisage *self);
 gboolean pos_completer_verbisage_cancel_newest_swipe (PosCompleterVerbisage *self);
 void     pos_completer_verbisage_invalidate_swipes (PosCompleterVerbisage *self);
 void pos_completer_verbisage_cancel_swipe (PosCompleterVerbisage *self);

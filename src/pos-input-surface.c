@@ -621,8 +621,10 @@ on_swipe_typing_changed (PosInputSurface *self)
 {
   clear_edit_history (self);
   self->swipe_typing = g_settings_get_boolean (self->osk_settings, "swipe-typing");
-  if (!self->swipe_typing)
+  if (!self->swipe_typing) {
+    g_debug ("Swipe typing disabled; dropping accepted gestures");
     invalidate_swipe_queue (self);
+  }
   update_swipe_enabled (self);
 }
 
@@ -768,57 +770,6 @@ undo_completion (PosInputSurface *self)
 }
 
 
-/**
- * pos_input_surface_text_after_deletion:
- * @surrounding: the application's text
- * @cursor: (inout): the cursor offset in bytes, moved back by @before
- * @anchor: the selection anchor, which must equal the cursor
- * @before: bytes deleted before the cursor
- * @after: bytes deleted after it
- *
- * The text a commit's deletion leaves behind, into which its string is then
- * inserted. Offsets are byte counts, as the text-input protocol uses, and are
- * rejected unless they fall on character boundaries of the actual text.
- *
- * Returns: (transfer full)(nullable): the text, or %NULL when the edit cannot
- *   be described.
- */
-static char *
-pos_input_surface_text_after_deletion (const char *surrounding,
-                                       guint      *cursor,
-                                       guint       anchor,
-                                       int         before,
-                                       int         after)
-{
-  GString *edited;
-  gsize length;
-  guint start, end;
-
-  if (!surrounding || anchor != *cursor || before < 0 || after < 0)
-    return NULL;
-
-  length = strlen (surrounding);
-  if (*cursor > length)
-    return NULL;
-  if ((guint) before > *cursor || (guint) after > length - *cursor)
-    return NULL;
-
-  start = *cursor - before;
-  end = *cursor + after;
-  /* A deletion that splits a character would describe text the application
-   * cannot produce. */
-  if (!g_utf8_validate (surrounding, length, NULL) ||
-      (start < length && (surrounding[start] & 0xc0) == 0x80) ||
-      (end < length && (surrounding[end] & 0xc0) == 0x80))
-    return NULL;
-
-  *cursor = start;
-  edited = g_string_new_len (surrounding, start);
-  g_string_append (edited, surrounding + end);
-  return g_string_free (edited, FALSE);
-}
-
-
 static void
 on_completer_commit_string (PosInputSurface *self,
                             const char      *text,
@@ -836,27 +787,31 @@ on_completer_commit_string (PosInputSurface *self,
   /* A replayed commit only counts once the application shows it, so record the
    * exact text state to wait for before the next word or key is played. A
    * commit may also delete - ordinary punctuation replaces the space before it
-   * - and the expectation has to describe the whole edit, not just the part
-   * that inserts. */
+   * - and the expectation has to describe the whole edit while keeping the real
+   * original context an already-in-flight preedit acknowledgement still
+   * reports. */
   g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
   if (replaying) {
-    g_autofree char *edited = NULL;
     const char *surrounding;
     guint anchor, cursor;
 
     surrounding = pos_input_method_get_surrounding_text (self->input_method, &anchor, &cursor);
-    edited = pos_input_surface_text_after_deletion (surrounding, &cursor, anchor, before, after);
-    /* No preedit is restored from this: it only records the text state the
-     * replayed commit must produce. */
-    if (edited) {
+    if (!before && !after && (!text || !*text)) {
+      /* A replayed key committed no text of its own. Its application effect,
+       * if it has one, is recorded where it is performed through the virtual
+       * keyboard; there is nothing here to fail. */
+    } else {
+      /* No preedit is restored from this: it only records the text state the
+       * replayed commit must produce. */
       self->swipe_replay_ack =
-        pos_completion_undo_new (edited, cursor, cursor, text, "", NULL, NULL,
-                                 pos_input_method_get_serial (self->input_method));
-    }
-    if (!self->swipe_replay_ack) {
-      /* This edit cannot be described, so nothing could confirm it landed.
-       * Stop rather than play the rest against a text state we do not know. */
-      pos_completer_verbisage_replay_untracked (POS_COMPLETER_VERBISAGE (self->completer));
+        pos_completion_undo_new_replacing (surrounding, cursor, anchor, before, after,
+                                           text, "", NULL, NULL,
+                                           pos_input_method_get_serial (self->input_method));
+      if (!self->swipe_replay_ack) {
+        /* This edit cannot be described, so nothing could confirm it landed.
+         * Stop rather than play the rest against a text state we do not know. */
+        pos_completer_verbisage_replay_untracked (POS_COMPLETER_VERBISAGE (self->completer));
+      }
     }
   }
 
@@ -961,8 +916,12 @@ on_completer_swipe_feedback (PosInputSurface *self, const char *reason)
   /* If the queue gave up waiting - an acknowledgement that never came, a
    * failure - this side must not keep expecting that text either. */
   if (POS_IS_COMPLETER_VERBISAGE (self->completer) &&
-      !pos_completer_verbisage_replay_pending (POS_COMPLETER_VERBISAGE (self->completer)))
-    g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
+      !pos_completer_verbisage_replay_pending (POS_COMPLETER_VERBISAGE (self->completer))) {
+    if (self->swipe_replay_ack) {
+      g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
+      g_debug ("Dropped the replay expectation the queue gave up on");
+    }
+  }
 }
 
 
@@ -1013,6 +972,32 @@ pos_input_surface_submit_symbol (PosInputSurface *self, const char *symbol)
 }
 
 
+/* A replayed key the completer does not handle itself is applied through the
+ * virtual keyboard, which changes the application's committed text with no
+ * completer commit to observe. Record the text state the key must produce so
+ * the queue waits for the application to report it, exactly as it waits for an
+ * input-method commit. Returns %TRUE when an expectation was armed. */
+static gboolean
+pos_input_surface_expect_virtual_key (PosInputSurface *self, const char *symbol)
+{
+  const char *surrounding;
+  guint anchor, cursor, serial;
+
+  surrounding = pos_input_method_get_surrounding_text (self->input_method, &anchor, &cursor);
+  serial = pos_input_method_get_serial (self->input_method);
+
+  g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
+  if (g_str_equal (symbol, "KEY_BACKSPACE"))
+    self->swipe_replay_ack = pos_completion_undo_new_virtual (surrounding, cursor, anchor,
+                                                              1, 0, "", serial);
+  else if (g_str_equal (symbol, "KEY_ENTER"))
+    self->swipe_replay_ack = pos_completion_undo_new_virtual (surrounding, cursor, anchor,
+                                                              0, 0, "\n", serial);
+
+  return self->swipe_replay_ack != NULL;
+}
+
+
 static void
 pos_input_surface_submit_symbol_full (PosInputSurface *self,
                                       const char      *symbol,
@@ -1055,6 +1040,23 @@ pos_input_surface_submit_symbol_full (PosInputSurface *self,
     handled = pos_completer_feed_symbol (self->completer, symbol);
     if (handled)
       return;
+  }
+
+  /* The completer did not handle this replayed key, so it reaches the
+   * application through the virtual keyboard. Keep the queue waiting on the
+   * application edit it causes instead of replaying dependent input early. */
+  if (!physical && POS_IS_COMPLETER_VERBISAGE (self->completer)) {
+    PosCompleterVerbisage *completer = POS_COMPLETER_VERBISAGE (self->completer);
+    const char *virtual_symbol = is_bs ? "KEY_BACKSPACE" :
+      (g_str_equal (symbol, "KEY_ENTER") ? "KEY_ENTER" : NULL);
+
+    if (virtual_symbol && pos_input_surface_expect_virtual_key (self, virtual_symbol))
+      pos_completer_verbisage_replay_application_edit (completer);
+    else if (virtual_symbol && !is_bs)
+      /* The application effect cannot be described, so nothing may be replayed
+       * against it. A Backspace with nothing before the caret changes no
+       * text and falls through to the ordinary cancel. */
+      pos_completer_verbisage_replay_untracked (completer);
   }
 
   if (is_bs) {

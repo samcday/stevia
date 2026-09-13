@@ -12,16 +12,21 @@
 
 struct _PosCompletionUndo {
   char *original;
+  char *intermediate;
   char *expected;
   char *preedit;
   GStrv candidates;
   GVariant *swipe_state;
   guint original_cursor;
+  guint intermediate_cursor;
   guint expected_cursor;
   guint inserted_bytes;
   guint32 serial;
   gboolean ready;
   gboolean valid;
+  /* The edit was performed through the virtual keyboard, so the application's
+   * report of it is not an input-method change. */
+  gboolean virtual_edit;
 };
 
 
@@ -79,6 +84,80 @@ valid_candidates (GStrv candidates)
 }
 
 
+static PosCompletionUndo *
+completion_undo_build (const char *surrounding,
+                       guint       cursor,
+                       guint       anchor,
+                       int         before,
+                       int         after,
+                       const char *inserted,
+                       const char *preedit,
+                       GStrv       candidates,
+                       GVariant   *swipe_state,
+                       guint       serial,
+                       gboolean    virtual_edit,
+                       gboolean    require_inserted)
+{
+  PosCompletionUndo *self;
+  gsize context_len, inserted_len, preedit_len, expected_len;
+  guint start, end;
+
+  if (!valid_context (surrounding, cursor, anchor, &context_len) ||
+      before < 0 || after < 0 ||
+      (guint) before > cursor || (guint) after > context_len - cursor)
+    return NULL;
+
+  start = cursor - before;
+  end = cursor + after;
+  /* A deletion that splits a character describes text the application cannot
+   * produce. */
+  if ((start < context_len && (surrounding[start] & 0xc0) == 0x80) ||
+      (end < context_len && (surrounding[end] & 0xc0) == 0x80))
+    return NULL;
+
+  if (!valid_text (inserted, MAX_WORD_BYTES, &inserted_len) ||
+      (require_inserted && !inserted_len) ||
+      !valid_text (preedit, MAX_WORD_BYTES, &preedit_len) ||
+      !valid_candidates (candidates) ||
+      (swipe_state && g_variant_get_size (swipe_state) > MAX_CONTEXT_BYTES))
+    return NULL;
+
+  expected_len = start + inserted_len + (context_len - end);
+  if (expected_len > MAX_CONTEXT_BYTES)
+    return NULL;
+
+  self = g_new0 (PosCompletionUndo, 1);
+  self->original = g_strdup (surrounding);
+  self->expected = g_malloc (expected_len + 1);
+  memcpy (self->expected, surrounding, start);
+  memcpy (self->expected + start, inserted, inserted_len);
+  memcpy (self->expected + start + inserted_len, surrounding + end,
+          context_len - end + 1);
+  /* A deletion plus insertion reaches the application in two steps: it reports
+   * the deleted text first and the inserted text after. Store that intermediate
+   * state so the report is tolerated rather than looking like a foreign edit.
+   * A pure deletion's only report is the expected text itself. */
+  if (inserted_len && (start != cursor || end != cursor)) {
+    self->intermediate = g_malloc (start + context_len - end + 1);
+    memcpy (self->intermediate, surrounding, start);
+    memcpy (self->intermediate + start, surrounding + end, context_len - end + 1);
+    self->intermediate_cursor = start;
+  }
+  self->preedit = g_strdup (preedit);
+  self->candidates = g_strdupv (candidates);
+  if (swipe_state)
+    self->swipe_state = g_variant_take_ref (g_variant_ref (swipe_state));
+  self->original_cursor = cursor;
+  self->expected_cursor = start + inserted_len;
+  self->inserted_bytes = inserted_len;
+  self->serial = serial;
+  self->virtual_edit = virtual_edit;
+  self->valid = TRUE;
+
+  return self;
+}
+
+
 PosCompletionUndo *
 pos_completion_undo_new (const char *surrounding,
                          guint cursor,
@@ -89,35 +168,41 @@ pos_completion_undo_new (const char *surrounding,
                          GVariant *swipe_state,
                          guint serial)
 {
-  PosCompletionUndo *self;
-  gsize context_len, inserted_len, preedit_len;
+  return completion_undo_build (surrounding, cursor, anchor, 0, 0,
+                                inserted, preedit, candidates, swipe_state, serial,
+                                FALSE, TRUE);
+}
 
-  if (!valid_context (surrounding, cursor, anchor, &context_len) ||
-      !valid_text (inserted, MAX_WORD_BYTES, &inserted_len) || !inserted_len ||
-      !valid_text (preedit, MAX_WORD_BYTES, &preedit_len) ||
-      context_len + inserted_len > MAX_CONTEXT_BYTES ||
-      !valid_candidates (candidates) ||
-      (swipe_state && g_variant_get_size (swipe_state) > MAX_CONTEXT_BYTES))
-    return NULL;
 
-  self = g_new0 (PosCompletionUndo, 1);
-  self->original = g_strdup (surrounding);
-  self->expected = g_malloc (context_len + inserted_len + 1);
-  memcpy (self->expected, surrounding, cursor);
-  memcpy (self->expected + cursor, inserted, inserted_len);
-  memcpy (self->expected + cursor + inserted_len, surrounding + cursor,
-          context_len - cursor + 1);
-  self->preedit = g_strdup (preedit);
-  self->candidates = g_strdupv (candidates);
-  if (swipe_state)
-    self->swipe_state = g_variant_take_ref (g_variant_ref (swipe_state));
-  self->original_cursor = cursor;
-  self->expected_cursor = cursor + inserted_len;
-  self->inserted_bytes = inserted_len;
-  self->serial = serial;
-  self->valid = TRUE;
+PosCompletionUndo *
+pos_completion_undo_new_replacing (const char *surrounding,
+                                   guint cursor,
+                                   guint anchor,
+                                   int before,
+                                   int after,
+                                   const char *inserted,
+                                   const char *preedit,
+                                   GStrv candidates,
+                                   GVariant *swipe_state,
+                                   guint serial)
+{
+  return completion_undo_build (surrounding, cursor, anchor, before, after,
+                                inserted, preedit, candidates, swipe_state, serial,
+                                FALSE, TRUE);
+}
 
-  return self;
+
+PosCompletionUndo *
+pos_completion_undo_new_virtual (const char *surrounding,
+                                 guint cursor,
+                                 guint anchor,
+                                 int before,
+                                 int after,
+                                 const char *inserted,
+                                 guint serial)
+{
+  return completion_undo_build (surrounding, cursor, anchor, before, after,
+                                inserted, "", NULL, NULL, serial, TRUE, FALSE);
 }
 
 
@@ -127,6 +212,7 @@ pos_completion_undo_free (PosCompletionUndo *self)
   if (!self)
     return;
   g_free (self->original);
+  g_free (self->intermediate);
   g_free (self->expected);
   g_free (self->preedit);
   g_strfreev (self->candidates);
@@ -151,7 +237,7 @@ pos_completion_undo_observe (PosCompletionUndo *self,
   /* Wayland serials wrap at 32 bits; an older serial must never acknowledge a
    * selection. Half the serial space is far beyond this one-action lifetime. */
   advance = (guint32) serial - self->serial;
-  if (!im_change || advance > G_MAXINT32 ||
+  if ((!im_change && !self->virtual_edit) || advance > G_MAXINT32 ||
       !valid_context (text, cursor, anchor, NULL))
     goto invalid;
 
@@ -160,6 +246,14 @@ pos_completion_undo_observe (PosCompletionUndo *self,
      * insertion acknowledgement. Keep waiting at the exact original context;
      * this never enables undo and cannot move confirmed state back to pending. */
     if (cursor == self->original_cursor && strcmp (text, self->original) == 0) {
+      self->serial = serial;
+      return TRUE;
+    }
+    /* A deletion plus insertion is reported in two steps: the deleted text
+     * arrives before the inserted text. Tolerate that intermediate state the
+     * same way. */
+    if (self->intermediate && cursor == self->intermediate_cursor &&
+        strcmp (text, self->intermediate) == 0) {
       self->serial = serial;
       return TRUE;
     }
