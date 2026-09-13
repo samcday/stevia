@@ -126,6 +126,173 @@ test_selected_locale_tag (void)
 }
 
 
+/* A minimal completer whose language setup can be made to fail, recording
+ * every call, so the surface's explicit-vs-default fallback policy is
+ * testable without a real engine. */
+typedef struct {
+  GObject    parent_instance;
+  char      *preedit;
+  guint      failures;
+  GPtrArray *calls;
+} TestCompleter;
+
+typedef struct {
+  GObjectClass parent_class;
+} TestCompleterClass;
+
+enum {
+  PROP_TEST_0,
+  PROP_TEST_NAME,
+  PROP_TEST_PREEDIT,
+  PROP_TEST_COMPLETIONS,
+  PROP_TEST_MODE_NAME,
+  PROP_TEST_MODE_SYMBOL,
+  PROP_TEST_MODE_MENU,
+  PROP_TEST_MODE_ACTIONS,
+  PROP_TEST_LAST,
+};
+
+GType test_completer_get_type (void);
+static void test_completer_iface_init (PosCompleterInterface *iface);
+
+G_DEFINE_TYPE_WITH_CODE (TestCompleter, test_completer, G_TYPE_OBJECT,
+                         G_IMPLEMENT_INTERFACE (POS_TYPE_COMPLETER,
+                                                test_completer_iface_init))
+
+static void
+test_completer_set_property (GObject *object, guint prop_id,
+                             const GValue *value, GParamSpec *pspec)
+{
+  TestCompleter *self = (TestCompleter *) object;
+
+  if (prop_id == PROP_TEST_PREEDIT) {
+    g_free (self->preedit);
+    self->preedit = g_value_dup_string (value);
+  } else {
+    G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+  }
+}
+
+static void
+test_completer_get_property (GObject *object, guint prop_id,
+                             GValue *value, GParamSpec *pspec)
+{
+  TestCompleter *self = (TestCompleter *) object;
+
+  switch (prop_id) {
+  case PROP_TEST_NAME:
+    g_value_set_string (value, "test");
+    break;
+  case PROP_TEST_PREEDIT:
+    g_value_set_string (value, self->preedit);
+    break;
+  case PROP_TEST_COMPLETIONS:
+  case PROP_TEST_MODE_NAME:
+  case PROP_TEST_MODE_SYMBOL:
+    g_value_set_string (value, NULL);
+    break;
+  case PROP_TEST_MODE_MENU:
+  case PROP_TEST_MODE_ACTIONS:
+    g_value_set_object (value, NULL);
+    break;
+  default:
+    G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+  }
+}
+
+static gboolean
+test_completer_set_language (PosCompleter *completer,
+                             const char   *lang,
+                             const char   *region,
+                             GError      **error)
+{
+  TestCompleter *self = (TestCompleter *) completer;
+
+  g_ptr_array_add (self->calls, g_strdup_printf ("%s:%s", lang, region ?: ""));
+  if (self->failures > 0) {
+    self->failures--;
+    g_set_error (error, POS_COMPLETER_ERROR, POS_COMPLETER_ERROR_LANG_INIT,
+                 "No dictionary for %s-%s", lang, region);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static void
+test_completer_iface_init (PosCompleterInterface *iface)
+{
+  iface->set_language = test_completer_set_language;
+}
+
+static void
+test_completer_finalize (GObject *object)
+{
+  TestCompleter *self = (TestCompleter *) object;
+
+  g_free (self->preedit);
+  g_ptr_array_unref (self->calls);
+  G_OBJECT_CLASS (test_completer_parent_class)->finalize (object);
+}
+
+static void
+test_completer_init (TestCompleter *self)
+{
+  self->calls = g_ptr_array_new_with_free_func (g_free);
+}
+
+static void
+test_completer_class_init (TestCompleterClass *klass)
+{
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+
+  object_class->set_property = test_completer_set_property;
+  object_class->get_property = test_completer_get_property;
+  object_class->finalize = test_completer_finalize;
+  /* Every property the PosCompleter interface installs must be implemented
+   * by the type, even though this fixture only needs set_language. */
+  g_object_class_override_property (object_class, PROP_TEST_NAME, "name");
+  g_object_class_override_property (object_class, PROP_TEST_PREEDIT, "preedit");
+  g_object_class_override_property (object_class, PROP_TEST_COMPLETIONS, "completions");
+  g_object_class_override_property (object_class, PROP_TEST_MODE_NAME, "mode-name");
+  g_object_class_override_property (object_class, PROP_TEST_MODE_SYMBOL, "mode-symbol");
+  g_object_class_override_property (object_class, PROP_TEST_MODE_MENU, "mode-menu");
+  g_object_class_override_property (object_class, PROP_TEST_MODE_ACTIONS, "mode-actions");
+}
+
+static void
+test_legacy_language_fallback_policy (void)
+{
+  g_autoptr (GObject) completer = g_object_new (test_completer_get_type (), NULL);
+  TestCompleter *fake = (TestCompleter *) completer;
+  PosCompletionInfo info = { .lang = "fr", .region = "FR" };
+  /* The failure paths log warnings; keep them printable but not fatal for
+   * this fixture (the suite runs with G_DEBUG=fatal-warnings). */
+  GLogLevelFlags always_fatal = g_log_set_always_fatal (0);
+
+  /* An explicit completion source that fails is reported, not replaced. */
+  fake->failures = 1;
+  g_assert_false (set_legacy_completer_language (POS_COMPLETER (fake), &info, "fr", "FR"));
+  g_assert_cmpuint (fake->calls->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fake->calls, 0), ==, "fr:FR");
+
+  /* The default completer path still retries the configured defaults. */
+  fake->failures = 1;
+  g_ptr_array_set_size (fake->calls, 0);
+  g_assert_true (set_legacy_completer_language (POS_COMPLETER (fake), NULL, "fr", "FR"));
+  g_assert_cmpuint (fake->calls->len, ==, 2);
+  g_assert_cmpstr (g_ptr_array_index (fake->calls, 0), ==, "fr:FR");
+  g_assert_cmpstr (g_ptr_array_index (fake->calls, 1), ==, "en:us");
+
+  /* Both failing is reported without further attempts. */
+  fake->failures = 2;
+  g_ptr_array_set_size (fake->calls, 0);
+  g_assert_false (set_legacy_completer_language (POS_COMPLETER (fake), NULL, "fr", "FR"));
+  g_assert_cmpuint (fake->calls->len, ==, 2);
+
+  g_log_set_always_fatal (always_fatal);
+}
+
+
 int
 main (int argc, char *argv[])
 {
@@ -143,6 +310,8 @@ main (int argc, char *argv[])
   g_test_add_func ("/pos/osk-input-surface/swipe-purpose", test_swipe_purpose);
   g_test_add_func ("/pos/osk-input-surface/selected-language-tag", test_selected_language_tag);
   g_test_add_func ("/pos/osk-input-surface/selected-locale-tag", test_selected_locale_tag);
+  g_test_add_func ("/pos/osk-input-surface/legacy-language-policy",
+                   test_legacy_language_fallback_policy);
 
   ret = g_test_run ();
 

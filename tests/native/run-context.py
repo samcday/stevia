@@ -32,7 +32,9 @@ parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swip
                                        "queue-job-deadline-late-playback",
                                        "queue-job-deadline-busy",
                                        "queue-backspace-utf8-suffix",
-                                       "language-routing", "language-dvorak"], default="literal")
+                                       "language-routing", "language-dvorak",
+                                       "language-transition", "language-transition-undo"],
+                    default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
                     help="Dictionary used by the service; recorded for provenance")
@@ -139,12 +141,13 @@ env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY="stevia-tes
            GTK_A11Y="none", NO_AT_BRIDGE="1",
            GTK_USE_PORTAL="0", GSETTINGS_SCHEMA_DIR=str(Path(args.schema_dir).resolve()),
            POS_TEST_LAYOUT="us", POS_TEST_COMPLETER="verbisage", POS_DEBUG="force-show")
-# The reset case changes a real setting and needs the change to reach Stevia.
-# The keyfile backend is shared through this run's private XDG_CONFIG_HOME, so
-# the gsettings subprocess and the keyboard really see the same value. Every
-# other case stays on the process-local memory backend.
-env["GSETTINGS_BACKEND"] = ("keyfile" if args.case == "queue-pending-ack-reset"
-                            else "memory")
+# These cases change a real setting and need the change to reach Stevia. The
+# keyfile backend is shared through this run's private XDG_CONFIG_HOME, so the
+# gsettings subprocess and the keyboard really see the same value. Every other
+# case stays on the process-local memory backend.
+keyfile_cases = ("queue-pending-ack-reset", "language-transition",
+                 "language-transition-undo")
+env["GSETTINGS_BACKEND"] = "keyfile" if args.case in keyfile_cases else "memory"
 # Only the controllable-service cases hold real requests this long; every other
 # case must use the keyboard's ordinary recognition timeout.
 if args.case.startswith("queue-"):
@@ -167,12 +170,20 @@ if args.case in ("queue-last-key-ack", "queue-backspace-suffix", "queue-pending-
 if args.case.startswith("queue-job-deadline"):
     env["POS_TEST_SWIPE_JOB_DEADLINE_MS"] = (
         "1500" if args.case == "queue-job-deadline-late-playback" else "700")
-# The language cases select a non-default physical layout; the locale in that
-# layout, not the layout or variant name, is the language identity.
+# The language routing cases select a non-default physical layout; the locale
+# in that layout, not the layout or variant name, is the language identity.
 if args.case == "language-routing":
     env["POS_TEST_LAYOUT"] = "fr"
 elif args.case == "language-dvorak":
     env["POS_TEST_LAYOUT"] = "us+dvorak"
+# The transition cases must go through the real input-sources settings path,
+# so they cannot have a forced test layout. The pending-acknowledgement setup
+# deliberately holds a request, so it uses the same test-only request timeout
+# the queue fixtures use.
+if args.case.startswith("language-transition"):
+    env.pop("POS_TEST_LAYOUT", None)
+if args.case == "language-transition":
+    env["POS_TEST_SWIPE_TIMEOUT_MS"] = "8000"
 env.pop("LD_LIBRARY_PATH", None)
 env.pop("LD_PRELOAD", None)
 env.pop("GLYCIN_DISABLE_SANDBOX", None)
@@ -454,6 +465,14 @@ def gsettings_value(schema, key):
     return call.stdout.strip()
 
 
+def set_input_sources(value):
+    """Select completion sources through the keyboard's real settings path."""
+    call = subprocess.run(["gsettings", "set", "org.gnome.desktop.input-sources",
+                           "sources", value],
+                          env=env, capture_output=True, text=True, timeout=5)
+    assert call.returncode == 0, f"input-sources: {call.stderr.strip()}"
+
+
 def drag_word(word, expected, *, focus_away=False, trail=False, wait=True, allow_words=None,
               assert_first=True):
     before_buffer, before_preedit = state("buffer"), state("preedit")
@@ -602,6 +621,11 @@ try:
     result["service_pid"] = service.pid
     result["service_bus_owner_pid"] = wait_for_service(service, "org.verbisage.Dictionary")
     result["service_bus_owner_command"] = process_command(result["service_bus_owner_pid"])
+    if args.case.startswith("language-transition"):
+        # Begin on an explicit completion source and switch it later through
+        # the same settings path a user would; the physical base layout stays
+        # US in both, so only the language selection changes.
+        set_input_sources("[('ibus','verbisage:en_US')]")
     osk_env = dict(env, G_MESSAGES_DEBUG="all", WAYLAND_DEBUG="client")
     start([args.stevia], "stevia.log", osk_env)
     probe = start([sys.executable, str(Path(args.probe).resolve())], "probe.log")
@@ -1423,7 +1447,7 @@ try:
             type_word("hello")
             key(" ")
             wait_state("hello ", "", "ordinary taps work after canceled gesture")
-    elif args.case.startswith("language-"):
+    elif args.case in ("language-routing", "language-dvorak"):
         # The layout's own locale, not its physical name or variant, must be
         # the tag that reaches the service. The controllable service records
         # every distinct tag its dictionary calls carried.
@@ -1444,6 +1468,77 @@ try:
             assert "en_US" not in service_languages(), \
                 f"a US region was invented from geometry: {service_languages()}"
         result["languages"] = service_languages()
+    elif args.case == "language-transition":
+        # The pending preedit commit and deferred Enter under the old explicit
+        # source must be cancelled by the actual surface when another language
+        # is selected; committed text stays and fresh input uses the new one.
+        service_control("Hold", "true")
+        drag_word("hello", None, wait=False, allow_words=("alpha",))
+        wait_held_requests(1, "recognition outstanding")
+        key("ENTER")
+        key("x")
+        key(" ")
+
+        freeze_probe()
+        service_control("Release", "0", "alpha")
+        time.sleep(.5)
+        log = (output / "stevia.log").read_text(errors="replace")
+        assert "Key: 'KEY_ENTER' symbol (replayed)" in log, \
+            "the replayed Enter never reached the surface"
+        assert 'commit_string("alpha")' in log, \
+            "the preedit commit was not sent before the switch"
+
+        # Switch the explicit source through the real settings path while the
+        # application is still stopped.
+        set_input_sources("[('ibus','verbisage:fr')]")
+        wait_for(lambda: "Adding osk for layout 'ibus:fr'" in
+                 (output / "stevia.log").read_text(errors="replace"),
+                 "the French source was selected", timeout=8)
+        time.sleep(.5)
+        assert state("buffer") == "" and state("preedit") == "", \
+            f"the frozen application already changed: {state('buffer')!r}/{state('preedit')!r}"
+
+        thaw_probe()
+        wait_for(lambda: state("buffer") != "",
+                 "the issued commit reached the application", timeout=10)
+        time.sleep(.8)
+        assert state("buffer") == "alpha", \
+            f"the cancelled Enter submitted: {state('buffer')!r}"
+        assert "\n" not in state("buffer"), \
+            f"the cancelled Enter inserted a newline: {state('buffer')!r}"
+        assert state("preedit") == "", \
+            f"a cancelled word was replayed: {state('preedit')!r}"
+
+        # Fresh input runs under the newly selected language.
+        key("a")
+        wait_for(lambda: state("preedit") != "", "fresh preedit")
+        wait_for(lambda: "fr" in service_languages(),
+                 "the fr tag reached the service", timeout=8)
+        languages = service_languages()
+        assert languages[-1] == "fr", \
+            f"the old selection kept answering: {languages}"
+        result["languages"] = languages
+        key(" ")
+        wait_for(lambda: state("buffer").startswith("alpha") and len(state("buffer")) > 5,
+                 "fresh input committed after the switch", timeout=6)
+    elif args.case == "language-transition-undo":
+        # A completion undo belongs to the selected language: switching the
+        # explicit source must clear it instead of restoring old text.
+        type_word("helo")
+        click_completion("hello")
+        wait_state("hello ", "", "completion selected before the switch")
+
+        set_input_sources("[('ibus','verbisage:fr')]")
+        wait_for(lambda: "Adding osk for layout 'ibus:fr'" in
+                 (output / "stevia.log").read_text(errors="replace"),
+                 "the French source was selected", timeout=8)
+        time.sleep(.5)
+
+        key("BACKSPACE")
+        time.sleep(.4)
+        assert state("preedit") != "helo", \
+            f"the old-language undo was restored: {state('preedit')!r}"
+        wait_state("hello", "", "Backspace edited ordinarily after the switch")
     else:
         word = "hello" if args.case == "literal" else "helo"
         type_word(word)

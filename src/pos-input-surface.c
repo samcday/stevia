@@ -1514,6 +1514,41 @@ selected_language_tag (PosCompletionInfo *info, PosOskWidget *osk)
   return g_strdup (pos_osk_widget_get_locale (osk));
 }
 
+/* Set the language on a completer that still takes the legacy language and
+ * region pair. An explicit completion source's metadata owns its language, so
+ * a failure is only reported and nothing replaces it. The default-completer
+ * path keeps the predecessor's fallback to the configured defaults. */
+static gboolean
+set_legacy_completer_language (PosCompleter      *completer,
+                               PosCompletionInfo *info,
+                               const char        *lang,
+                               const char        *region)
+{
+  g_autoptr (GError) err = NULL;
+
+  if (pos_completer_set_language (completer, lang, region, &err))
+    return TRUE;
+
+  if (info) {
+    g_warning ("Failed to switch completer: %s", err->message);
+    return FALSE;
+  }
+
+  g_warning ("Failed to set completion language: %s-%s: %s, switching to '%s-%s' instead",
+             lang, region, err->message, POS_COMPLETER_DEFAULT_LANG,
+             POS_COMPLETER_DEFAULT_REGION);
+  g_clear_error (&err);
+  if (!pos_completer_set_language (completer,
+                                   POS_COMPLETER_DEFAULT_LANG,
+                                   POS_COMPLETER_DEFAULT_REGION,
+                                   &err)) {
+    g_warning ("Failed to set completion language '%s-%s': %s",
+               POS_COMPLETER_DEFAULT_LANG, POS_COMPLETER_DEFAULT_REGION, err->message);
+    return FALSE;
+  }
+  return TRUE;
+}
+
 /* Switch the completion engine and it's configuration */
 static void
 pos_input_surface_switch_completion (PosInputSurface *self, PosOskWidget *osk)
@@ -1555,21 +1590,10 @@ pos_input_surface_switch_completion (PosInputSurface *self, PosOskWidget *osk)
                  tag ?: "(unset)", err ? err->message : "unknown error");
     }
   } else {
-    /* Unrelated completers keep their language/region inputs and their
-     * existing fallback to the configured defaults. */
-    if (!pos_completer_set_language (self->completer, lang, region, &err)) {
-      g_warning ("Failed to set completion language: %s-%s: %s, switching to '%s-%s' instead",
-                 lang, region, err->message, POS_COMPLETER_DEFAULT_LANG,
-                 POS_COMPLETER_DEFAULT_REGION);
-      g_clear_error (&err);
-      if (!pos_completer_set_language (self->completer,
-                                       POS_COMPLETER_DEFAULT_LANG,
-                                       POS_COMPLETER_DEFAULT_REGION,
-                                       &err)) {
-        g_warning ("Failed to set completion language '%s-%s': %s",
-                   POS_COMPLETER_DEFAULT_LANG, POS_COMPLETER_DEFAULT_REGION, err->message);
-      }
-    }
+    /* Unrelated completers keep their language/region inputs: an explicit
+     * source's failure is only reported, the default completer still falls
+     * back to the configured defaults. */
+    set_legacy_completer_language (self->completer, info, lang, region);
   }
 
   pos_completion_bar_set_completions (POS_COMPLETION_BAR (self->completion_bar), NULL);
