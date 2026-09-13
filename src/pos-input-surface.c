@@ -170,6 +170,9 @@ struct _PosInputSurface {
   PosCompletionUndo          *swipe_replay_ack;
   PosCompletionUndo          *completion_undo;
   PosCompletionUndo          *completion_restore;
+  /* A replayed Enter committed visible preedit and returned for the virtual-key
+   * fallback. Its newline is sent only once that text has been acknowledged. */
+  gboolean                    pending_virtual_enter;
 
   /* emission hook for clicks */
   gulong                      clicked_id;
@@ -223,6 +226,7 @@ static void
 invalidate_swipe_queue (PosInputSurface *self)
 {
   g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
+  self->pending_virtual_enter = FALSE;
   if (POS_IS_COMPLETER_VERBISAGE (self->completer))
     pos_completer_verbisage_invalidate_swipes (POS_COMPLETER_VERBISAGE (self->completer));
 }
@@ -914,9 +918,11 @@ on_completer_swipe_feedback (PosInputSurface *self, const char *reason)
   pos_input_surface_trigger_feedback (self, BUTTON_PRESS_EVENT);
 
   /* If the queue gave up waiting - an acknowledgement that never came, a
-   * failure - this side must not keep expecting that text either. */
+   * failure - this side must not keep expecting that text or a deferred
+   * virtual key either. */
   if (POS_IS_COMPLETER_VERBISAGE (self->completer) &&
       !pos_completer_verbisage_replay_pending (POS_COMPLETER_VERBISAGE (self->completer))) {
+    self->pending_virtual_enter = FALSE;
     if (self->swipe_replay_ack) {
       g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
       g_debug ("Dropped the replay expectation the queue gave up on");
@@ -972,12 +978,24 @@ pos_input_surface_submit_symbol (PosInputSurface *self, const char *symbol)
 }
 
 
+/* What a replayed virtual-key edit produced. */
+typedef enum {
+  /* The text the key must produce is recorded; wait for the application. */
+  POS_VIRTUAL_EDIT_ARMED,
+  /* The key changes nothing (for example Backspace at the start of an
+   * unselected field), so the queue may continue. */
+  POS_VIRTUAL_EDIT_NOOP,
+  /* The edit is real but cannot be described, so the queue must fail closed. */
+  POS_VIRTUAL_EDIT_UNTRACKABLE,
+} PosVirtualEdit;
+
+
 /* A replayed key the completer does not handle itself is applied through the
  * virtual keyboard, which changes the application's committed text with no
  * completer commit to observe. Record the text state the key must produce so
  * the queue waits for the application to report it, exactly as it waits for an
- * input-method commit. Returns %TRUE when an expectation was armed. */
-static gboolean
+ * input-method commit. */
+static PosVirtualEdit
 pos_input_surface_expect_virtual_key (PosInputSurface *self, const char *symbol)
 {
   const char *surrounding;
@@ -987,14 +1005,55 @@ pos_input_surface_expect_virtual_key (PosInputSurface *self, const char *symbol)
   serial = pos_input_method_get_serial (self->input_method);
 
   g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
-  if (g_str_equal (symbol, "KEY_BACKSPACE"))
-    self->swipe_replay_ack = pos_completion_undo_new_virtual (surrounding, cursor, anchor,
-                                                              1, 0, "", serial);
-  else if (g_str_equal (symbol, "KEY_ENTER"))
-    self->swipe_replay_ack = pos_completion_undo_new_virtual (surrounding, cursor, anchor,
-                                                              0, 0, "\n", serial);
+  if (g_str_equal (symbol, "KEY_BACKSPACE")) {
+    const char *prev;
 
-  return self->swipe_replay_ack != NULL;
+    /* With no caret edit point, a selection or no surrounding text at all this
+     * is not a describable single-character deletion. */
+    if (!surrounding || anchor != cursor)
+      return POS_VIRTUAL_EDIT_UNTRACKABLE;
+    /* Nothing before an unselected caret: the key is a real no-op. */
+    if (cursor == 0)
+      return POS_VIRTUAL_EDIT_NOOP;
+    prev = g_utf8_find_prev_char (surrounding, surrounding + cursor);
+    if (!prev)
+      return POS_VIRTUAL_EDIT_UNTRACKABLE;
+    /* One whole character, not one byte: a multibyte character must be removed
+     * in full or the constructor rejects the split. */
+    self->swipe_replay_ack =
+      pos_completion_undo_new_virtual (surrounding, cursor, anchor,
+                                       (int) ((surrounding + cursor) - prev), 0, "", serial);
+  } else if (g_str_equal (symbol, "KEY_ENTER")) {
+    self->swipe_replay_ack =
+      pos_completion_undo_new_virtual (surrounding, cursor, anchor, 0, 0, "\n", serial);
+  } else {
+    return POS_VIRTUAL_EDIT_UNTRACKABLE;
+  }
+
+  return self->swipe_replay_ack ? POS_VIRTUAL_EDIT_ARMED : POS_VIRTUAL_EDIT_UNTRACKABLE;
+}
+
+
+/* Perform a replayed virtual-key edit: record the text it must produce, tell
+ * the completer to keep waiting when it can be described, and then send the
+ * key itself. */
+static void
+pos_input_surface_apply_virtual_key (PosInputSurface *self, const char *symbol)
+{
+  PosVirtualEdit edit = pos_input_surface_expect_virtual_key (self, symbol);
+  PosCompleterVerbisage *completer = POS_COMPLETER_VERBISAGE (self->completer);
+
+  if (edit == POS_VIRTUAL_EDIT_ARMED)
+    pos_completer_verbisage_replay_application_edit (completer);
+  else if (edit == POS_VIRTUAL_EDIT_UNTRACKABLE)
+    pos_completer_verbisage_replay_untracked (completer);
+
+  if (g_str_equal (symbol, "KEY_BACKSPACE"))
+    pos_input_surface_handle_backsapce (self);
+  else {
+    pos_vk_driver_key_down (self->keyboard_driver, symbol, POS_KEYCODE_MODIFIER_NONE);
+    pos_vk_driver_key_up (self->keyboard_driver, symbol);
+  }
 }
 
 
@@ -1045,18 +1104,20 @@ pos_input_surface_submit_symbol_full (PosInputSurface *self,
   /* The completer did not handle this replayed key, so it reaches the
    * application through the virtual keyboard. Keep the queue waiting on the
    * application edit it causes instead of replaying dependent input early. */
-  if (!physical && POS_IS_COMPLETER_VERBISAGE (self->completer)) {
-    PosCompleterVerbisage *completer = POS_COMPLETER_VERBISAGE (self->completer);
-    const char *virtual_symbol = is_bs ? "KEY_BACKSPACE" :
-      (g_str_equal (symbol, "KEY_ENTER") ? "KEY_ENTER" : NULL);
-
-    if (virtual_symbol && pos_input_surface_expect_virtual_key (self, virtual_symbol))
-      pos_completer_verbisage_replay_application_edit (completer);
-    else if (virtual_symbol && !is_bs)
-      /* The application effect cannot be described, so nothing may be replayed
-       * against it. A Backspace with nothing before the caret changes no
-       * text and falls through to the ordinary cancel. */
-      pos_completer_verbisage_replay_untracked (completer);
+  if (!physical && POS_IS_COMPLETER_VERBISAGE (self->completer) &&
+      (is_bs || g_str_equal (symbol, "KEY_ENTER"))) {
+    if (!is_bs && self->swipe_replay_ack) {
+      /* Enter committed the visible preedit and returned for the virtual-key
+       * fallback, so this key has two effects. Its text commit must be
+       * acknowledged before the virtual Enter changes the text again; perform
+       * that second stage when the first acknowledgement arrives. */
+      self->pending_virtual_enter = TRUE;
+    } else {
+      pos_input_surface_apply_virtual_key (self, symbol);
+    }
+    if (pos_input_surface_is_completer_active (self))
+      pos_completer_set_preedit (self->completer, NULL);
+    return;
   }
 
   if (is_bs) {
@@ -2049,8 +2110,15 @@ on_im_surrounding_text_changed (PosInputSurface *self, GParamSpec *pspec, PosInp
     /* The replayed word is really in the text, so the queue may play the next
      * one. The completer is told after it has seen the new context. */
     g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
-    if (POS_IS_COMPLETER_VERBISAGE (self->completer))
+    if (self->pending_virtual_enter && POS_IS_COMPLETER_VERBISAGE (self->completer)) {
+      /* Enter committed the visible preedit; now that its text has landed,
+       * send the real virtual Enter and wait for its newline before any input
+       * behind Enter is replayed. */
+      self->pending_virtual_enter = FALSE;
+      pos_input_surface_apply_virtual_key (self, "KEY_ENTER");
+    } else if (POS_IS_COMPLETER_VERBISAGE (self->completer)) {
       pos_completer_verbisage_replay_acknowledged (POS_COMPLETER_VERBISAGE (self->completer));
+    }
   }
 }
 
