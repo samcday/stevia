@@ -873,8 +873,21 @@ test_language_equivalent_reselection (Fixture *fixture, gconstpointer unused)
   g_assert_true (pos_completer_verbisage_set_language_tag (self, "fr-FR-br", &error));
   g_assert_no_error (error);
   g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 1);
+
+  /* Case is not significant either. */
+  g_assert_true (pos_completer_verbisage_set_language_tag (self, "fr-FR-BR", &error));
+  g_assert_no_error (error);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 1);
+
+  /* A variant separator is significant: `fr_FR_br` is a different variant,
+   * so accepted work is flushed rather than silently reused. */
+  g_assert_true (pos_completer_verbisage_set_language_tag (self, "fr_FR_br", &error));
+  g_assert_no_error (error);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
   release_held (fixture);
   fixture->hold_swipes = FALSE;
+  spin (40);
+  pos_completer_set_preedit (fixture->completer, NULL);
 }
 
 

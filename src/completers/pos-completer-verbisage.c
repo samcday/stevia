@@ -1536,13 +1536,17 @@ language_tag_is_valid (const char *tag)
 }
 
 
-/* Semantic identity of two selected tags. ASCII case and the region separator
- * are not significant, so `en_US`, `en-US` and `EN_us` select the same
- * language. Component count and order still matter, so a bare `en` is not
- * `en_US` and `fr_FR-br` is not `fr_FR`. */
+/* Semantic identity of two selected tags. ASCII case and the first
+ * (language/region) separator are not significant, so `en_US`, `en-US` and
+ * `EN_us` select the same language. Variant separators are significant, so
+ * `fr_FR-br` is equivalent to `fr-FR-br` but not to `fr_FR_br`, and a bare
+ * `en` is not `en_US`. */
 static gboolean
 language_tag_equivalent (const char *a, const char *b)
 {
+  gboolean a_region_separator_seen = FALSE;
+  gboolean b_region_separator_seen = FALSE;
+
   if (gm_str_is_null_or_empty (a) || gm_str_is_null_or_empty (b))
     return gm_str_is_null_or_empty (a) && gm_str_is_null_or_empty (b);
 
@@ -1550,10 +1554,16 @@ language_tag_equivalent (const char *a, const char *b)
     char ca = g_ascii_tolower (*a);
     char cb = g_ascii_tolower (*b);
 
-    if (ca == '-')
-      ca = '_';
-    if (cb == '-')
-      cb = '_';
+    if (ca == '-' || ca == '_') {
+      if (!a_region_separator_seen)
+        ca = '_';
+      a_region_separator_seen = TRUE;
+    }
+    if (cb == '-' || cb == '_') {
+      if (!b_region_separator_seen)
+        cb = '_';
+      b_region_separator_seen = TRUE;
+    }
     if (ca != cb)
       return FALSE;
     if (!ca)
@@ -1576,10 +1586,12 @@ language_tag_equivalent (const char *a, const char *b)
  * deferred keys, retry timers and acknowledgements are dropped and ordinary
  * lookups are cancelled. Committed text and the literal preedit stay.
  *
- * Selecting an equivalent spelling of the current language (case or the
- * region separator) keeps accepted work and only updates the spelling used
- * for later requests. An unusable tag clears the selection before reporting
- * the error, so no earlier language keeps answering.
+ * Selecting an equivalent spelling of the current language (ASCII case or
+ * the first language/region separator) keeps accepted work and only updates
+ * the spelling used for later requests. A different variant separator is a
+ * real change: `fr_FR_br` is not `fr_FR-br`. An unusable tag clears the
+ * selection before reporting the error, so no earlier language keeps
+ * answering.
  *
  * Returns: %TRUE when the tag was selected or cleared.
  */
