@@ -20,7 +20,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--output", required=True)
 parser.add_argument("--stevia", default="/usr/bin/phosh-osk-stevia",
                     help="Stevia executable (can be extracted from a trial RPM)")
-parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swipe-rapid", "swipe-undo", "swipe-edit", "swipe-focus", "swipe-shift", "typed-undo", "typed-reselect", "undo-focus", "literal", "context-chain", "context-prefix", "context-swipe", "context-undo", "queue-overlap", "queue-enter", "queue-field-switch", "queue-failure"], default="literal")
+parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swipe-rapid", "swipe-undo", "swipe-edit", "swipe-focus", "swipe-shift", "typed-undo", "typed-reselect", "undo-focus", "literal", "context-chain", "context-prefix", "context-swipe", "context-undo", "queue-overlap", "queue-enter", "queue-field-switch", "queue-failure", "queue-barrier", "queue-midword", "queue-second-field", "queue-cursor-move", "queue-hide", "queue-middle-failure", "queue-backspace-repeat", "queue-geometry", "queue-overflow"], default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
                     help="Dictionary used by the service; recorded for provenance")
@@ -266,6 +266,42 @@ def focus(away):
     time.sleep(.25)
 
 
+def focus_second_field():
+    """Move to the probe's other real text field."""
+    os.kill(probe.pid, signal.SIGHUP)
+    wait_for(lambda: state("focus") == "second", "second text field focused")
+    time.sleep(.35)
+
+
+def move_cursor():
+    """Move the caret inside the field, as the user would."""
+    os.kill(probe.pid, signal.SIGWINCH)
+    wait_for(lambda: state("cursor") == "start", "cursor moved")
+    time.sleep(.35)
+
+
+def freeze_probe():
+    """Stop the application processing events, so nothing it would report -
+    including a commit acknowledgement - reaches the keyboard."""
+    os.kill(probe.pid, signal.SIGSTOP)
+    time.sleep(.3)
+
+
+def thaw_probe():
+    os.kill(probe.pid, signal.SIGCONT)
+    time.sleep(.5)
+
+
+def set_osk_visible(visible):
+    """Hide or show the keyboard through its own interface."""
+    call = subprocess.run(["gdbus", "call", "--session", "--dest", "sm.puri.OSK0",
+                           "--object-path", "/sm/puri/OSK0", "--method",
+                           "sm.puri.OSK0.SetVisible", "true" if visible else "false"],
+                          env=env, capture_output=True, text=True, timeout=5)
+    assert call.returncode == 0, f"SetVisible: {call.stderr.strip()}"
+    time.sleep(.6)
+
+
 def drag_word(word, expected, *, focus_away=False, trail=False, wait=True, allow_words=None):
     before_buffer, before_preedit = state("buffer"), state("preedit")
     rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
@@ -388,7 +424,193 @@ try:
         allowed = ("alpha", "beta")
         service_control("Hold", "true")
 
-        if args.case == "queue-overlap":
+        if args.case == "queue-barrier":
+            # A word typed between two gestures keeps its place, and the
+            # gesture behind it survives the application acknowledging it.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            wait_held_requests(1, "first recognition outstanding")
+            key("o")
+            key("k")
+            key(" ")
+            drag_word("world", None, wait=False, allow_words=allowed)
+            wait_held_requests(2, "second recognition outstanding")
+            assert state("buffer") == "" and state("preedit") == "", \
+                "typed keys ran ahead of the gestures"
+
+            service_control("Release", "0", "alpha")
+            wait_state("alpha ok ", "", "word, then the keys typed after it", timeout=10)
+            service_control("Release", "0", "beta")
+            wait_state("alpha ok ", "beta", "gesture behind the key survived its commit")
+            key(" ")
+            wait_state("alpha ok beta ", "", "Space accepts the last word")
+        elif args.case == "queue-midword":
+            # A gesture drawn while a word is being typed is refused, and the
+            # typed word is not replaced by it.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            wait_held_requests(1, "recognition outstanding")
+            key("x")
+            drag_word("world", None, wait=False, allow_words=allowed)
+            time.sleep(.6)
+            assert service_count("Requests") == 1, "a gesture was accepted mid-word"
+            service_control("Release", "0", "alpha")
+            wait_state("alpha ", "x", "typed word survived the gesture replay")
+        elif args.case == "queue-second-field":
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            drag_word("world", None, wait=False, allow_words=allowed)
+            wait_held_requests(2, "both recognitions outstanding")
+            focus_second_field()
+            service_control("Release", "1", "beta")
+            service_control("Release", "0", "alpha")
+            time.sleep(.9)
+            assert state("buffer") == "", f"late words reached the old field: {state('buffer')!r}"
+            assert state("buffer2") == "", f"late words reached the new field: {state('buffer2')!r}"
+            # The keyboard still works in the field that is now active.
+            service_control("Hold", "false")
+            key("o")
+            key("k")
+            key(" ")
+            wait_state("", "", "old field untouched", timeout=6)
+            wait_for(lambda: state("buffer2") == "ok ", "fresh input in the new field")
+        elif args.case == "queue-cursor-move":
+            # There must be text for the caret to move within, or the
+            # application reports no change at all.
+            service_control("Hold", "false")
+            drag_word("hello", "word1")
+            key(" ")
+            wait_state("word1 ", "", "a first word to move the caret in")
+            service_control("Hold", "true")
+
+            drag_word("world", None, wait=False, allow_words=("word1", "alpha"))
+            wait_held_requests(1, "recognition outstanding")
+            move_cursor()
+            service_control("Release", "0", "alpha")
+            time.sleep(.9)
+            assert state("buffer") == "word1 ", \
+                f"a moved caret still received a word: {state('buffer')!r}"
+            # The caret now sits before existing text, which is not a gesture
+            # boundary, so check the keyboard is usable by typing there.
+            service_control("Hold", "false")
+            key("o")
+            key("k")
+            wait_state("word1 ", "ok", "typing works after the caret moved")
+            key(" ")
+            wait_state("ok word1 ", "", "the typed word landed at the caret")
+        elif args.case == "queue-hide":
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            drag_word("world", None, wait=False, allow_words=allowed)
+            wait_held_requests(2, "both recognitions outstanding")
+            set_osk_visible(False)
+            service_control("Release", "1", "beta")
+            service_control("Release", "0", "alpha")
+            time.sleep(.9)
+            assert state("buffer") == "", f"a hidden keyboard still typed: {state('buffer')!r}"
+            set_osk_visible(True)
+            # The keyboard animates back in before it can be drawn on.
+            time.sleep(1.5)
+            service_control("Hold", "false")
+            drag_word("hello", "word3")
+            wait_state("", "word3", "fresh gesture works after showing it again")
+        elif args.case == "queue-middle-failure":
+            # A prefix that is already committed and acknowledged must survive a
+            # failure further along, and an Enter behind that failure must never
+            # submit.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            drag_word("world", None, wait=False, allow_words=allowed)
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            # Three gestures are accepted, but only two recognitions run at
+            # once; the third is sent when a worker frees.
+            wait_held_requests(2, "two recognitions outstanding")
+            key("ENTER")
+
+            service_control("Release", "0", "alpha")
+            wait_state("", "alpha", "first word is the guess")
+            wait_held_requests(2, "the third recognition started")
+            service_control("Release", "0", "beta")
+            # The second word arriving commits the first, which the application
+            # acknowledges before the second becomes the guess.
+            wait_state("alpha ", "beta", "prefix committed and acknowledged")
+
+            service_control("Fail", "0")
+            time.sleep(1.0)
+            assert state("buffer") == "alpha ", \
+                f"committed prefix changed: {state('buffer')!r}"
+            assert "\n" not in state("buffer"), "a cancelled Enter still submitted"
+            assert state("preedit") == "beta", \
+                f"the played word was lost: {state('preedit')!r}"
+            service_control("Hold", "false")
+            key(" ")
+            wait_state("alpha beta ", "", "typing still works after the failure")
+        elif args.case == "queue-backspace-repeat":
+            # A Backspace replayed from the queue must not start the repeat of a
+            # finger that has long since lifted. Reaching that state needs a
+            # commit the application has not acknowledged yet, so it is frozen
+            # for the moment the Backspace is pressed.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            wait_held_requests(1, "recognition outstanding")
+            key("x")
+            key(" ")
+
+            freeze_probe()
+            service_control("Release", "0", "alpha")
+            time.sleep(.5)
+            # No acknowledgement can arrive while the application is stopped,
+            # so this Backspace joins the queue behind the waiting commit.
+            key("BACKSPACE")
+            thaw_probe()
+
+            wait_for(lambda: state("buffer").startswith("alpha "), "replay reached the text",
+                     timeout=10)
+            settled = state("buffer")
+            # Well past the 700 ms repeat delay: nothing may keep deleting.
+            time.sleep(2.0)
+            assert state("buffer") == settled, \
+                f"a released Backspace kept deleting: {settled!r} then {state('buffer')!r}"
+            result["actions"].append({"step": "text stable after replayed Backspace",
+                                      "buffer": state("buffer"), "preedit": state("preedit"),
+                                      "time": time.monotonic()})
+        elif args.case == "queue-geometry":
+            # Each gesture keeps the geometry and case it was drawn with, even
+            # though the keyboard changes underneath the ones still waiting.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            wait_held_requests(1, "first recognition outstanding")
+            key("SHIFT")
+            time.sleep(.3)
+            drag_word("world", None, wait=False, allow_words=allowed)
+            wait_held_requests(2, "second recognition outstanding")
+
+            first = json.loads(service_control("Payload", "0").strip("()',\n "))
+            second = json.loads(service_control("Payload", "1").strip("()',\n "))
+            result["request_payloads"] = [first, second]
+            # Each gesture carried its own trace and key rectangles, captured
+            # when it was drawn. Recognition still uses the old ASCII letter
+            # export rather than the registered layout token, so the labels are
+            # the same 26 either way; replacing that is the next change.
+            assert first["points"] >= 2 and second["points"] >= 2, "traces were empty"
+            assert first["first_point"] != second["first_point"], \
+                f"both gestures sent one trace: {first} {second}"
+            assert first["keys"] == second["keys"] == 26, \
+                f"unexpected key export: {first} {second}"
+            assert first["first_rect"] == second["first_rect"], \
+                "the keyboard did not actually keep its geometry here"
+
+            # Capitalization is captured per gesture: the first was drawn
+            # unshifted and the second with Shift, and holding both does not
+            # let the later state reach the earlier word.
+            service_control("Release", "1", "beta")
+            service_control("Release", "0", "alpha")
+            wait_state("alpha ", "Beta", "each gesture kept the case it was drawn with")
+        elif args.case == "queue-overflow":
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            wait_held_requests(1, "recognition outstanding")
+            for _ in range(9):
+                key("a")
+                key(" ")
+            # Seventeen keys: one more than is kept behind unplayed gestures.
+            assert state("buffer") == "", "deferred keys ran ahead"
+            service_control("Release", "0", "alpha")
+            wait_for(lambda: state("buffer").startswith("alpha "), "word played first",
+                     timeout=10)
+        elif args.case == "queue-overlap":
             drag_word("hello", None, wait=False, allow_words=allowed)
             drag_word("world", None, wait=False, allow_words=allowed)
             wait_held_requests(2, "both recognitions outstanding at once")

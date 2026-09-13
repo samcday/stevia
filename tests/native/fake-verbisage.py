@@ -53,6 +53,8 @@ CONTROL_XML = """
   <method name='Fail'><arg type='u' direction='in'/></method>
   <method name='Requests'><arg type='u' direction='out'/></method>
   <method name='Overlap'><arg type='u' direction='out'/></method>
+  <method name='Payload'>
+    <arg type='u' direction='in'/><arg type='s' direction='out'/></method>
 </interface></node>
 """
 
@@ -67,6 +69,8 @@ class Service:
         self.held = []
         self.requests = 0
         self.outstanding = 0
+        # What each request actually carried, in arrival order.
+        self.payloads = []
         # The most requests that were ever outstanding at the same moment: with
         # one worker this can never exceed one.
         self.overlap = 0
@@ -80,11 +84,25 @@ class Service:
         elif method in ("CompleteWith", "PredictWith"):
             invocation.return_value(GLib.Variant("(a(sd))", ([],)))
         elif method == "RecognizeSwipe":
+            trace, keys, _max, lang = params.unpack()
+            # Record what this request carried, so a test can check that a
+            # gesture kept its own geometry while the keyboard changed.
+            labels = [key[0] for key in keys]
+            payload = {
+                "points": len(trace),
+                "first_point": list(trace[0][:2]) if trace else None,
+                "keys": len(keys),
+                "labels": "".join(labels),
+                "upper": sum(1 for label in labels if label.isupper()),
+                "first_rect": list(keys[0][1:]) if keys else None,
+                "lang": lang,
+            }
+            self.payloads.append(payload)
             self.requests += 1
             self.outstanding += 1
             self.overlap = max(self.overlap, self.outstanding)
             log("swipe", request=self.requests, outstanding=self.outstanding,
-                overlap=self.overlap)
+                overlap=self.overlap, payload=payload)
             if self.hold:
                 self.held.append(invocation)
                 log("held", count=len(self.held))
@@ -109,6 +127,13 @@ class Service:
             invocation.return_value(GLib.Variant("(u)", (self.requests,)))
         elif method == "Overlap":
             invocation.return_value(GLib.Variant("(u)", (self.overlap,)))
+        elif method == "Payload":
+            index = params.unpack()[0]
+            if index >= len(self.payloads):
+                invocation.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs",
+                                             f"no request {index}")
+                return
+            invocation.return_value(GLib.Variant("(s)", (json.dumps(self.payloads[index]),)))
         elif method == "Release":
             index, word = params.unpack()
             if index >= len(self.held):

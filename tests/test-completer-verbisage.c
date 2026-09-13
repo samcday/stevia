@@ -2339,7 +2339,8 @@ test_queue_retry_cancellation (Fixture *fixture, gconstpointer unused)
 }
 
 
-/* Disposing while a retry is armed must not leave the callback behind. */
+/* Disposing while a retry is armed must not leave the callback behind. The
+ * busy reply has to be processed first, or nothing is armed to survive. */
 static void
 test_queue_retry_disposal (Fixture *fixture, gconstpointer unused)
 {
@@ -2349,9 +2350,16 @@ test_queue_retry_disposal (Fixture *fixture, gconstpointer unused)
   fixture->hold_swipes = FALSE;
   release_held_busy_at (fixture, 0);
 
-  /* The completer goes away while the retry is still pending. */
+  /* Let the busy reply arrive and arm the retry, but not fire it: the first
+   * backoff is longer than this. */
+  spin (25);
+  g_assert_cmpuint (fixture->swipe_requests, ==, 1);
+
+  /* The completer goes away with that timer still pending. */
   g_clear_object (&fixture->completer);
-  spin (300);
+  spin (400);
+  /* No stranded callback asked for anything, and none of this warned. */
+  g_assert_cmpuint (fixture->swipe_requests, ==, 1);
 }
 
 
