@@ -27,6 +27,7 @@ parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swip
                                        "queue-middle-timeout", "queue-pending-ack-reset",
                                        "queue-backspace-hold", "queue-enter-suffix",
                                        "queue-backspace-suffix", "queue-enter-preedit-suffix",
+                                       "queue-cursor-mode-enter",
                                        "queue-backspace-utf8-suffix"], default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
@@ -149,7 +150,7 @@ if args.case.startswith("queue-"):
 # dropping it at the ordinary two-second deadline, so only these lengthen the
 # deadline. The expiry cases keep the production default and depend on it.
 if args.case in ("queue-last-key-ack", "queue-backspace-suffix", "queue-pending-ack-reset",
-                 "queue-backspace-utf8-suffix"):
+                 "queue-cursor-mode-enter", "queue-backspace-utf8-suffix"):
     env["POS_TEST_SWIPE_ACK_TIMEOUT_MS"] = "60000"
 env.pop("LD_LIBRARY_PATH", None)
 env.pop("LD_PRELOAD", None)
@@ -1147,6 +1148,70 @@ try:
             wait_state("alpha\nx ", "beta", "the later gesture landed in order")
             key(" ")
             wait_state("alpha\nx beta ", "", "Space accepts the last word")
+        elif args.case == "queue-cursor-mode-enter":
+            # Entering cursor mode turns completion off and cancels the queue.
+            # That cancellation must also clear the surface expectation for a
+            # commit already on its way and the Enter deferred behind it:
+            # otherwise the late alpha report after returning to keyboard mode
+            # fires the cancelled Enter with no queue barrier.
+            drag_word("hello", None, wait=False, allow_words=allowed3)
+            wait_held_requests(1, "recognition outstanding")
+            # No Space before Enter: the preedit is still visible. x and Space
+            # are the dependent suffix queued behind the deferred Enter.
+            key("ENTER")
+            key("x")
+            key(" ")
+
+            freeze_probe()
+            service_control("Release", "0", "alpha")
+            time.sleep(.5)
+            # The keyboard committed the visible preedit and is waiting for the
+            # application to acknowledge it; the real Enter is deferred behind
+            # that expectation. The application is stopped and the deadline is
+            # the test-only long one, so this is a genuinely pending
+            # acknowledgement rather than an expired queue.
+            log = (output / "stevia.log").read_text(errors="replace")
+            assert "Key: 'KEY_ENTER' symbol (replayed)" in log, \
+                "the replayed Enter never reached the surface"
+            assert 'commit_string("alpha")' in log, \
+                "the preedit commit was not sent before cursor mode started"
+            assert "Dropped the replay expectation" not in log, \
+                "the queue gave up before cursor mode could cancel it"
+            assert "button-pressed" not in feedback_requests(), \
+                f"the queue gave up instead of being cancelled: {feedback_requests()}"
+
+            # A real long press on Space enters cursor mode; releasing without
+            # moving the caret leaves it again. Both transitions are the normal
+            # mode handler, not a caret drag.
+            hold_and_watch(180, 695, 800)
+            log = (output / "stevia.log").read_text(errors="replace")
+            assert "Switching to mode: 1" in log, \
+                "the hold did not enter cursor mode"
+            assert "Switching to mode: 0" in log, \
+                "the release did not leave cursor mode"
+            assert state("buffer") == "" and state("preedit") == "", \
+                f"cursor mode typed something: {state('buffer')!r}/{state('preedit')!r}"
+
+            thaw_probe()
+            # The already issued alpha commit may land. The Enter cancelled by
+            # cursor mode must not, and neither must the suffix behind it.
+            wait_for(lambda: state("buffer") != "",
+                     "the issued commit reached the application", timeout=10)
+            time.sleep(.8)
+            assert state("buffer") == "alpha", \
+                f"the cancelled Enter submitted: {state('buffer')!r}"
+            assert "\n" not in state("buffer"), \
+                f"the cancelled Enter inserted a newline: {state('buffer')!r}"
+            assert state("preedit") == "", \
+                f"a cancelled word was replayed: {state('preedit')!r}"
+
+            # The keyboard still works after the late input was dropped.
+            service_control("Hold", "false")
+            key("o")
+            key("k")
+            wait_state("alpha", "ok", "fresh input works after cursor mode cancelled the queue")
+            key(" ")
+            wait_state("alphaok ", "", "Space accepts the fresh input")
         elif args.case == "queue-field-switch":
             drag_word("hello", None, wait=False, allow_words=allowed)
             drag_word("world", None, wait=False, allow_words=allowed)
