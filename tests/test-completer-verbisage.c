@@ -419,6 +419,12 @@ on_commit (PosCompleter *completer, const char *text, int before, int after, gpo
   fixture->after = after;
   fixture->commits++;
   g_ptr_array_add (fixture->commits_seen, g_strdup (text));
+  /* The application deletes and then inserts, exactly as the surface asks. The
+   * caret is always at the end here, so nothing is deleted after it. */
+  g_assert_cmpint (after, ==, 0);
+  g_assert_cmpint (before, <=, (int) fixture->app_text->len);
+  if (before > 0)
+    g_string_truncate (fixture->app_text, fixture->app_text->len - before);
   g_string_append (fixture->app_text, text);
   /* The application shows the text on its own turn of the loop. */
   g_idle_add (acknowledge_replay, fixture);
@@ -1934,6 +1940,106 @@ test_queue_key_commit_acknowledgement (Fixture *fixture, gconstpointer unused)
 }
 
 
+/* A replayed key can commit an edit that also deletes - ordinary punctuation
+ * replaces the space before it. That edit must be acknowledged like any other
+ * before the words behind it are played. */
+static void
+test_queue_punctuation_barrier (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_swipes = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  pos_completer_feed_symbol (fixture->completer, " ");
+  pos_completer_feed_symbol (fixture->completer, ".");
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_held_count (fixture, 2);
+
+  /* The second word is ready before the first, so nothing may depend on the
+   * order the service answered in. */
+  release_held_at (fixture, 1);
+  spin (30);
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 0);
+  release_held_at (fixture, 0);
+  fixture->hold_swipes = FALSE;
+
+  wait_completion (fixture->completer, "w2");
+  /* The space the punctuation replaced is gone, exactly once, and the word
+   * behind the punctuation still arrived. */
+  g_assert_cmpstr (fixture->app_text->str, ==, "w1. ");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "w2");
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+}
+
+
+/* The last key's own commit can leave the list empty while its acknowledgement
+ * is still outstanding. Input typed then still belongs after it. */
+static void
+test_queue_pending_ack_orders_input (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_swipes = TRUE;
+  fixture->hold_ack = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  pos_completer_feed_symbol (fixture->completer, " ");
+  wait_held_count (fixture, 1);
+
+  release_held_at (fixture, 0);
+  fixture->hold_swipes = FALSE;
+  wait_commits (fixture, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 0), ==, "w1 ");
+  /* Nothing is queued behind it, but its commit is still outstanding. */
+  g_assert_true (pos_completer_verbisage_replay_pending (self));
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, "x"));
+  spin (60);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 1);
+
+  fixture->hold_ack = FALSE;
+  pos_completer_verbisage_replay_acknowledged (self);
+  spin (80);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "x");
+}
+
+
+/* Giving up on a commit nothing acknowledged is reported even when the list
+ * behind it was already empty, so the keyboard clears what it expected too. */
+static void
+test_queue_expiry_without_suffix (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  gint64 deadline;
+
+  fixture->hold_swipes = TRUE;
+  fixture->hold_ack = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  pos_completer_feed_symbol (fixture->completer, " ");
+  wait_held_count (fixture, 1);
+  release_held_at (fixture, 0);
+  fixture->hold_swipes = FALSE;
+  wait_commits (fixture, 1);
+  g_assert_true (pos_completer_verbisage_replay_pending (self));
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+
+  deadline = g_get_monotonic_time () + 5 * G_TIME_SPAN_SECOND;
+  while (fixture->feedback->len == 0 && g_get_monotonic_time () < deadline)
+    spin (50);
+  g_assert_cmpuint (fixture->feedback->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->feedback, 0), ==, "acknowledgement-missing");
+  g_assert_false (pos_completer_verbisage_replay_pending (self));
+
+  /* Typing works again straight away. */
+  fixture->hold_ack = FALSE;
+  pos_completer_feed_symbol (fixture->completer, "h");
+  pos_completer_feed_symbol (fixture->completer, "e");
+  pos_completer_feed_symbol (fixture->completer, "l");
+  wait_completion (fixture->completer, "hello");
+}
+
+
 /* While the guess on screen is waiting to be acknowledged, the newest unplayed
  * gesture is still what Backspace takes back. */
 static void
@@ -2165,6 +2271,33 @@ test_queue_disabled_during_replay (Fixture *fixture, gconstpointer unused)
 }
 
 
+/* The surface drops the queue on hide, purpose, hint, layout and mode changes
+ * by invalidating the session. That must clear an acknowledgement with nothing
+ * queued behind it too, not only queued gestures. */
+static void
+test_queue_invalidate_clears_pending_ack (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_ack = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_commits (fixture, 1);
+  g_assert_true (pos_completer_verbisage_replay_pending (self));
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 1);
+
+  pos_completer_verbisage_invalidate_swipes (self);
+  g_assert_false (pos_completer_verbisage_replay_pending (self));
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+
+  /* A late reply from the old session inserts nothing. */
+  fixture->hold_ack = FALSE;
+  spin (150);
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 1);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+}
+
+
 /* A word that cannot be recognized stops replay at that position: the words
  * behind it are cancelled with feedback rather than silently moved up, and a
  * key deferred behind them does not run either. */
@@ -2230,6 +2363,45 @@ test_queue_middle_failure_keeps_played_words (Fixture *fixture, gconstpointer un
   g_assert_cmpuint (fixture->feedback->len, ==, 1);
   g_assert_cmpstr (g_ptr_array_index (fixture->feedback, 0), ==, "recognition-failed");
   g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+}
+
+
+/* The same committed prefix and deferred Enter as the middle failure, but the
+ * recognition in the middle is never answered and its own request deadline ends
+ * it. The suffix must still be cancelled and the Enter must not run. */
+static void
+test_queue_middle_timeout_keeps_played_words (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  gint64 deadline;
+
+  fixture->hold_swipes = TRUE;
+  for (int mark = 1; mark <= 3; mark++)
+    g_assert_true (request_marked_swipe (fixture, mark, 0));
+  wait_held_count (fixture, 2);
+  pos_completer_feed_symbol (fixture->completer, "KEY_ENTER");
+
+  /* The first word is played and becomes the visible guess. */
+  release_held_at (fixture, 0);
+  wait_completion (fixture->completer, "w1");
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 0);
+
+  /* The second is left unanswered; the third waits behind it. */
+  wait_held_count (fixture, 2);
+  fixture->hold_swipes = FALSE;
+
+  deadline = g_get_monotonic_time () + 4 * G_TIME_SPAN_SECOND;
+  while (fixture->feedback->len == 0 && g_get_monotonic_time () < deadline)
+    spin (50);
+
+  /* The prefix and guess survive, the suffix is gone, and the deferred Enter
+   * never reached the keyboard's own key handling. */
+  g_assert_cmpuint (fixture->feedback->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->feedback, 0), ==, "recognition-failed");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "w1");
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+  g_assert_cmpuint (fixture->unhandled_keys->len, ==, 0);
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 0);
 }
 
 
@@ -2649,14 +2821,19 @@ main (int argc, char **argv)
   ADD_TEST ("queue-typed-boundary", test_queue_typed_boundary);
   ADD_TEST ("queue-key-commit-ack", test_queue_key_commit_acknowledgement);
   ADD_TEST ("queue-backspace-during-ack", test_queue_backspace_during_acknowledgement);
+  ADD_TEST ("queue-punctuation-barrier", test_queue_punctuation_barrier);
+  ADD_TEST ("queue-pending-ack-orders", test_queue_pending_ack_orders_input);
+  ADD_TEST ("queue-expiry-no-suffix", test_queue_expiry_without_suffix);
   ADD_TEST ("queue-separator-bytes", test_queue_separator_bytes_match_unbuffered);
   ADD_TEST ("queue-deferred-enter", test_queue_deferred_enter_is_not_swallowed);
   ADD_TEST ("queue-deferred-capacity", test_queue_deferred_capacity);
   ADD_TEST ("queue-backspace", test_queue_backspace_cancels_newest);
   ADD_TEST ("queue-missing-ack", test_queue_missing_acknowledgement_stops_replay);
   ADD_TEST ("queue-disabled-during-replay", test_queue_disabled_during_replay);
+  ADD_TEST ("queue-invalidate-pending-ack", test_queue_invalidate_clears_pending_ack);
   ADD_TEST ("queue-failure", test_queue_failure_cancels_the_suffix);
   ADD_TEST ("queue-middle-failure", test_queue_middle_failure_keeps_played_words);
+  ADD_TEST ("queue-middle-timeout", test_queue_middle_timeout_keeps_played_words);
   ADD_TEST ("queue-capitalization", test_queue_keeps_captured_capitalization);
   ADD_TEST ("queue-busy-retry", test_queue_busy_is_retried);
   ADD_TEST ("queue-busy-retry-order", test_queue_busy_retry_order);

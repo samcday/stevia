@@ -69,6 +69,46 @@ test_swipe_purpose (void)
 }
 
 
+static void
+test_swipe_deletion_text (void)
+{
+  guint cursor;
+  g_autofree char *before_edit = NULL;
+  g_autofree char *after_edit = NULL;
+
+  /* Ordinary punctuation replaces the space before it: the expectation for
+   * that commit has to describe the deletion as well as the insertion. */
+  cursor = 6;
+  before_edit = pos_input_surface_text_after_deletion ("alpha ", &cursor, 6, 1, 0);
+  g_assert_cmpstr (before_edit, ==, "alpha");
+  g_assert_cmpint (cursor, ==, 5);
+
+  /* A deletion after the caret is described too, at the same position. */
+  cursor = 5;
+  after_edit = pos_input_surface_text_after_deletion ("alpha ", &cursor, 5, 0, 1);
+  g_assert_cmpstr (after_edit, ==, "alpha");
+  g_assert_cmpint (cursor, ==, 5);
+
+  /* A selection is not a caret edit and cannot be described this way. */
+  cursor = 3;
+  g_assert_null (pos_input_surface_text_after_deletion ("alpha ", &cursor, 0, 1, 0));
+
+  /* Deleting before the start, or beyond the text, is refused. */
+  cursor = 1;
+  g_assert_null (pos_input_surface_text_after_deletion ("alpha", &cursor, 1, 2, 0));
+  cursor = 6;
+  g_assert_null (pos_input_surface_text_after_deletion ("alpha", &cursor, 6, 0, 2));
+
+  /* A deletion that splits a character cannot be produced by an application. */
+  cursor = 2;
+  g_assert_null (pos_input_surface_text_after_deletion ("é", &cursor, 2, 1, 0));
+  cursor = 0;
+  g_assert_null (pos_input_surface_text_after_deletion ("é", &cursor, 0, 0, 1));
+
+  g_assert_null (pos_input_surface_text_after_deletion (NULL, &cursor, 0, 0, 0));
+}
+
+
 int
 main (int argc, char *argv[])
 {
@@ -84,6 +124,7 @@ main (int argc, char *argv[])
   g_test_add_func ("/pos/osk-input-surface/swipe-layout", test_swipe_layout);
 
   g_test_add_func ("/pos/osk-input-surface/swipe-purpose", test_swipe_purpose);
+  g_test_add_func ("/pos/osk-input-surface/swipe-deletion-text", test_swipe_deletion_text);
 
   ret = g_test_run ();
 

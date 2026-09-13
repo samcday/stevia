@@ -21,7 +21,11 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--output", required=True)
 parser.add_argument("--stevia", default="/usr/bin/phosh-osk-stevia",
                     help="Stevia executable (can be extracted from a trial RPM)")
-parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swipe-rapid", "swipe-undo", "swipe-edit", "swipe-focus", "swipe-shift", "typed-undo", "typed-reselect", "undo-focus", "literal", "context-chain", "context-prefix", "context-swipe", "context-undo", "queue-overlap", "queue-enter", "queue-field-switch", "queue-failure", "queue-barrier", "queue-midword", "queue-second-field", "queue-cursor-move", "queue-hide", "queue-middle-failure", "queue-backspace-repeat", "queue-geometry", "queue-overflow", "queue-ack-expiry"], default="literal")
+parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swipe-rapid", "swipe-undo", "swipe-edit", "swipe-focus", "swipe-shift", "typed-undo", "typed-reselect", "undo-focus", "literal", "context-chain", "context-prefix", "context-swipe", "context-undo", "queue-overlap", "queue-enter", "queue-field-switch", "queue-failure", "queue-barrier", "queue-midword", "queue-second-field", "queue-cursor-move", "queue-hide", "queue-middle-failure", "queue-backspace-repeat", "queue-geometry", "queue-overflow", "queue-ack-expiry",
+                                       "queue-punctuation", "queue-last-key-ack",
+                                       "queue-ack-expiry-last-key", "queue-reverse-barrier",
+                                       "queue-middle-timeout", "queue-pending-ack-disable",
+                                       "queue-backspace-hold"], default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
                     help="Dictionary used by the service; recorded for provenance")
@@ -35,32 +39,84 @@ parser.add_argument("--defer-pixel-check", action="store_true",
                     help="Capture trail frames without Pillow; verify-trail.py must validate them on a host")
 parser.add_argument("--private-bus-child", action="store_true", help=argparse.SUPPRESS)
 args = parser.parse_args()
+
+
+def adopted_children():
+    """PIDs this process is currently the parent of, from /proc if available."""
+    pids = set()
+    for task in Path("/proc/self/task").glob("*/children"):
+        try:
+            pids.update(int(pid) for pid in task.read_text().split())
+        except OSError:
+            pass
+    return sorted(pids)
+
+
 if not args.private_bus_child:
     # The private bus starts services of its own (portals, feedbackd, dconf).
     # They outlive the bus and, in a container whose PID 1 does not reap, they
     # would accumulate as zombies for as long as it runs. Become the subreaper
     # so this run can clean up after itself below.
+    subreaper = False
     try:
-        ctypes.CDLL("libc.so.6", use_errno=True).prctl(36, 1, 0, 0, 0)
-    except OSError:
-        pass
-    child = subprocess.run(["dbus-run-session", "--", sys.executable, str(Path(__file__).resolve()),
-                            *sys.argv[1:], "--private-bus-child"], capture_output=True, text=True)
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) == 0:
+            subreaper = True
+        else:
+            print(f"warning: could not become a child subreaper: errno {ctypes.get_errno()}",
+                  file=sys.stderr)
+    except OSError as error:
+        print(f"warning: could not load libc for subreaper setup: {error}", file=sys.stderr)
+
+    # Bounded, and file-backed rather than piped: a descendant that inherits an
+    # output pipe can keep it open past the child's exit, which would leave a
+    # capture-based wait blocked. The direct child's exit is all this waits on.
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="stevia-bus-") as bus_tmp:
+        stdout_path = Path(bus_tmp) / "stdout"
+        stderr_path = Path(bus_tmp) / "stderr"
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            child = subprocess.Popen(["dbus-run-session", "--", sys.executable,
+                                      str(Path(__file__).resolve()), *sys.argv[1:],
+                                      "--private-bus-child"],
+                                     stdout=stdout, stderr=stderr)
+            try:
+                returncode = child.wait(timeout=900)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+                returncode = 124
+                print("error: the private bus child did not finish within 900s",
+                      file=sys.stderr)
+        child_stdout = stdout_path.read_text(errors="replace")
+        child_stderr = stderr_path.read_text(errors="replace")
     if Path(args.output).exists():
-        (Path(args.output) / "dbus.log").write_text(child.stderr)
-    print(child.stdout, end="")
+        (Path(args.output) / "dbus.log").write_text(child_stderr)
+    print(child_stdout, end="")
 
     # Reap whatever the private bus left behind. Anything still running loses
-    # its bus with the session and exits on its own.
+    # its bus with the session and exits on its own. The wait is bounded and
+    # its outcome is reported rather than assumed.
+    reaped = 0
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         try:
-            reaped, _ = os.waitpid(-1, os.WNOHANG)
+            pid, _ = os.waitpid(-1, os.WNOHANG)
         except ChildProcessError:
             break
-        if reaped == 0:
+        if pid == 0:
             time.sleep(.1)
-    raise SystemExit(child.returncode)
+        else:
+            reaped += 1
+    leftovers = adopted_children()
+    if Path(args.output).exists():
+        (Path(args.output) / "cleanup.json").write_text(
+            json.dumps({"subreaper": subreaper, "reaped": reaped,
+                        "leftover_children": leftovers}, indent=2) + "\n")
+    if not subreaper or leftovers:
+        print(f"warning: cleanup incomplete (subreaper={subreaper}, "
+              f"leftover children={leftovers})", file=sys.stderr)
+    raise SystemExit(returncode)
 
 base = Path(args.tools_dir).resolve()
 output = Path(args.output).resolve()
@@ -80,6 +136,13 @@ env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY="stevia-tes
 # case must use the keyboard's ordinary recognition timeout.
 if args.case.startswith("queue-"):
     env["POS_TEST_SWIPE_TIMEOUT_MS"] = "8000"
+# The ordering case deliberately freezes the application to leave a commit
+# waiting with nothing queued behind it. The keyboard has to keep waiting for
+# that acknowledgement through the freeze instead of dropping it at the ordinary
+# two-second deadline, so only this case lengthens the deadline. The expiry
+# cases below keep the production default and depend on it.
+if args.case == "queue-last-key-ack":
+    env["POS_TEST_SWIPE_ACK_TIMEOUT_MS"] = "60000"
 env.pop("LD_LIBRARY_PATH", None)
 env.pop("LD_PRELOAD", None)
 env.pop("GLYCIN_DISABLE_SANDBOX", None)
@@ -214,6 +277,14 @@ def click_completion(name):
                        f"visible: {sorted(visible_completions())}")
 
 
+def feedback_requests():
+    """Events the keyboard asked the feedback service to play, in order."""
+    log = output / "feedback.log"
+    if not log.exists():
+        return []
+    return re.findall(r'string "([a-z-]+)"', log.read_text(errors="replace"))
+
+
 def service_control(method, *args):
     """Drive the controllable stand-in service, when one is in use."""
     call = subprocess.run(["gdbus", "call", "--session", "--dest", "org.verbisage.Dictionary",
@@ -247,6 +318,10 @@ def key(char):
         click(338, 645)
     elif char == "ENTER":
         click(338, 695)
+    elif char == ".":
+        click(288, 695)
+    elif char == ",":
+        click(72, 695)
     elif char == "SHIFT":
         click(27, 645)
     else:
@@ -320,6 +395,20 @@ def set_osk_visible(visible):
                           env=env, capture_output=True, text=True, timeout=5)
     assert call.returncode == 0, f"SetVisible: {call.stderr.strip()}"
     time.sleep(.6)
+
+
+def set_swipe_typing(enabled):
+    """Turn swipe typing on or off through the keyboard's own setting.
+
+    Unlike hiding the keyboard this does not deactivate the input method, so a
+    commit already on its way to the application still arrives. The setting
+    change is one of the surface's session-reset paths.
+    """
+    call = subprocess.run(["gsettings", "set", "mobi.phosh.osk", "swipe-typing",
+                           "true" if enabled else "false"],
+                          env=env, capture_output=True, text=True, timeout=5)
+    assert call.returncode == 0, f"swipe-typing: {call.stderr.strip()}"
+    time.sleep(.4)
 
 
 def drag_word(word, expected, *, focus_away=False, trail=False, wait=True, allow_words=None):
@@ -405,6 +494,27 @@ def drag_word(word, expected, *, focus_away=False, trail=False, wait=True, allow
     screenshot(f"swipe-{number}-preedit.png", settle=True)
 
 
+def hold_at(x, y, milliseconds):
+    """Press and hold a point for the given time, then release it.
+
+    The pointer stays still, so this is a real finger resting on a key rather
+    than the click the other helpers send. It is how the physical repeat path
+    is reached, as distinct from a symbol replayed from the queue.
+    """
+    number = sum(action["step"].startswith("hold released")
+                 for action in result["actions"])
+    trace = output / f"hold-{number}.txt"
+    trace.write_text(f"{x} {y} 0\n{x} {y} {milliseconds}\n")
+    hold = subprocess.Popen([str(base / "virtual-drag"), "360", "720", str(trace)],
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    processes.append(hold)
+    assert hold.wait(timeout=8) == 0, hold.stderr.read()
+    processes.remove(hold)
+    result["actions"].append({"step": f"hold released {x},{y}",
+                              "time": time.monotonic()})
+
+
 try:
     result["installed_package_context"] = subprocess.run(
         ["rpm", "-q", "stevia", "gtk4", "phoc", "verbisage", "android-patricia-dictionaries-en-US"],
@@ -425,6 +535,12 @@ try:
         }
     else:
         result["dictionary_sha256"] = hashlib.sha256(dictionary.read_bytes()).hexdigest()
+    # Watch what the keyboard actually asks the feedback service to play. This
+    # observes the request itself, so it does not depend on whether the sound
+    # or haptic backend in this environment can play anything.
+    start(["dbus-monitor", "--session",
+           "type='method_call',interface='org.sigxcpu.Feedback',member='TriggerFeedback'"],
+          "feedback.log")
     start(["phoc", "--no-xwayland", "--socket=stevia-test", "-C", str(config)], "phoc.log")
     wait_for(lambda: (runtime / "stevia-test").exists(), "headless output")
     service = start(result["service_command"], "verbisage.log")
@@ -442,9 +558,76 @@ try:
         # These run against the controllable stand-in service, so real
         # widget-generated requests can be held and answered out of order.
         allowed = ("alpha", "beta")
+        allowed3 = ("alpha", "beta", "gamma")
         service_control("Hold", "true")
 
-        if args.case == "queue-barrier":
+        if args.case == "queue-punctuation":
+            # Punctuation replaces the space before it, so its commit deletes as
+            # well as inserts. That edit must be acknowledged before the words
+            # behind it are played, or they are built on text that no longer
+            # exists.
+            drag_word("hello", None, wait=False, allow_words=allowed3)
+            wait_held_requests(1, "first recognition outstanding")
+            key(" ")
+            key(".")
+            drag_word("world", None, wait=False, allow_words=allowed3)
+            drag_word("hello", None, wait=False, allow_words=allowed3)
+            wait_held_requests(2, "two recognitions outstanding")
+
+            # The later words are ready first; only then does the first arrive.
+            service_control("Release", "1", "beta")
+            wait_held_requests(2, "the third recognition started")
+            service_control("Release", "1", "gamma")
+            service_control("Release", "0", "alpha")
+
+            wait_state("alpha. beta ", "gamma", "punctuation edit kept the order",
+                       timeout=15)
+            key(" ")
+            wait_state("alpha. beta gamma ", "", "the last word is accepted")
+        elif args.case == "queue-last-key-ack":
+            # The last key's own commit can leave nothing queued while its
+            # acknowledgement is still outstanding. Input typed then still
+            # belongs after it.
+            drag_word("hello", None, wait=False, allow_words=allowed3)
+            wait_held_requests(1, "recognition outstanding")
+            key(" ")
+
+            freeze_probe()
+            service_control("Release", "0", "alpha")
+            time.sleep(.5)
+            # Nothing is queued now, but "alpha " is not acknowledged yet.
+            key("x")
+            key(" ")
+            drag_word("world", None, wait=False, allow_words=allowed3)
+            thaw_probe()
+            wait_held_requests(1, "the later gesture was accepted and sent")
+
+            service_control("Release", "0", "beta")
+            wait_state("alpha x ", "beta", "typed keys and the later word kept order",
+                       timeout=15)
+        elif args.case == "queue-ack-expiry-last-key":
+            # The same empty-list state, but nothing ever acknowledges it: the
+            # deadline must still report a missing acknowledgement.
+            drag_word("hello", None, wait=False, allow_words=allowed3)
+            wait_held_requests(1, "recognition outstanding")
+            key(" ")
+
+            freeze_probe()
+            service_control("Release", "0", "alpha")
+            # Longer than the queue's acknowledgement deadline.
+            time.sleep(3.5)
+            # Observed while the application is still stopped, so no late
+            # matching update can account for it.
+            assert "button-pressed" in feedback_requests(), \
+                f"no missing-acknowledgement feedback: {feedback_requests()}"
+            result["feedback_before_thaw"] = feedback_requests()
+            thaw_probe()
+
+            service_control("Hold", "false")
+            key("o")
+            key("k")
+            wait_state("alpha ", "ok", "typing works after the deadline", timeout=10)
+        elif args.case == "queue-barrier":
             # A word typed between two gestures keeps its place, and the
             # gesture behind it survives the application acknowledging it.
             drag_word("hello", None, wait=False, allow_words=allowed)
@@ -461,6 +644,32 @@ try:
             wait_state("alpha ok ", "", "word, then the keys typed after it", timeout=10)
             service_control("Release", "0", "beta")
             wait_state("alpha ok ", "beta", "gesture behind the key survived its commit")
+            key(" ")
+            wait_state("alpha ok beta ", "", "Space accepts the last word")
+        elif args.case == "queue-reverse-barrier":
+            # The same key barrier, but the gesture behind the typed word is
+            # recognized first. Input order, not completion order, decides.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            wait_held_requests(1, "first recognition outstanding")
+            key("o")
+            key("k")
+            key(" ")
+            drag_word("world", None, wait=False, allow_words=allowed)
+            wait_held_requests(2, "second recognition outstanding")
+            assert state("buffer") == "" and state("preedit") == "", \
+                "typed keys ran ahead of the gestures"
+
+            # The later gesture is ready first; nothing may be played while the
+            # head is still unrecognized.
+            service_control("Release", "1", "beta")
+            time.sleep(.4)
+            assert state("buffer") == "" and state("preedit") == "", \
+                "a later gesture ran ahead across the key barrier"
+            service_control("Release", "0", "alpha")
+            # The head word commits, the typed keys follow it, and only then
+            # does the already-ready later gesture become the guess.
+            wait_state("alpha ok ", "beta",
+                       "word then keys, with the later gesture behind", timeout=10)
             key(" ")
             wait_state("alpha ok beta ", "", "Space accepts the last word")
         elif args.case == "queue-midword":
@@ -530,6 +739,31 @@ try:
             service_control("Hold", "false")
             drag_word("hello", "word3")
             wait_state("", "word3", "fresh gesture works after showing it again")
+        elif args.case == "queue-pending-ack-disable":
+            # A commit waiting to be acknowledged when swipe typing is switched
+            # off must not be replayed against whatever text the surface sees
+            # afterwards: the reset has to forget the expectation, while the
+            # commit already on its way still reaches the application.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            wait_held_requests(1, "recognition outstanding")
+            freeze_probe()
+            service_control("Release", "0", "alpha")
+            time.sleep(.4)
+            # The queued key commits the guess and now waits for the
+            # acknowledgement the frozen application cannot send.
+            key(" ")
+            time.sleep(.3)
+            set_swipe_typing(False)
+            thaw_probe()
+            time.sleep(.8)
+            assert state("buffer") == "alpha ", \
+                f"the committed text was lost: {state('buffer')!r}"
+            assert "button-pressed" not in feedback_requests(), \
+                f"the reset was reported as a failure: {feedback_requests()}"
+            set_swipe_typing(True)
+            service_control("Hold", "false")
+            drag_word("hello", "word2")
+            wait_state("alpha ", "word2", "fresh gesture works after the pending ack was dropped")
         elif args.case == "queue-middle-failure":
             # A prefix that is already committed and acknowledged must survive a
             # failure further along, and an Enter behind that failure must never
@@ -560,6 +794,34 @@ try:
             service_control("Hold", "false")
             key(" ")
             wait_state("alpha beta ", "", "typing still works after the failure")
+        elif args.case == "queue-middle-timeout":
+            # The same committed prefix and deferred Enter as the failure case,
+            # but the recognition in the middle is never answered at all and the
+            # bounded request deadline gives up on it.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            drag_word("world", None, wait=False, allow_words=allowed)
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            wait_held_requests(2, "two recognitions outstanding")
+            key("ENTER")
+
+            service_control("Release", "0", "alpha")
+            wait_state("", "alpha", "first word is the guess")
+            wait_held_requests(2, "the third recognition started")
+            service_control("Release", "0", "beta")
+            wait_state("alpha ", "beta", "prefix committed and acknowledged")
+
+            # The pending recognition is left unanswered: the request deadline
+            # must end it without playing the suffix or submitting the Enter.
+            wait_for(lambda: "button-pressed" in feedback_requests(),
+                     "the middle timeout was reported", timeout=30)
+            assert state("buffer") == "alpha ", \
+                f"committed prefix changed: {state('buffer')!r}"
+            assert "\n" not in state("buffer"), "a cancelled Enter still submitted"
+            assert state("preedit") == "beta", \
+                f"the played word was lost: {state('preedit')!r}"
+            service_control("Hold", "false")
+            key(" ")
+            wait_state("alpha beta ", "", "typing still works after the timeout")
         elif args.case == "queue-backspace-repeat":
             # A Backspace replayed from the queue must not start the repeat of a
             # finger that has long since lifted. Reaching that state needs a
@@ -578,16 +840,35 @@ try:
             key("BACKSPACE")
             thaw_probe()
 
-            wait_for(lambda: state("buffer").startswith("alpha "), "replay reached the text",
-                     timeout=10)
-            settled = state("buffer")
-            # Well past the 700 ms repeat delay: nothing may keep deleting.
-            time.sleep(2.0)
-            assert state("buffer") == settled, \
-                f"a released Backspace kept deleting: {settled!r} then {state('buffer')!r}"
-            result["actions"].append({"step": "text stable after replayed Backspace",
+            # The replayed key must delete exactly the trailing space once, not
+            # be swallowed and not keep running after its finger has lifted.
+            wait_for(lambda: state("buffer") == "alpha x",
+                     "replay deleted the key exactly once", timeout=10)
+            assert state("preedit") == "", \
+                f"the deleted key left a preedit behind: {state('preedit')!r}"
+            result["actions"].append({"step": "replayed Backspace deleted exactly once",
                                       "buffer": state("buffer"), "preedit": state("preedit"),
                                       "time": time.monotonic()})
+            # Well past the 700 ms repeat delay: nothing may keep deleting.
+            time.sleep(2.0)
+            assert state("buffer") == "alpha x" and state("preedit") == "", \
+                f"a released Backspace kept deleting: {state('buffer')!r}/{state('preedit')!r}"
+        elif args.case == "queue-backspace-hold":
+            # The counterpart to the replayed Backspace: a finger really resting
+            # on the key must still repeat, and lifting it must stop. Separating
+            # replay from physical bookkeeping must not break the real hold.
+            service_control("Hold", "false")
+            drag_word("hello", "word1")
+            key(" ")
+            wait_state("word1 ", "", "text to delete with a held key")
+            hold_at(338, 645, 1600)
+            wait_for(lambda: state("buffer") != "word1 ",
+                     "holding Backspace deleted text", timeout=5)
+            settled = state("buffer")
+            # Well past the repeat interval: the lifted key must not keep going.
+            time.sleep(1.0)
+            assert state("buffer") == settled, \
+                f"Backspace kept deleting after release: {settled!r} then {state('buffer')!r}"
         elif args.case == "queue-geometry":
             # Each gesture keeps the geometry and case it was drawn with, even
             # though the keyboard changes underneath the ones still waiting.
@@ -651,11 +932,21 @@ try:
             for _ in range(9):
                 key("a")
                 key(" ")
-            # Seventeen keys: one more than is kept behind unplayed gestures.
+            # Eighteen keys are offered: sixteen fit behind the gesture, and the
+            # seventeenth and eighteenth are each refused and reported.
             assert state("buffer") == "", "deferred keys ran ahead"
+            assert feedback_requests().count("button-pressed") == 2, \
+                f"each refused key must be reported: {feedback_requests()}"
             service_control("Release", "0", "alpha")
-            wait_for(lambda: state("buffer").startswith("alpha "), "word played first",
-                     timeout=10)
+            # Exactly the sixteen kept keys are applied: eight "a " pairs after
+            # the committed word. Nothing is dropped and nothing extra is kept.
+            wait_state("alpha a a a a a a a a ", "", "exactly sixteen keys were kept",
+                       timeout=15)
+            # The keyboard is still usable once the queue drains.
+            service_control("Hold", "false")
+            key("o")
+            key("k")
+            wait_state("alpha a a a a a a a a ", "ok", "fresh input works after overflow")
         elif args.case == "queue-overlap":
             drag_word("hello", None, wait=False, allow_words=allowed)
             drag_word("world", None, wait=False, allow_words=allowed)
@@ -826,6 +1117,7 @@ try:
                     key(" ")
                     wait_state("hel ", "", "Space accepts edited restored literal")
     screenshot("final.png", settle=True)
+    result["feedback_requests"] = feedback_requests()
     final_owner = bus_owner_pid("org.verbisage.Dictionary")
     if final_owner != service.pid:
         raise RuntimeError(
