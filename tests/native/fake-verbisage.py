@@ -51,6 +51,7 @@ CONTROL_XML = """
   <method name='Release'>
     <arg type='u' direction='in'/><arg type='s' direction='in'/></method>
   <method name='Fail'><arg type='u' direction='in'/></method>
+  <method name='Busy'><arg type='u' direction='in'/></method>
   <method name='Requests'><arg type='u' direction='out'/></method>
   <method name='Overlap'><arg type='u' direction='out'/></method>
   <method name='Payload'>
@@ -152,6 +153,19 @@ class Service:
             self.held.pop(index).return_dbus_error("org.freedesktop.DBus.Error.Failed",
                                                    "recognition unavailable")
             log("failed")
+            invocation.return_value(None)
+        elif method == "Busy":
+            # The same temporary backpressure message the real service returns
+            # when all recognition workers are occupied.
+            index = params.unpack()[0]
+            if index >= len(self.held):
+                invocation.return_dbus_error("org.freedesktop.DBus.Error.InvalidArgs",
+                                             f"no held request {index}")
+                return
+            self.outstanding -= 1
+            self.held.pop(index).return_dbus_error("org.freedesktop.DBus.Error.Failed",
+                                                   "swipe recognition is busy")
+            log("busy")
             invocation.return_value(None)
         else:
             invocation.return_dbus_error("org.freedesktop.DBus.Error.UnknownMethod", method)

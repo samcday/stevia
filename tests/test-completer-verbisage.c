@@ -2527,6 +2527,120 @@ test_queue_busy_retry_order (Fixture *fixture, gconstpointer unused)
 }
 
 
+/* A gesture that outlives its lifetime must not play a late success: the reply
+ * is retired at its position with bounded feedback, and committed text is
+ * untouched. The short lifetime is the test-only override. */
+static void
+test_queue_job_deadline_late_success (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  gint64 deadline;
+
+  fixture->hold_swipes = TRUE;
+  g_setenv ("POS_TEST_SWIPE_JOB_DEADLINE_MS", "150", TRUE);
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  wait_held_count (fixture, 1);
+  /* Age past the short lifetime while the request is still held. */
+  spin (250);
+
+  release_held_at (fixture, 0);
+  fixture->hold_swipes = FALSE;
+
+  deadline = g_get_monotonic_time () + 3 * G_TIME_SPAN_SECOND;
+  while (fixture->feedback->len == 0 && g_get_monotonic_time () < deadline)
+    spin (20);
+  /* Reset to the production lifetime; zero means default. */
+  g_setenv ("POS_TEST_SWIPE_JOB_DEADLINE_MS", "0", TRUE);
+
+  g_assert_cmpuint (fixture->feedback->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->feedback, 0), ==, "recognition-failed");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_null (fixture->committed);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+
+  /* The keyboard recovers with the ordinary lifetime again. */
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_completion (fixture->completer, "w2");
+}
+
+
+/* A result that arrived in time but outlived its lifetime while the queue
+ * waited for the application's acknowledgement must not play when the queue
+ * advances. The committed prefix stays. */
+static void
+test_queue_job_deadline_blocks_late_playback (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  gint64 deadline;
+
+  fixture->hold_swipes = TRUE;
+  g_setenv ("POS_TEST_SWIPE_JOB_DEADLINE_MS", "200", TRUE);
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_held_count (fixture, 2);
+
+  /* w1 becomes the guess, then commits when w2's result arrives; the
+   * acknowledgement is held while w2 ages. */
+  fixture->hold_ack = TRUE;
+  release_held_at (fixture, 0);
+  wait_completion (fixture->completer, "w1");
+  release_held_at (fixture, 0);
+  wait_commits (fixture, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 0), ==, "w1 ");
+  g_assert_true (pos_completer_verbisage_replay_pending (self));
+
+  spin (300);
+  fixture->hold_ack = FALSE;
+  pos_completer_verbisage_replay_acknowledged (self);
+  fixture->hold_swipes = FALSE;
+
+  deadline = g_get_monotonic_time () + 3 * G_TIME_SPAN_SECOND;
+  while (fixture->feedback->len == 0 && g_get_monotonic_time () < deadline)
+    spin (20);
+  /* Reset to the production lifetime; zero means default. */
+  g_setenv ("POS_TEST_SWIPE_JOB_DEADLINE_MS", "0", TRUE);
+
+  /* The committed prefix is untouched and w2 is not played. */
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 1);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_cmpuint (fixture->feedback->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->feedback, 0), ==, "recognition-failed");
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+}
+
+
+/* A busy reply that arrives after the gesture's lifetime must not arm or
+ * restart a retry: the queue gives up at that position instead. */
+static void
+test_queue_job_deadline_expires_busy_retry (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_swipes = TRUE;
+  g_setenv ("POS_TEST_SWIPE_JOB_DEADLINE_MS", "150", TRUE);
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  wait_held_count (fixture, 1);
+  spin (250);
+  fixture->hold_swipes = FALSE;
+
+  /* Busy would normally arm a retry, but the lifetime is already over. */
+  release_held_busy_at (fixture, 0);
+  spin (200);
+  /* Reset to the production lifetime; zero means default. */
+  g_setenv ("POS_TEST_SWIPE_JOB_DEADLINE_MS", "0", TRUE);
+
+  g_assert_cmpuint (fixture->swipe_requests, ==, 1);
+  g_assert_cmpuint (fixture->feedback->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->feedback, 0), ==, "recognition-failed");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+
+  /* Recovery. */
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_completion (fixture->completer, "w2");
+}
+
+
 /* Cancelling a gesture between retry firings must remove that gesture's own
  * timer. With two retries armed and the later one firing first, a retry that
  * cleared another gesture's id would leave a stale one behind, and cancelling
@@ -2891,6 +3005,9 @@ main (int argc, char **argv)
   ADD_TEST ("queue-capitalization", test_queue_keeps_captured_capitalization);
   ADD_TEST ("queue-busy-retry", test_queue_busy_is_retried);
   ADD_TEST ("queue-busy-retry-order", test_queue_busy_retry_order);
+  ADD_TEST ("queue-job-deadline-late-success", test_queue_job_deadline_late_success);
+  ADD_TEST ("queue-job-deadline-late-playback", test_queue_job_deadline_blocks_late_playback);
+  ADD_TEST ("queue-job-deadline-busy", test_queue_job_deadline_expires_busy_retry);
   ADD_TEST ("queue-retry-cancellation", test_queue_retry_cancellation);
   ADD_TEST ("queue-retry-disposal", test_queue_retry_disposal);
   ADD_TEST ("queue-empty-result", test_queue_empty_result_is_a_failure);

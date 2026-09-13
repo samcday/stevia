@@ -28,6 +28,9 @@ parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swip
                                        "queue-backspace-hold", "queue-enter-suffix",
                                        "queue-backspace-suffix", "queue-enter-preedit-suffix",
                                        "queue-cursor-mode-enter",
+                                       "queue-job-deadline-late-success",
+                                       "queue-job-deadline-late-playback",
+                                       "queue-job-deadline-busy",
                                        "queue-backspace-utf8-suffix"], default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
@@ -145,6 +148,11 @@ env["GSETTINGS_BACKEND"] = ("keyfile" if args.case == "queue-pending-ack-reset"
 # case must use the keyboard's ordinary recognition timeout.
 if args.case.startswith("queue-"):
     env["POS_TEST_SWIPE_TIMEOUT_MS"] = "8000"
+    # These fixtures deliberately hold recognitions across user-like sequences
+    # that are longer than a keyboard's real gesture lifetime. The
+    # queue-job-deadline cases below override this with a short lifetime and
+    # prove the production enforcement really expires them.
+    env["POS_TEST_SWIPE_JOB_DEADLINE_MS"] = "60000"
 # These cases deliberately freeze the application to build up a replay that is
 # waiting. The keyboard has to keep waiting through the freeze instead of
 # dropping it at the ordinary two-second deadline, so only these lengthen the
@@ -152,6 +160,12 @@ if args.case.startswith("queue-"):
 if args.case in ("queue-last-key-ack", "queue-backspace-suffix", "queue-pending-ack-reset",
                  "queue-cursor-mode-enter", "queue-backspace-utf8-suffix"):
     env["POS_TEST_SWIPE_ACK_TIMEOUT_MS"] = "60000"
+# The late-playback case releases both recognitions before the elapsed time is
+# measured, so its short lifetime has to clear the setup drag. The others just
+# need to outlive one held request.
+if args.case.startswith("queue-job-deadline"):
+    env["POS_TEST_SWIPE_JOB_DEADLINE_MS"] = (
+        "1500" if args.case == "queue-job-deadline-late-playback" else "700")
 env.pop("LD_LIBRARY_PATH", None)
 env.pop("LD_PRELOAD", None)
 env.pop("GLYCIN_DISABLE_SANDBOX", None)
@@ -1212,6 +1226,79 @@ try:
             wait_state("alpha", "ok", "fresh input works after cursor mode cancelled the queue")
             key(" ")
             wait_state("alphaok ", "", "Space accepts the fresh input")
+        elif args.case == "queue-job-deadline-late-success":
+            # A recognition success that arrives after the gesture's own
+            # lifetime must not play. The request is deliberately held past
+            # the short test-only lifetime, which proves real expiry.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            wait_held_requests(1, "recognition outstanding")
+            time.sleep(1.0)
+            service_control("Release", "0", "alpha")
+            wait_for(lambda: "button-pressed" in feedback_requests(),
+                     "the expired gesture was reported", timeout=5)
+            time.sleep(.4)
+            assert state("buffer") == "" and state("preedit") == "", \
+                f"an expired success was played: {state('buffer')!r}/{state('preedit')!r}"
+            assert "exceeded its job deadline" in \
+                (output / "stevia.log").read_text(errors="replace"), \
+                "the job deadline never expired"
+
+            service_control("Hold", "false")
+            drag_word("hello", "word2")
+            wait_state("", "word2", "fresh gesture works after the expired success")
+        elif args.case == "queue-job-deadline-late-playback":
+            # The second result is ready but waits for the application's
+            # acknowledgement. Holding that acknowledgement lets the gesture
+            # outlive its lifetime; when the queue advances, the expired word
+            # must not play and the committed prefix stays.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            drag_word("world", None, wait=False, allow_words=allowed)
+            wait_held_requests(2, "both recognitions outstanding")
+            freeze_probe()
+            # Release the second held request first; the reply order does not
+            # change the queue order, and `Release` indexes what is left.
+            service_control("Release", "1", "beta")
+            service_control("Release", "0", "alpha")
+            # Past the short gesture lifetime, but inside the ordinary
+            # two-second acknowledgement deadline.
+            time.sleep(1.3)
+            assert state("buffer") == "", "the frozen application received text"
+            thaw_probe()
+            wait_for(lambda: state("buffer") == "alpha ",
+                     "the issued commit landed", timeout=5)
+            wait_for(lambda: "button-pressed" in feedback_requests(),
+                     "the expired word was reported", timeout=5)
+            time.sleep(.4)
+            assert state("buffer") == "alpha ", \
+                f"a ready but expired word was played: {state('buffer')!r}"
+            assert state("preedit") == "", \
+                f"the expired word became preedit: {state('preedit')!r}"
+
+            service_control("Hold", "false")
+            drag_word("hello", "word3")
+            wait_state("alpha ", "word3", "fresh gesture works after the expired word")
+        elif args.case == "queue-job-deadline-busy":
+            # Busy is retryable only while the gesture is inside its lifetime.
+            # After that it is terminal: a retry must not restart the expired
+            # work, and the queue gives up at that position.
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            wait_held_requests(1, "recognition outstanding")
+            time.sleep(1.0)
+            service_control("Busy", "0")
+            wait_for(lambda: "button-pressed" in feedback_requests(),
+                     "the expired busy gesture was reported", timeout=5)
+            time.sleep(.4)
+            assert service_count("Requests") == 1, \
+                "an expired retry was restarted"
+            assert "Recognition busy; retrying" not in \
+                (output / "stevia.log").read_text(errors="replace"), \
+                "a busy reply past the deadline was retried"
+            assert state("buffer") == "" and state("preedit") == "", \
+                f"an expired retry played: {state('buffer')!r}/{state('preedit')!r}"
+
+            service_control("Hold", "false")
+            drag_word("hello", "word2")
+            wait_state("", "word2", "fresh gesture works after the expired busy reply")
         elif args.case == "queue-field-switch":
             drag_word("hello", None, wait=False, allow_words=allowed)
             drag_word("world", None, wait=False, allow_words=allowed)
