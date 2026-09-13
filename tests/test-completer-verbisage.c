@@ -2007,6 +2007,35 @@ test_queue_missing_acknowledgement_stops_replay (Fixture *fixture, gconstpointer
 }
 
 
+/* Turning the completer off while a replayed word is still waiting to be
+ * acknowledged must drop the queue with it. A deactivate and reactivate pair
+ * can be batched into one event, so this is the moment a word from the old
+ * field could otherwise survive into the new one. */
+static void
+test_queue_disabled_during_replay (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->hold_ack = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_commits (fixture, 1);
+  g_assert_true (pos_completer_verbisage_replay_pending (self));
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 1);
+
+  pos_completer_verbisage_set_enabled (self, FALSE);
+  g_assert_false (pos_completer_verbisage_replay_pending (self));
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+
+  /* Whatever arrives now belongs to a session that has ended. */
+  pos_completer_verbisage_set_enabled (self, TRUE);
+  fixture->hold_ack = FALSE;
+  spin (150);
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 1);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+}
+
+
 /* A word that cannot be recognized stops replay at that position: the words
  * behind it are cancelled with feedback rather than silently moved up, and a
  * key deferred behind them does not run either. */
@@ -2485,6 +2514,7 @@ main (int argc, char **argv)
   ADD_TEST ("queue-deferred-capacity", test_queue_deferred_capacity);
   ADD_TEST ("queue-backspace", test_queue_backspace_cancels_newest);
   ADD_TEST ("queue-missing-ack", test_queue_missing_acknowledgement_stops_replay);
+  ADD_TEST ("queue-disabled-during-replay", test_queue_disabled_during_replay);
   ADD_TEST ("queue-failure", test_queue_failure_cancels_the_suffix);
   ADD_TEST ("queue-middle-failure", test_queue_middle_failure_keeps_played_words);
   ADD_TEST ("queue-capitalization", test_queue_keeps_captured_capitalization);

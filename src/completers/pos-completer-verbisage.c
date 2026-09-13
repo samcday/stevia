@@ -554,6 +554,23 @@ on_swipe_job_finished (GObject *source, GAsyncResult *result, gpointer user_data
 }
 
 
+/* How long one recognition request may take. A private test service needs to
+ * hold real requests for longer than a keyboard ever should, so this follows
+ * the existing POS_TEST_* convention; unset, it is the ordinary timeout. */
+static int
+swipe_request_timeout (void)
+{
+  static int timeout = -1;
+
+  if (timeout < 0) {
+    const char *configured = g_getenv ("POS_TEST_SWIPE_TIMEOUT_MS");
+
+    timeout = configured ? MAX (atoi (configured), 1) : LOOKUP_TIMEOUT_MS;
+  }
+  return timeout;
+}
+
+
 static void
 swipe_job_start (PosCompleterVerbisage *self, SwipeEntry *job)
 {
@@ -574,7 +591,8 @@ swipe_job_start (PosCompleterVerbisage *self, SwipeEntry *job)
   job->cancellable = g_cancellable_new ();
   g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "RecognizeSwipe",
                           job->parameters, G_VARIANT_TYPE ("(a(sd))"), G_DBUS_CALL_FLAGS_NONE,
-                          LOOKUP_TIMEOUT_MS, job->cancellable, on_swipe_job_finished, lookup);
+                          swipe_request_timeout (), job->cancellable,
+                          on_swipe_job_finished, lookup);
 }
 
 

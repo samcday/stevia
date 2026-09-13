@@ -20,7 +20,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--output", required=True)
 parser.add_argument("--stevia", default="/usr/bin/phosh-osk-stevia",
                     help="Stevia executable (can be extracted from a trial RPM)")
-parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swipe-rapid", "swipe-undo", "swipe-edit", "swipe-focus", "swipe-shift", "typed-undo", "typed-reselect", "undo-focus", "literal", "context-chain", "context-prefix", "context-swipe", "context-undo"], default="literal")
+parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swipe-rapid", "swipe-undo", "swipe-edit", "swipe-focus", "swipe-shift", "typed-undo", "typed-reselect", "undo-focus", "literal", "context-chain", "context-prefix", "context-swipe", "context-undo", "queue-overlap", "queue-enter", "queue-field-switch", "queue-failure"], default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
                     help="Dictionary used by the service; recorded for provenance")
@@ -55,7 +55,9 @@ env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY="stevia-tes
            GDK_BACKEND="wayland", GTK_IM_MODULE="wayland", GSK_RENDERER="cairo",
            GTK_A11Y="none", GSETTINGS_BACKEND="memory", NO_AT_BRIDGE="1",
            GTK_USE_PORTAL="0", GSETTINGS_SCHEMA_DIR=str(Path(args.schema_dir).resolve()),
-           POS_TEST_LAYOUT="us", POS_TEST_COMPLETER="verbisage", POS_DEBUG="force-show")
+           POS_TEST_LAYOUT="us", POS_TEST_COMPLETER="verbisage", POS_DEBUG="force-show",
+           # Only the controllable-service cases hold requests this long.
+           POS_TEST_SWIPE_TIMEOUT_MS="8000" if args.case.startswith("queue-") else "")
 env.pop("LD_LIBRARY_PATH", None)
 env.pop("LD_PRELOAD", None)
 env.pop("GLYCIN_DISABLE_SANDBOX", None)
@@ -190,6 +192,25 @@ def click_completion(name):
                        f"visible: {sorted(visible_completions())}")
 
 
+def service_control(method, *args):
+    """Drive the controllable stand-in service, when one is in use."""
+    call = subprocess.run(["gdbus", "call", "--session", "--dest", "org.verbisage.Dictionary",
+                           "--object-path", "/org/verbisage/TestControl",
+                           "--method", f"org.verbisage.TestControl1.{method}", *args],
+                          env=env, capture_output=True, text=True, timeout=5)
+    assert call.returncode == 0, f"{method}: {call.stderr.strip()}"
+    return call.stdout.strip()
+
+
+def service_count(method):
+    # gdbus prints "(uint32 2,)": the type name has digits of its own.
+    return int(re.search(r"uint32\s+(\d+)", service_control(method)).group(1))
+
+
+def wait_held_requests(count, label, timeout=10):
+    wait_for(lambda: service_count("Held") == count, label, timeout)
+
+
 def key(char):
     # The pinned us layout has ten equal columns and four 50px rows.
     rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
@@ -202,6 +223,8 @@ def key(char):
         click(180, 695)
     elif char == "BACKSPACE":
         click(338, 645)
+    elif char == "ENTER":
+        click(338, 695)
     elif char == "SHIFT":
         click(27, 645)
     else:
@@ -357,7 +380,70 @@ try:
     time.sleep(2)
     screenshot("initial.png")
 
-    if args.case.startswith("context"):
+    if args.case.startswith("queue-"):
+        # These run against the controllable stand-in service, so real
+        # widget-generated requests can be held and answered out of order.
+        allowed = ("alpha", "beta")
+        service_control("Hold", "true")
+
+        if args.case == "queue-overlap":
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            drag_word("world", None, wait=False, allow_words=allowed)
+            wait_held_requests(2, "both recognitions outstanding at once")
+            # Proof of overlap from the service's own view, not inference.
+            assert service_count("Overlap") >= 2, "recognition did not overlap"
+            result["observed_overlap"] = service_count("Overlap")
+
+            # Answer the second gesture first.
+            service_control("Release", "1", "beta")
+            time.sleep(.4)
+            assert state("buffer") == "" and state("preedit") == "", \
+                "a later gesture was played before the head"
+            service_control("Release", "0", "alpha")
+            wait_state("alpha ", "beta", "ordered replay despite reversed completion")
+            key(" ")
+            wait_state("alpha beta ", "", "Space accepts the second word")
+        elif args.case == "queue-enter":
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            wait_held_requests(1, "recognition outstanding")
+            key("ENTER")
+            time.sleep(.4)
+            assert state("buffer") == "", "Enter submitted before its word"
+            service_control("Release", "0", "alpha")
+            # The word, then a real Enter: the text view gains the newline.
+            wait_state("alpha\n", "", "deferred Enter reached the application")
+        elif args.case == "queue-field-switch":
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            drag_word("world", None, wait=False, allow_words=allowed)
+            wait_held_requests(2, "both recognitions outstanding")
+            focus(True)
+            time.sleep(.5)
+            service_control("Release", "1", "beta")
+            service_control("Release", "0", "alpha")
+            time.sleep(.8)
+            assert state("buffer") == "", f"late words reached a field: {state('buffer')!r}"
+            focus(False)
+            time.sleep(.5)
+            # The keyboard still works in the field it came back to.
+            service_control("Hold", "false")
+            drag_word("hello", "word3")
+            key(" ")
+            wait_state("word3 ", "", "fresh input works after the field changed")
+        elif args.case == "queue-failure":
+            drag_word("hello", None, wait=False, allow_words=allowed)
+            drag_word("world", None, wait=False, allow_words=allowed)
+            wait_held_requests(2, "both recognitions outstanding")
+            service_control("Release", "1", "beta")
+            time.sleep(.3)
+            service_control("Fail", "0")
+            time.sleep(.8)
+            assert state("buffer") == "" and state("preedit") == "", \
+                f"a cancelled suffix left text: {state('buffer')!r}/{state('preedit')!r}"
+            # The surface was told, and the keyboard still works.
+            service_control("Hold", "false")
+            drag_word("hello", "word3")
+            wait_state("", "word3", "fresh gesture works after a failure")
+    elif args.case.startswith("context"):
         if args.case == "context-swipe":
             drag_word("hello", "hello")
             key(" ")
