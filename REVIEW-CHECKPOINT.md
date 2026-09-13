@@ -1,94 +1,68 @@
-# Layout review checkpoint 2 — 2026-09-13
+# Layout review checkpoint 3 — 2026-09-13
 
-Paired public review trees:
+Paired review trees:
 
-- [Verbisage](https://github.com/samcday/verbisage/tree/codex/layout-review-20260913-2)
-- [Stevia](https://github.com/samcday/stevia/tree/codex/layout-review-20260913-2)
+- [Verbisage](https://github.com/samcday/verbisage/tree/codex/layout-review-20260913-3)
+- [Stevia](https://github.com/samcday/stevia/tree/codex/layout-review-20260913-3)
 
-This checkpoint adds independent fixes and configurable recognition workers to
-[the earlier checkpoint](https://github.com/samcday/verbisage/tree/codex/layout-review-20260913).
-The new Stevia buffered-input implementation remains under correctness review
-and is excluded. Existing single-gesture recognition and its fading trail remain.
-No phone, COPR, image or deployment changes accompany this source publication.
+This small checkpoint adds Prawn's requested D-Bus service integration and
+failure diagnostics to the reviewed source from
+[checkpoint 2](https://github.com/samcday/verbisage/tree/codex/layout-review-20260913-2).
+The swipe buffer and shared-token swipe migration remain in progress and are
+excluded from these review trees. Existing single-gesture recognition and its
+fading trail remain. This publication changes source only.
 
-## New commits available for review or cherry-picking
+## New changes
 
-- Verbisage [`9387b87`](https://github.com/samcday/verbisage/commit/9387b873613044ad18a120ac890906895488f4fe):
-  `--swipe-workers` / `[daemon] swipe_workers`, with CLI > file > default precedence
-  and default two. Each slot stays occupied until its actual recognition work
-  exits, including after the response times out. Completion has separate capacity.
-  Valid requested counts are respected, with no arbitrary clamp.
-- Verbisage [`8cf0639`](https://github.com/samcday/verbisage/commit/8cf06398fe766fef0d0c83c70dda99b3c9dd8e34): reject counts above Tokio's actual semaphore limit
-  with a configuration error instead of a startup panic. Zero remains invalid.
-- Stevia [`e9da0a0`](https://github.com/samcday/stevia/commit/e9da0a09605d755ae65966eb4a6a54f561bc66b9):
-  ignore unknown-layout errors belonging to a replaced token; an old reply cannot
-  discard the current layout token or consume its recovery allowance. Tests now
-  distinguish slow registration from a genuinely stale token rejection.
-- Stevia [`5bee2a1`](https://github.com/samcday/stevia/commit/5bee2a1398a2538f10a927de1035bfcc753cc003):
-  native tests locate their intended suggestion by its label and allocated position,
-  so undo/reselection/focus assertions run even when candidate ranking changes.
-  This adds diagnostic placement logging; it does not alter the ranking.
+- Verbisage [6320211](https://github.com/samcday/verbisage/commit/6320211a6a20115171346952a3ad1e0b4682d159)
+  adds `data/org.verbisage.Dictionary.service.in`, the D-Bus activation launcher
+  with literal `%bindir%` and `verbisaged --mode dbus`. This standalone commit
+  was previously published on the service-template branch.
+- Verbisage [b238629](https://github.com/samcday/verbisage/commit/b238629c157dd24a038f2009edc77c0174417295)
+  configures and installs that launcher through Meson when `dbus=true`.
+  Relative and absolute bindir/datadir settings are respected; DESTDIR does not
+  enter the installed Exec line. A tiny Python helper substitutes the literal
+  placeholder. This is a D-Bus activation file, not a new systemd unit.
+- Stevia [4646479](https://github.com/samcday/stevia/commit/46464796d974f00d5a251c026150ed047af6ec1a)
+  includes the actual D-Bus error in contextual registration/lookup diagnostics.
+  Cancellation, recovery and fallback behavior are unchanged. It is a standalone
+  cherry-pick of `c8e155c`; its commit description is qualified because arbitrary
+  service-provided error text is not guaranteed to be redacted.
 
-Worker changes are separate from general layout changes. Code revisions are
-Verbisage [`8cf0639`](https://github.com/samcday/verbisage/commit/8cf06398fe766fef0d0c83c70dda99b3c9dd8e34) and Stevia `5bee2a1398a2538f10a927de1035bfcc753cc003`;
-the final commit in each review branch only adds this note. Original implementation
-commit identities are retained for cherry-picking.
+Code revisions: Verbisage `b238629c157dd24a038f2009edc77c0174417295`, Stevia
+`46464796d974f00d5a251c026150ed047af6ec1a`. The following commit in each tree adds this review note.
+No swipe-buffer commits are required for the new diagnostics.
 
-## Pairing and source inputs
+## Validation
 
-The earlier checkpoint's actual Stevia layout registration, layout-aware
-completion scoring and contextual prediction are included. Verbisage starts from
-Prawn's `completion_swipe` at `c47dd4bd0291b51bfb7f4c5cb12c7588768f8e41`, which
-already includes the earlier contextual/swipe integration. Stevia starts from
-`2caaeb27c7f4a21e59b57fcd6ff81bdd665e6e41`.
+- The exact Stevia cut compiled. All 73 distinct Meson checks passed, including
+  44 Verbisage-completer cases. The first invocation omitted a display: 68 passed,
+  while five GTK checks failed to open one. Those five then passed under the
+  repository's private Phoc/D-Bus harness. Both runs are retained locally.
+- Verbisage's production Meson project configured with fatal warnings in five
+  cases: default paths, relative bindir, absolute bindir, absolute datadir and
+  D-Bus disabled. Staged installation of the exact production data subdirectory
+  passed all five cases. This verifies the new data rule, not the existing
+  full Cargo/binary/introspection installation pipeline or runtime activation.
+- The Rust runtime is unchanged from checkpoint 2. Its Rust and native interaction
+  evidence is documented there; those suites were not rerun for this small cut.
 
-Use the paired API: Stevia calls `CompleteWith` with trailing layout-token and
-touch-point arguments. An older daemon rejects that request and Stevia retains
-literal input. The actual displayed Stevia geometry is registered via D-Bus;
-it is not inferred from XKB. Touch-point arrays currently remain empty.
+## Remaining limits and source inputs
 
-Recreate these sibling Cargo path sources beside Verbisage:
+The buffered-swipe queue still needs acknowledgement-boundary repairs and review.
+Swipes still use the old separate ASCII-key adapter; using registered layout
+tokens and actual geometry/alternate labels, with accent and immutable queued
+layout coverage, remains the next implementation phase. These trees do not claim
+that milestone is complete.
 
-| Directory | Source identity |
-|---|---|
-| `keyboard_layout` | [public rs-keyboard-layout](https://gitlab.com/InsanePrawn/rs-keyboard-layout), `9cc0b2081657e3cd654fde22a1efe4bf7b0fa949` |
-| `drift-type` | Prawn's private `prawn/layout_info` checkout, `f0b2cc7ac1f84d479abfa6c8e4028f473a8c50b3` |
-| `verbisage/patricia_dict` | [existing public submodule](https://github.com/samcday/android-patricia-dict), `32121e2b5cb8615d408eecc9cd55eeb8d51bd7b7` |
+The paired `CompleteWith` API and source dependencies remain as in checkpoint 2:
+public [rs-keyboard-layout](https://gitlab.com/InsanePrawn/rs-keyboard-layout)
+`9cc0b2081657e3cd654fde22a1efe4bf7b0fa949`; Prawn's private Drift Type
+`prawn/layout_info` at `f0b2cc7ac1f84d479abfa6c8e4028f473a8c50b3`; public
+[Patricia submodule](https://github.com/samcday/android-patricia-dict)
+`32121e2b5cb8615d408eecc9cd55eeb8d51bd7b7`. Cargo.lock does not pin sibling
+path sources. Private Drift Type source is not included in this publication.
 
-Cargo.lock does not pin sibling source revisions. The private Drift Type source
-is not published here; its maintainer must grant access for the complete
-swipe-enabled build. No new Patricia or layout-library source delta is included.
-
-## Validation of this checkpoint
-
-- Verbisage all features: 136 unit, 4 backend, 8 contextual, 1 transport,
-  8 layout and 2 doctests passed. Default features: 110 unit, 4 backend,
-  5 contextual, 8 layout and 1 doctest passed.
-- The worker overflow regression failed before the fix and passed afterward;
-  8 CLI/config smoke cases checked invalid counts, precedence and defaults.
-- This exact Stevia code revision was built separately and passed 73/73 Meson
-  checks, including 44 Verbisage-completer cases.
-- All 11 original native interaction cases passed with this exact source pair:
-  swipe/trail, tap after swipe, next swipe, swipe undo/edit/focus/Shift,
-  typed undo, typed reselection, undo focus and literal input. In particular,
-  the three typed-correction cases that stopped early in the previous checkpoint
-  now reach and pass their undo/reselection/focus assertions.
-
-These are local desktop checks using a private headless compositor and D-Bus
-session, not phone latency or acceptance claims. Candidate binaries and actual
-D-Bus owner PIDs were checked, rather than relying on installed RPM identities.
-
-## Limits and the next boundary
-
-- The new five-swipe buffer is deliberately outside these trees. Independent
-  review found remaining mixed-input/acknowledgement and cancellation defects;
-  passing overlap tests alone do not establish queue correctness. It will follow
-  as a separate source checkpoint after repairs and real surface-boundary tests.
-- The real v202 dictionary still ranks `help` ahead of `hello` for `helo`
-  (approximately 0.612 versus 0.550 in the earlier measured probe). The native
-  test repair allows interaction assertions to execute; it does not restore
-  `hello`-first ranking.
-- Prediction uses previous-word context without layout geometry. Raw tap tracking,
-  full matching-character touch-distance scoring, dictionary learning/interleaving
-  and frequency decay remain follow-ups. System dictionaries are not modified.
-- Packaging and device trials have not been performed for this checkpoint.
+The earlier `helo` ranking tradeoff remains. Raw tap tracking, dictionary
+learning/interleaving and decay remain later work; system dictionaries are
+unchanged. No new phone, COPR, image or deployment trial accompanies this cut.
