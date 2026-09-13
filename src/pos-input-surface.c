@@ -768,6 +768,57 @@ undo_completion (PosInputSurface *self)
 }
 
 
+/**
+ * pos_input_surface_text_after_deletion:
+ * @surrounding: the application's text
+ * @cursor: (inout): the cursor offset in bytes, moved back by @before
+ * @anchor: the selection anchor, which must equal the cursor
+ * @before: bytes deleted before the cursor
+ * @after: bytes deleted after it
+ *
+ * The text a commit's deletion leaves behind, into which its string is then
+ * inserted. Offsets are byte counts, as the text-input protocol uses, and are
+ * rejected unless they fall on character boundaries of the actual text.
+ *
+ * Returns: (transfer full)(nullable): the text, or %NULL when the edit cannot
+ *   be described.
+ */
+static char *
+pos_input_surface_text_after_deletion (const char *surrounding,
+                                       guint      *cursor,
+                                       guint       anchor,
+                                       int         before,
+                                       int         after)
+{
+  GString *edited;
+  gsize length;
+  guint start, end;
+
+  if (!surrounding || anchor != *cursor || before < 0 || after < 0)
+    return NULL;
+
+  length = strlen (surrounding);
+  if (*cursor > length)
+    return NULL;
+  if ((guint) before > *cursor || (guint) after > length - *cursor)
+    return NULL;
+
+  start = *cursor - before;
+  end = *cursor + after;
+  /* A deletion that splits a character would describe text the application
+   * cannot produce. */
+  if (!g_utf8_validate (surrounding, length, NULL) ||
+      (start < length && (surrounding[start] & 0xc0) == 0x80) ||
+      (end < length && (surrounding[end] & 0xc0) == 0x80))
+    return NULL;
+
+  *cursor = start;
+  edited = g_string_new_len (surrounding, start);
+  g_string_append (edited, surrounding + end);
+  return g_string_free (edited, FALSE);
+}
+
+
 static void
 on_completer_commit_string (PosInputSurface *self,
                             const char      *text,
@@ -783,23 +834,28 @@ on_completer_commit_string (PosInputSurface *self,
   g_debug ("%s: %s, (%d,%d)", __func__, text, before, after);
 
   /* A replayed commit only counts once the application shows it, so record the
-   * exact text state to wait for before the next word or key is played. */
+   * exact text state to wait for before the next word or key is played. A
+   * commit may also delete - ordinary punctuation replaces the space before it
+   * - and the expectation has to describe the whole edit, not just the part
+   * that inserts. */
   g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
   if (replaying) {
+    g_autofree char *edited = NULL;
     const char *surrounding;
     guint anchor, cursor;
 
     surrounding = pos_input_method_get_surrounding_text (self->input_method, &anchor, &cursor);
+    edited = pos_input_surface_text_after_deletion (surrounding, &cursor, anchor, before, after);
     /* No preedit is restored from this: it only records the text state the
      * replayed commit must produce. */
-    if (!before && !after) {
+    if (edited) {
       self->swipe_replay_ack =
-        pos_completion_undo_new (surrounding, cursor, anchor, text, "", NULL, NULL,
+        pos_completion_undo_new (edited, cursor, cursor, text, "", NULL, NULL,
                                  pos_input_method_get_serial (self->input_method));
     }
     if (!self->swipe_replay_ack) {
-      /* A commit that also deletes, or one this state cannot describe, has no
-       * expectation to match; say so instead of leaving replay waiting. */
+      /* This edit cannot be described, so nothing could confirm it landed.
+       * Stop rather than play the rest against a text state we do not know. */
       pos_completer_verbisage_replay_untracked (POS_COMPLETER_VERBISAGE (self->completer));
     }
   }

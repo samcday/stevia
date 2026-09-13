@@ -376,6 +376,7 @@ static void swipe_dispatch (PosCompleterVerbisage *self);
 static void swipe_advance (PosCompleterVerbisage *self);
 static gboolean swipe_retry_timeout (gpointer data);
 static void swipe_promote_to_preedit (PosCompleterVerbisage *self, SwipeEntry *entry);
+static int swipe_ack_timeout (void);
 
 
 static void
@@ -446,7 +447,11 @@ swipe_count (PosCompleterVerbisage *self, SwipeEntryKind kind)
 static void
 swipe_queue_clear (PosCompleterVerbisage *self, const char *reason)
 {
-  gboolean had_work = self->swipe_entries && self->swipe_entries->len;
+  /* A commit still waiting to be acknowledged is work of its own: giving up on
+   * it has to be reported, so the keyboard clears what it was expecting too,
+   * even when nothing was left in the list behind it. */
+  gboolean had_work = (self->swipe_entries && self->swipe_entries->len) ||
+                      self->replay_pending;
 
   /* Replies and timers still in flight belong to the session that is ending. */
   self->swipe_session++;
@@ -503,7 +508,7 @@ swipe_await_acknowledgement (PosCompleterVerbisage *self, gboolean is_preedit)
   self->replay_pending = TRUE;
   self->replay_is_preedit = is_preedit;
   g_clear_handle_id (&self->replay_ack_timeout, g_source_remove);
-  self->replay_ack_timeout = g_timeout_add (SWIPE_ACK_TIMEOUT_MS,
+  self->replay_ack_timeout = g_timeout_add (swipe_ack_timeout (),
                                             swipe_replay_ack_timeout, self);
 }
 
@@ -588,6 +593,23 @@ swipe_request_timeout (void)
     const char *configured = g_getenv ("POS_TEST_SWIPE_TIMEOUT_MS");
 
     timeout = (configured && atoi (configured) > 0) ? atoi (configured) : LOOKUP_TIMEOUT_MS;
+  }
+  return timeout;
+}
+
+
+/* How long a replayed commit may wait to be acknowledged. A test that stops the
+ * application to reach a particular ordering needs longer than a keyboard
+ * should ever wait; unset, it is the ordinary deadline. */
+static int
+swipe_ack_timeout (void)
+{
+  static int timeout = -1;
+
+  if (timeout < 0) {
+    const char *configured = g_getenv ("POS_TEST_SWIPE_ACK_TIMEOUT_MS");
+
+    timeout = (configured && atoi (configured) > 0) ? atoi (configured) : SWIPE_ACK_TIMEOUT_MS;
   }
   return timeout;
 }
@@ -1340,7 +1362,10 @@ pos_completer_verbisage_feed_symbol (PosCompleter *iface, const char *symbol)
   PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (iface);
   g_autofree char *previous = NULL;
 
-  if (!self->replaying_key && self->swipe_entries->len) {
+  /* An outstanding acknowledgement orders input just as a queued gesture does:
+   * the last key's own commit may still be waiting for the application, and
+   * anything typed now belongs after it. */
+  if (!self->replaying_key && (self->swipe_entries->len || self->replay_pending)) {
     SwipeEntry *entry;
 
     /* Backspace takes back the newest gesture that has not been played,
@@ -1690,17 +1715,20 @@ pos_completer_verbisage_replay_pending (PosCompleterVerbisage *self)
  * pos_completer_verbisage_replay_untracked:
  *
  * The keyboard could not record what text state the commit it just made should
- * produce, so nothing will ever acknowledge it. Carry on rather than wait for
- * an acknowledgement that cannot arrive.
+ * produce, so nothing will ever confirm it landed. Stop here: the words and
+ * keys still waiting were meant for a text state we can no longer describe,
+ * and playing them against it would put them in the wrong place. Text that is
+ * already committed is untouched.
  */
 void
 pos_completer_verbisage_replay_untracked (PosCompleterVerbisage *self)
 {
   g_return_if_fail (POS_IS_COMPLETER_VERBISAGE (self));
 
-  if (!self->replay_pending || !self->replay_is_preedit)
+  if (!self->replay_pending)
     return;
-  swipe_cancel_acknowledgement (self);
+  g_debug ("A replayed edit cannot be confirmed; dropping the unplayed rest");
+  swipe_queue_clear (self, "acknowledgement-untrackable");
 }
 
 
