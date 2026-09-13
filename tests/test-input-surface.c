@@ -8,6 +8,8 @@
 
 #include "pos-input-surface.c"
 
+#include "pos-commit-pacer.h"
+
 #include <glib.h>
 
 
@@ -293,6 +295,48 @@ test_legacy_language_fallback_policy (void)
 }
 
 
+/* The input method may only commit with the serial of the most recent `done`
+ * event. A burst of state changes must fold into one commit per `done` instead
+ * of sending later commits with a stale serial, which the compositor discards
+ * along with their pending state. */
+static void
+test_commit_pacer_serializes_commits (void)
+{
+  PosCommitPacer pacer;
+  guint sends = 0;
+
+  pos_commit_pacer_init (&pacer);
+
+  /* The first request sends with the initial serial. */
+  if (pos_commit_pacer_request (&pacer))
+    sends++;
+  g_assert_cmpuint (sends, ==, 1);
+  g_assert_cmpuint (pos_commit_pacer_serial (&pacer), ==, 0);
+
+  /* State changes before the matching done are folded, not sent stale. */
+  g_assert_false (pos_commit_pacer_request (&pacer));
+  g_assert_false (pos_commit_pacer_request (&pacer));
+  g_assert_cmpuint (sends, ==, 1);
+
+  /* The done advances the serial and flushes the folded state exactly once. */
+  g_assert_true (pos_commit_pacer_done (&pacer));
+  if (pos_commit_pacer_request (&pacer))
+    sends++;
+  g_assert_cmpuint (sends, ==, 2);
+  g_assert_cmpuint (pos_commit_pacer_serial (&pacer), ==, 1);
+
+  /* A done with no folded state must not produce an empty commit. */
+  g_assert_false (pos_commit_pacer_done (&pacer));
+  g_assert_false (pacer.pending);
+
+  /* The next request sends with the current serial. */
+  if (pos_commit_pacer_request (&pacer))
+    sends++;
+  g_assert_cmpuint (sends, ==, 3);
+  g_assert_cmpuint (pos_commit_pacer_serial (&pacer), ==, 2);
+}
+
+
 int
 main (int argc, char *argv[])
 {
@@ -312,6 +356,7 @@ main (int argc, char *argv[])
   g_test_add_func ("/pos/osk-input-surface/selected-locale-tag", test_selected_locale_tag);
   g_test_add_func ("/pos/osk-input-surface/legacy-language-policy",
                    test_legacy_language_fallback_policy);
+  g_test_add_func ("/pos/osk-input-surface/commit-pacer", test_commit_pacer_serializes_commits);
 
   ret = g_test_run ();
 

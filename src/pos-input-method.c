@@ -12,6 +12,7 @@
 
 #include "pos-enums.h"
 #include "pos-enum-types.h"
+#include "pos-commit-pacer.h"
 #include "pos-input-method.h"
 
 #include "input-method-unstable-v2-client-protocol.h"
@@ -61,7 +62,7 @@ struct _PosInputMethod {
   PosImState *pending;
   PosImState *submitted;
 
-  guint       serial;
+  PosCommitPacer commit_pacer;
 };
 G_DEFINE_TYPE (PosInputMethod, pos_input_method, G_TYPE_OBJECT)
 
@@ -186,10 +187,14 @@ handle_done (void                       *data,
 {
   PosInputMethod *self = POS_INPUT_METHOD (data);
   g_autoptr (PosImState) current = self->submitted;
+  gboolean flush_pending;
 
   g_debug ("%s", __func__);
 
-  self->serial++;
+  flush_pending = pos_commit_pacer_done (&self->commit_pacer);
+  if (flush_pending)
+    pos_input_method_commit (self);
+
   g_object_freeze_notify (G_OBJECT (self));
 
   self->submitted = pos_im_state_dup (self->pending);
@@ -442,6 +447,7 @@ pos_input_method_init (PosInputMethod *self)
 {
   self->pending = g_new0 (PosImState, 1);
   self->submitted = g_new0 (PosImState, 1);
+  pos_commit_pacer_init (&self->commit_pacer);
 }
 
 
@@ -507,7 +513,7 @@ pos_input_method_get_serial (PosInputMethod *self)
 {
   g_return_val_if_fail (POS_IS_INPUT_METHOD (self), 0);
 
-  return self->serial;
+  return pos_commit_pacer_serial (&self->commit_pacer);
 }
 
 /**
@@ -572,9 +578,20 @@ pos_input_method_delete_surrounding_text (PosInputMethod *self,
  * Sends a `commit` request to the compositor so that any pending
  * `commit_string`, `set_preedit_string` and `delete_surrounding_text`.
  * changes get applied.
+ *
+ * A commit may only carry the serial of the most recent `done` event; the
+ * compositor discards pending state sent with an older serial. When a commit
+ * is already in flight the request is deferred and sent once the `done`
+ * arrives, with the state changes folded into the same commit.
  */
 void
 pos_input_method_commit (PosInputMethod *self)
 {
-  zwp_input_method_v2_commit (self->input_method, self->serial);
+  if (!pos_commit_pacer_request (&self->commit_pacer)) {
+    g_debug ("Deferring commit until the previous one is acknowledged");
+    return;
+  }
+
+  zwp_input_method_v2_commit (self->input_method,
+                              pos_commit_pacer_serial (&self->commit_pacer));
 }
