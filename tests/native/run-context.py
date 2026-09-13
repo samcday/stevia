@@ -26,7 +26,8 @@ parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swip
                                        "queue-ack-expiry-last-key", "queue-reverse-barrier",
                                        "queue-middle-timeout", "queue-pending-ack-reset",
                                        "queue-backspace-hold", "queue-enter-suffix",
-                                       "queue-backspace-suffix"], default="literal")
+                                       "queue-backspace-suffix", "queue-enter-preedit-suffix",
+                                       "queue-backspace-utf8-suffix"], default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
                     help="Dictionary used by the service; recorded for provenance")
@@ -147,7 +148,8 @@ if args.case.startswith("queue-"):
 # waiting. The keyboard has to keep waiting through the freeze instead of
 # dropping it at the ordinary two-second deadline, so only these lengthen the
 # deadline. The expiry cases keep the production default and depend on it.
-if args.case in ("queue-last-key-ack", "queue-backspace-suffix", "queue-pending-ack-reset"):
+if args.case in ("queue-last-key-ack", "queue-backspace-suffix", "queue-pending-ack-reset",
+                 "queue-backspace-utf8-suffix"):
     env["POS_TEST_SWIPE_ACK_TIMEOUT_MS"] = "60000"
 env.pop("LD_LIBRARY_PATH", None)
 env.pop("LD_PRELOAD", None)
@@ -936,6 +938,34 @@ try:
                 f"the replayed Backspace kept deleting: {state('buffer')!r}"
             key(" ")
             wait_state("alphax beta ", "", "Space accepts the last word")
+        elif args.case == "queue-backspace-utf8-suffix":
+            # The same barrier over multibyte text: the second replayed
+            # Backspace must delete a whole é, not one byte of it, before the
+            # suffix is built on the result.
+            drag_word("hello", None, wait=False, allow_words=allowed3)
+            wait_held_requests(1, "recognition outstanding")
+            key(" ")
+            freeze_probe()
+            service_control("Release", "0", "café")
+            time.sleep(.5)
+            key("BACKSPACE")
+            key("BACKSPACE")
+            key("x")
+            key(" ")
+            drag_word("world", None, wait=False, allow_words=allowed3)
+            wait_held_requests(1, "the later gesture is outstanding")
+            thaw_probe()
+
+            # café-space -> first Backspace removes the space, second removes
+            # the é, then x and its separator produce "cafx ".
+            wait_for(lambda: state("buffer") == "cafx ",
+                     "the UTF-8 deletion finished before the suffix", timeout=15)
+            assert state("preedit") == "", \
+                f"the deletion left a preedit behind: {state('preedit')!r}"
+            service_control("Release", "0", "beta")
+            wait_state("cafx ", "beta", "the later gesture landed in order")
+            key(" ")
+            wait_state("cafx beta ", "", "Space accepts the last word")
         elif args.case == "queue-backspace-hold":
             # The counterpart to the replayed Backspace: a finger really resting
             # on the key must repeat more than once, and lifting it must stop.
@@ -1090,6 +1120,33 @@ try:
             wait_state("alpha \nx ", "beta", "the later gesture landed in order")
             key(" ")
             wait_state("alpha \nx beta ", "", "Space accepts the last word")
+        elif args.case == "queue-enter-preedit-suffix":
+            # Enter with a visible preedit has two effects: it commits that text
+            # and then inserts a newline. Both must be ordered before the input
+            # behind Enter, so the text acknowledgement is not replaced by the
+            # newline one.
+            drag_word("hello", None, wait=False, allow_words=allowed3)
+            wait_held_requests(1, "recognition outstanding")
+            # No Space before Enter: the preedit is still visible.
+            key("ENTER")
+            key("x")
+            key(" ")
+            drag_word("world", None, wait=False, allow_words=allowed3)
+            wait_held_requests(2, "the later gesture is outstanding")
+
+            service_control("Release", "0", "alpha")
+            # alpha is committed, then the newline, then x on the new line.
+            wait_for(lambda: state("buffer") == "alpha\nx ",
+                     "Enter committed its preedit and then its newline", timeout=15)
+            assert state("preedit") == "", \
+                f"the newline left a preedit behind: {state('preedit')!r}"
+            assert "button-pressed" not in feedback_requests(), \
+                f"a valid Enter was reported as a failed edit: {feedback_requests()}"
+
+            service_control("Release", "0", "beta")
+            wait_state("alpha\nx ", "beta", "the later gesture landed in order")
+            key(" ")
+            wait_state("alpha\nx beta ", "", "Space accepts the last word")
         elif args.case == "queue-field-switch":
             drag_word("hello", None, wait=False, allow_words=allowed)
             drag_word("world", None, wait=False, allow_words=allowed)

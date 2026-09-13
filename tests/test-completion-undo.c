@@ -268,6 +268,31 @@ test_virtual_edit_observer (void)
 }
 
 
+/* A virtual deletion removes a whole character. At the end of "café " the
+ * trailing space is one byte; deleting the é needs two, and a one-byte deletion
+ * that would split it is refused. */
+static void
+test_virtual_deletion_boundary (void)
+{
+  g_autoptr (PosCompletionUndo) undo =
+    pos_completion_undo_new_virtual ("café ", 6, 6, 1, 0, "", 10);
+
+  g_assert_nonnull (undo);
+  g_assert_true (pos_completion_undo_observe (undo, "café", 5, 5, 11, FALSE));
+  g_assert_true (pos_completion_undo_matches (undo, "café", 5, 5));
+
+  g_clear_pointer (&undo, pos_completion_undo_free);
+  undo = pos_completion_undo_new_virtual ("café", 5, 5, 2, 0, "", 10);
+  g_assert_nonnull (undo);
+  g_assert_true (pos_completion_undo_observe (undo, "caf", 3, 3, 11, FALSE));
+  g_assert_true (pos_completion_undo_matches (undo, "caf", 3, 3));
+
+  /* One byte would split the é, so the edit cannot be represented. */
+  g_clear_pointer (&undo, pos_completion_undo_free);
+  g_assert_null (pos_completion_undo_new_virtual ("café", 5, 5, 1, 0, "", 10));
+}
+
+
 int
 main (int argc, char *argv[])
 {
@@ -283,6 +308,8 @@ main (int argc, char *argv[])
                    test_replacing_keeps_original_context);
   g_test_add_func ("/pos/completion-undo/replacing-rejections", test_replacing_rejections);
   g_test_add_func ("/pos/completion-undo/virtual-edit-observer", test_virtual_edit_observer);
+  g_test_add_func ("/pos/completion-undo/virtual-deletion-boundary",
+                   test_virtual_deletion_boundary);
 
   return g_test_run ();
 }
