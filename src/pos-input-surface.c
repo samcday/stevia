@@ -1180,6 +1180,11 @@ on_osk_mode_changed (PosInputSurface *self, GParamSpec *pspec, GtkWidget *osk_wi
   g_return_if_fail (POS_IS_OSK_WIDGET (osk_widget));
 
   clear_edit_history (self);
+  /* Entering cursor mode turns completion off, which cancels the queue's
+   * accepted work. Cancel the surface side with it so a commit already on its
+   * way cannot fire the deferred Enter or replay a word cursor mode dropped. */
+  if (pos_osk_widget_get_mode (POS_OSK_WIDGET (osk_widget)) == POS_OSK_WIDGET_MODE_CURSOR)
+    invalidate_swipe_queue (self);
   update_swipe_enabled (self);
 
   /* We only want to clear preedit when entering cursor mode */
