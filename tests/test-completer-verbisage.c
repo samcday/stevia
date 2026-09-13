@@ -83,6 +83,7 @@ typedef struct {
 static void request_swipe (Fixture *fixture);
 static gboolean request_marked_swipe (Fixture *fixture, int mark, guint capitalization);
 static void wait_held_count (Fixture *fixture, guint expected);
+static void wait_pending_swipes (Fixture *fixture, guint expected);
 
 static GTestDBus *bus;
 
@@ -792,24 +793,26 @@ test_language_tag_unset_and_invalid (Fixture *fixture, gconstpointer unused)
   g_autoptr (GError) error = NULL;
   g_auto (GStrv) words = NULL;
 
+  /* An unusable tag clears the previous language: no lookup may run in it. */
   g_assert_false (pos_completer_verbisage_set_language_tag (self, "bad tag", &error));
   g_assert_error (error, POS_COMPLETER_ERROR, POS_COMPLETER_ERROR_LANG_INIT);
   g_clear_error (&error);
 
   pos_completer_set_preedit (fixture->completer, "hel");
-  wait_completion (fixture->completer, "hello");
-  g_assert_cmpstr (fixture->last_lang, ==, "en_US");
+  spin (120);
+  words = pos_completer_get_completions (fixture->completer);
+  g_assert_nonnull (words);
+  g_assert_cmpuint (g_strv_length (words), ==, 1);
+  g_assert_cmpstr (words[0], ==, "hel");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "hel");
 
+  /* Clearing is the same recoverable unset state. */
   pos_completer_set_preedit (fixture->completer, NULL);
   g_assert_true (pos_completer_verbisage_set_language_tag (self, "", &error));
   g_assert_no_error (error);
   pos_completer_set_preedit (fixture->completer, "hel");
   spin (120);
   /* Only the literal choice remains; no service lookup ran. */
-  words = pos_completer_get_completions (fixture->completer);
-  g_assert_nonnull (words);
-  g_assert_cmpuint (g_strv_length (words), ==, 1);
-  g_assert_cmpstr (words[0], ==, "hel");
   g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "hel");
 
   fixture->expected_lang = "de_DE";
@@ -818,6 +821,60 @@ test_language_tag_unset_and_invalid (Fixture *fixture, gconstpointer unused)
   pos_completer_set_preedit (fixture->completer, "hel");
   wait_completion (fixture->completer, "hello");
   g_assert_cmpstr (fixture->last_lang, ==, "de_DE");
+}
+
+
+/* Equivalent spellings of the selected language keep accepted work and update
+ * the spelling used for later requests; a distinct tag still flushes. */
+static void
+test_language_equivalent_reselection (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GError) error = NULL;
+
+  fixture->hold_swipes = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  wait_held_count (fixture, 2);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 2);
+
+  /* Same semantic language in another case and separator spelling. */
+  g_assert_true (pos_completer_verbisage_set_language_tag (self, "EN-us", &error));
+  g_assert_no_error (error);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 2);
+
+  /* Later requests carry the newly selected spelling. */
+  fixture->hold_swipes = FALSE;
+  release_held (fixture);
+  wait_pending_swipes (fixture, 0);
+
+  fixture->expected_lang = "EN-us";
+  fixture->hold_swipes = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 3, 0));
+  wait_held_count (fixture, 1);
+  g_assert_cmpstr (fixture->last_lang, ==, "EN-us");
+
+  /* Specificity is not equivalence: a variant form flushes accepted work. */
+  g_assert_true (pos_completer_verbisage_set_language_tag (self, "fr_FR-br", &error));
+  g_assert_no_error (error);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+  release_held (fixture);
+  fixture->hold_swipes = FALSE;
+  spin (40);
+  /* The language change dropped the unplayed word, not the visible text; a
+   * fresh gesture starts after the old guess is cleared. */
+  pos_completer_set_preedit (fixture->completer, NULL);
+
+  /* The region separator is not significant either. */
+  fixture->hold_swipes = TRUE;
+  fixture->expected_lang = "fr_FR-br";
+  g_assert_true (request_marked_swipe (fixture, 4, 0));
+  wait_held_count (fixture, 1);
+  g_assert_true (pos_completer_verbisage_set_language_tag (self, "fr-FR-br", &error));
+  g_assert_no_error (error);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 1);
+  release_held (fixture);
+  fixture->hold_swipes = FALSE;
 }
 
 
@@ -2993,6 +3050,32 @@ test_swipe_snapshot_invalid (Fixture *fixture, gconstpointer unused)
 
 
 static void
+test_swipe_snapshot_language_equivalence (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) snapshot = NULL;
+  g_autoptr (GError) error = NULL;
+
+  request_swipe (fixture);
+  wait_completion (fixture->completer, "hello");
+  snapshot = pos_completer_verbisage_snapshot_swipe (self);
+  g_assert_nonnull (snapshot);
+
+  /* An equivalent spelling still restores the same composition. */
+  g_assert_true (pos_completer_verbisage_set_language_tag (self, "EN-us", &error));
+  g_assert_no_error (error);
+  pos_completer_set_preedit (fixture->completer, NULL);
+  g_assert_true (pos_completer_verbisage_restore_swipe (self, snapshot));
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "hello");
+
+  /* A different language cannot restore it. */
+  g_assert_true (pos_completer_verbisage_set_language_tag (self, "fr_FR", &error));
+  g_assert_no_error (error);
+  g_assert_false (pos_completer_verbisage_restore_swipe (self, snapshot));
+}
+
+
+static void
 test_prediction_chain (Fixture *fixture, gconstpointer unused)
 {
   PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
@@ -3122,6 +3205,7 @@ main (int argc, char **argv)
   ADD_TEST ("language", test_language);
   ADD_TEST ("language-tag-routing", test_language_tag_routing);
   ADD_TEST ("language-tag-unset-invalid", test_language_tag_unset_and_invalid);
+  ADD_TEST ("language-equivalent", test_language_equivalent_reselection);
   ADD_TEST ("language-change-queue", test_language_change_drops_queued_work);
   ADD_TEST ("language-change-retry", test_language_change_cancels_retry);
   ADD_TEST ("error-recovery", test_error_recovery);
@@ -3188,6 +3272,7 @@ main (int argc, char **argv)
   ADD_TEST ("queue-daemon-gone", test_queue_daemon_disappearance);
   ADD_TEST ("swipe-snapshot", test_swipe_snapshot);
   ADD_TEST ("swipe-snapshot-invalid", test_swipe_snapshot_invalid);
+  ADD_TEST ("swipe-snapshot-equivalent", test_swipe_snapshot_language_equivalence);
 #undef ADD_TEST
   result = g_test_run ();
   g_test_dbus_down (bus);

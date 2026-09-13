@@ -1536,6 +1536,33 @@ language_tag_is_valid (const char *tag)
 }
 
 
+/* Semantic identity of two selected tags. ASCII case and the region separator
+ * are not significant, so `en_US`, `en-US` and `EN_us` select the same
+ * language. Component count and order still matter, so a bare `en` is not
+ * `en_US` and `fr_FR-br` is not `fr_FR`. */
+static gboolean
+language_tag_equivalent (const char *a, const char *b)
+{
+  if (gm_str_is_null_or_empty (a) || gm_str_is_null_or_empty (b))
+    return gm_str_is_null_or_empty (a) && gm_str_is_null_or_empty (b);
+
+  for (;;) {
+    char ca = g_ascii_tolower (*a);
+    char cb = g_ascii_tolower (*b);
+
+    if (ca == '-')
+      ca = '_';
+    if (cb == '-')
+      cb = '_';
+    if (ca != cb)
+      return FALSE;
+    if (!ca)
+      return TRUE;
+    a++;
+    b++;
+  }
+}
+
 /**
  * pos_completer_verbisage_set_language_tag:
  * @self: The completer
@@ -1549,6 +1576,11 @@ language_tag_is_valid (const char *tag)
  * deferred keys, retry timers and acknowledgements are dropped and ordinary
  * lookups are cancelled. Committed text and the literal preedit stay.
  *
+ * Selecting an equivalent spelling of the current language (case or the
+ * region separator) keeps accepted work and only updates the spelling used
+ * for later requests. An unusable tag clears the selection before reporting
+ * the error, so no earlier language keeps answering.
+ *
  * Returns: %TRUE when the tag was selected or cleared.
  */
 gboolean
@@ -1561,13 +1593,24 @@ pos_completer_verbisage_set_language_tag (PosCompleterVerbisage *self,
   g_return_val_if_fail (POS_IS_COMPLETER_VERBISAGE (self), FALSE);
 
   if (!clearing && !language_tag_is_valid (tag)) {
+    /* An unusable selection must not keep answering in the previous
+     * language: clear it so literal text stays usable and nothing requests or
+     * accepts replies in the old language. */
+    pos_completer_verbisage_set_language_tag (self, NULL, NULL);
     /* Deliberately not echoing the rejected tag: it can be arbitrarily long. */
     g_set_error_literal (error, POS_COMPLETER_ERROR, POS_COMPLETER_ERROR_LANG_INIT,
                          "Invalid language tag");
     return FALSE;
   }
-  if (g_strcmp0 (self->language, clearing ? NULL : tag) == 0)
+  if (language_tag_equivalent (self->language, tag)) {
+    /* The same language in another supported spelling: keep accepted work,
+     * and keep the newly selected spelling for later requests. */
+    if (!clearing) {
+      g_free (self->language);
+      self->language = g_strdup (tag);
+    }
     return TRUE;
+  }
 
   if (self->language) {
     /* Nothing accepted for the old language may reach the application, and
@@ -2102,7 +2145,9 @@ pos_completer_verbisage_restore_swipe (PosCompleterVerbisage *self, GVariant *sn
   if (!snapshot || !g_variant_is_of_type (snapshot, G_VARIANT_TYPE ("(ssas)")))
     return FALSE;
   g_variant_get (snapshot, "(&s&s^as)", &language, &preedit, &ranked);
-  if (g_strcmp0 (language, self->language) || !*preedit || !ranked[0] ||
+  /* The snapshot's language identity is the semantic one: an equivalent
+   * spelling of the same selected language may still restore. */
+  if (!language_tag_equivalent (language, self->language) || !*preedit || !ranked[0] ||
       g_strcmp0 (preedit, ranked[0]) || g_strv_length (ranked) > MAX_RESULTS)
     return FALSE;
   for (guint i = 0; ranked[i]; i++) {
