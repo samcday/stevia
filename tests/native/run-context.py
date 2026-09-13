@@ -33,7 +33,8 @@ parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swip
                                        "queue-job-deadline-busy",
                                        "queue-backspace-utf8-suffix",
                                        "language-routing", "language-dvorak",
-                                       "language-transition", "language-transition-undo"],
+                                       "language-transition", "language-transition-undo",
+                                       "language-transition-undo-control"],
                     default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
@@ -146,7 +147,7 @@ env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY="stevia-tes
 # gsettings subprocess and the keyboard really see the same value. Every other
 # case stays on the process-local memory backend.
 keyfile_cases = ("queue-pending-ack-reset", "language-transition",
-                 "language-transition-undo")
+                 "language-transition-undo", "language-transition-undo-control")
 env["GSETTINGS_BACKEND"] = "keyfile" if args.case in keyfile_cases else "memory"
 # Only the controllable-service cases hold real requests this long; every other
 # case must use the keyboard's ordinary recognition timeout.
@@ -1539,6 +1540,18 @@ try:
         assert state("preedit") != "helo", \
             f"the old-language undo was restored: {state('preedit')!r}"
         wait_state("hello", "", "Backspace edited ordinarily after the switch")
+    elif args.case == "language-transition-undo-control":
+        # Independent pre-switch control for `language-transition-undo`: with
+        # the same completion selected and no source change, Backspace must
+        # restore the typed word. This proves the undo record is eligible
+        # immediately before the switch, so the switched case measures
+        # invalidation rather than a missing record.
+        type_word("helo")
+        click_completion("hello")
+        wait_state("hello ", "", "completion selected before the control Backspace")
+
+        key("BACKSPACE")
+        wait_state("", "helo", "the undo was eligible before any switch")
     else:
         word = "hello" if args.case == "literal" else "helo"
         type_word(word)
