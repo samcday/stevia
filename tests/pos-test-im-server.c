@@ -10,7 +10,11 @@
 
 #include <wayland-server.h>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 typedef struct {
   char    *commit_text;
@@ -25,10 +29,15 @@ struct _PosTestImServer {
   struct wl_display    *display;
   struct wl_event_loop *loop;
   struct wl_client     *client;
-  int                   client_fd;
   struct wl_global     *seat_global;
   struct wl_global     *manager_global;
   struct wl_resource   *input_method;
+
+  /* The client's end of its socket pair, and the relay's ends of both pairs */
+  int                   client_fd;
+  int                   relay_client_fd;
+  int                   relay_server_fd;
+  GByteArray           *to_server;
 
   PosTestImState        pending;
   guint                 current_serial;
@@ -244,11 +253,47 @@ bind_manager (struct wl_client *client, void *data, uint32_t version, uint32_t i
 }
 
 
+static void
+set_nonblocking (int fd)
+{
+  int flags = fcntl (fd, F_GETFL);
+
+  g_assert_cmpint (flags, >=, 0);
+  g_assert_cmpint (fcntl (fd, F_SETFL, flags | O_NONBLOCK), ==, 0);
+}
+
+
+/* Read whatever one side has written so far */
+static void
+relay_read (int fd, GByteArray *buffer)
+{
+  guint8 chunk[4096];
+  gssize n;
+
+  while ((n = recv (fd, chunk, sizeof chunk, MSG_DONTWAIT)) > 0)
+    g_byte_array_append (buffer, chunk, n);
+  g_assert_true (n == 0 || errno == EAGAIN || errno == EWOULDBLOCK);
+}
+
+
+static void
+relay_write (int fd, const guint8 *data, gsize len)
+{
+  while (len) {
+    gssize n = send (fd, data, len, MSG_NOSIGNAL);
+
+    g_assert_cmpint (n, >, 0);
+    data += n;
+    len -= n;
+  }
+}
+
+
 PosTestImServer *
 pos_test_im_server_new (void)
 {
   PosTestImServer *self = g_new0 (PosTestImServer, 1);
-  int fds[2];
+  int client_pair[2], server_pair[2];
 
   self->display = wl_display_create ();
   g_assert_nonnull (self->display);
@@ -256,10 +301,17 @@ pos_test_im_server_new (void)
   self->seat_global = wl_global_create (self->display, &wl_seat_interface, 1, self, bind_seat);
   self->manager_global = wl_global_create (self->display, &zwp_input_method_manager_v2_interface,
                                            1, self, bind_manager);
-  g_assert_cmpint (socketpair (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds), ==, 0);
-  self->client = wl_client_create (self->display, fds[0]);
+
+  g_assert_cmpint (socketpair (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client_pair), ==, 0);
+  g_assert_cmpint (socketpair (AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, server_pair), ==, 0);
+  self->client = wl_client_create (self->display, server_pair[0]);
   g_assert_nonnull (self->client);
-  self->client_fd = fds[1];
+  self->relay_server_fd = server_pair[1];
+  self->relay_client_fd = client_pair[0];
+  self->client_fd = client_pair[1];
+  set_nonblocking (self->relay_server_fd);
+  set_nonblocking (self->relay_client_fd);
+  self->to_server = g_byte_array_new ();
   self->log = g_ptr_array_new_with_free_func (g_free);
 
   return self;
@@ -273,6 +325,9 @@ pos_test_im_server_free (PosTestImServer *self)
   g_clear_pointer (&self->manager_global, wl_global_destroy);
   g_clear_pointer (&self->seat_global, wl_global_destroy);
   wl_display_destroy (self->display);
+  close (self->relay_server_fd);
+  close (self->relay_client_fd);
+  g_byte_array_unref (self->to_server);
   state_reset (&self->pending);
   g_ptr_array_unref (self->log);
   g_free (self);
@@ -287,16 +342,59 @@ pos_test_im_server_get_client_fd (PosTestImServer *self)
 
 
 /**
+ * pos_test_im_server_forward:
+ * @max_messages: how many whole requests to hand to the server, or -1 for all
+ *
+ * Collect what the client has flushed and hand the server the next requests
+ * from it. What is not handed over stays with the relay for a later call.
+ *
+ * Returns: the number of requests handed over
+ */
+guint
+pos_test_im_server_forward (PosTestImServer *self, int max_messages)
+{
+  guint forwarded = 0;
+  gsize offset = 0;
+
+  relay_read (self->relay_client_fd, self->to_server);
+
+  while (self->to_server->len - offset >= 8 &&
+         (max_messages < 0 || forwarded < (guint) max_messages)) {
+    guint32 header;
+    gsize size;
+
+    memcpy (&header, self->to_server->data + offset + 4, sizeof header);
+    size = header >> 16;
+    g_assert_cmpuint (size, >=, 8);
+    if (self->to_server->len - offset < size)
+      break;
+    relay_write (self->relay_server_fd, self->to_server->data + offset, size);
+    offset += size;
+    forwarded++;
+  }
+  g_byte_array_remove_range (self->to_server, 0, offset);
+
+  return forwarded;
+}
+
+
+/**
  * pos_test_im_server_dispatch:
  *
- * Handle every request the client has flushed so far, then flush the events
- * this produced together with any sent earlier, in emission order.
+ * Handle the requests handed to the server so far, then pass the events this
+ * produced, together with any sent earlier, on to the client in emission
+ * order.
  */
 void
 pos_test_im_server_dispatch (PosTestImServer *self)
 {
+  g_autoptr (GByteArray) to_client = g_byte_array_new ();
+
   g_assert_cmpint (wl_event_loop_dispatch (self->loop, 0), ==, 0);
   wl_display_flush_clients (self->display);
+
+  relay_read (self->relay_server_fd, to_client);
+  relay_write (self->relay_client_fd, to_client->data, to_client->len);
 }
 
 

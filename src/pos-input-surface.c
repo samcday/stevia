@@ -931,6 +931,33 @@ on_completer_swipe_feedback (PosInputSurface *self, const char *reason)
 }
 
 
+/* The input method gave up on a committed transaction: the compositor kept
+ * discarding it, it deleted text relative to a cursor the application moved
+ * meanwhile, or too much was already waiting. Text committed before it is
+ * untouched. A replay waiting for that text stops here through the queue's
+ * own path and feedback; otherwise the user gets the feedback a refused
+ * gesture gets, since a dropped key is invisible too. A transaction that may
+ * or may not have been applied is left to the acknowledgement deadline,
+ * which already handles text that never shows. */
+static void
+on_im_transaction_failed (PosInputSurface                  *self,
+                          PosInputMethodTransactionFailure  reason,
+                          PosInputMethod                   *im)
+{
+  g_assert (POS_IS_INPUT_SURFACE (self));
+
+  if (reason == POS_INPUT_METHOD_TRANSACTION_UNCONFIRMED)
+    return;
+
+  if (POS_IS_COMPLETER_VERBISAGE (self->completer) &&
+      pos_completer_verbisage_replay_pending (POS_COMPLETER_VERBISAGE (self->completer))) {
+    pos_completer_verbisage_replay_untracked (POS_COMPLETER_VERBISAGE (self->completer));
+    return;
+  }
+  pos_input_surface_trigger_feedback (self, BUTTON_PRESS_EVENT);
+}
+
+
 /* Give the completer the geometry of the layer the keyboard is really
  * showing. The completer owns how (and whether) the service is told. */
 static void
@@ -2327,6 +2354,8 @@ pos_input_surface_constructed (GObject *object)
                     on_im_text_change_cause_changed, self,
                     "swapped-object-signal::notify::surrounding-text",
                     on_im_surrounding_text_changed, self,
+                    "swapped-object-signal::transaction-failed",
+                    on_im_transaction_failed, self,
                     NULL);
 
   set_keymap (self);

@@ -18,6 +18,7 @@
 
 enum {
   PROP_0,
+  PROP_DISPLAY,
   PROP_MANAGER,
   PROP_SEAT,
   /* Input method state */
@@ -33,6 +34,7 @@ static GParamSpec *props[PROP_LAST_PROP];
 enum {
   DONE,
   PENDING_CHANGED,
+  TRANSACTION_FAILED,
   N_SIGNALS
 };
 static guint signals[N_SIGNALS];
@@ -58,17 +60,23 @@ typedef struct {
  * PosImTransaction:
  *
  * The requests issued since the previous `commit` and the `commit` that
- * applies them. Transactions are sent one at a time in commit order. Each is
- * preceded by a `wl_display.sync` barrier and stays in flight until the
- * barrier's callback arrives; `serial` is the value its commit carried and
- * `dones` counts the `done` events applied while it was in flight.
+ * applies them. Transactions are sent one at a time in commit order, each
+ * between two `wl_display.sync` barriers, and stay in flight until the
+ * trailing barrier returns. `serial` is what the commit carried, `dones`
+ * counts the `done` events applied since it was sent and `dones_at_barrier`
+ * how many of those had arrived when the leading barrier returned.
  */
 typedef struct {
   GArray  *requests;
+  gboolean context_dependent;
   guint    serial;
   guint    dones;
+  guint    dones_at_barrier;
+  gboolean barrier_returned;
   gboolean dropped;
+  gboolean cancelled;
   guint    sends;
+  gint64   created;
 } PosImTransaction;
 
 /**
@@ -82,12 +90,13 @@ typedef struct {
  * when the input method receives the `done` event form the
  * compositor.
  *
- * Outgoing state is sent as transactions, see [struct@PosImTransaction] and
- * [method@PosInputMethod.commit].
+ * Outgoing state is sent as transactions, see
+ * [method@PosInputMethod.commit] for what is and is not guaranteed.
  */
 struct _PosInputMethod {
   GObject  parent;
 
+  struct wl_display *display;
   gpointer manager;
   struct wl_seat *seat;
   struct zwp_input_method_v2 *input_method;
@@ -97,14 +106,18 @@ struct _PosInputMethod {
 
   /* The number of `done` events received, which every commit must carry */
   guint serial;
+  /* Activation changes received, and the count the last `done` applied */
+  guint activation_epoch;
+  guint applied_epoch;
 
   /* The requests issued since the last commit */
   PosImTransaction *building;
   /* Committed transactions not yet sent, in commit order */
   GQueue queued;
-  /* The one transaction sent and not yet past its barrier */
+  /* The one transaction sent and not yet past its trailing barrier */
   PosImTransaction *in_flight;
-  struct wl_callback *barrier;
+  struct wl_callback *barrier_before;
+  struct wl_callback *barrier_after;
 };
 G_DEFINE_TYPE (PosInputMethod, pos_input_method, G_TYPE_OBJECT)
 
@@ -157,30 +170,69 @@ pos_im_transaction_free (PosImTransaction *transaction)
 }
 
 
-static void on_barrier_done (void *data, struct wl_callback *callback, uint32_t time);
+/* How long a committed transaction may live and still be re-sent. Follows
+ * the POS_TEST_* convention: a test may shorten it, down to zero; unset or
+ * negative, it is the production bound. */
+static gint64
+pos_input_method_transaction_lifetime (void)
+{
+  const char *configured = g_getenv ("POS_TEST_IM_TRANSACTION_LIFETIME_MS");
+  gint64 ms = -1;
 
-static const struct wl_callback_listener barrier_listener = {
-  .done = on_barrier_done,
+  if (configured && *configured)
+    ms = g_ascii_strtoll (configured, NULL, 10);
+  if (ms < 0)
+    ms = POS_INPUT_METHOD_TRANSACTION_LIFETIME_MS;
+
+  return ms * G_TIME_SPAN_MILLISECOND;
+}
+
+
+static void
+pos_input_method_fail_transaction (PosInputMethod                   *self,
+                                   PosImTransaction                 *transaction,
+                                   PosInputMethodTransactionFailure  reason)
+{
+  g_autoptr (GEnumClass) reasons = g_type_class_ref (POS_TYPE_INPUT_METHOD_TRANSACTION_FAILURE);
+
+  g_debug ("Giving up on commit %u after %u send(s): %s", transaction->serial,
+           transaction->sends, g_enum_get_value (reasons, reason)->value_nick);
+  pos_im_transaction_free (transaction);
+  g_signal_emit (self, signals[TRANSACTION_FAILED], 0, reason);
+}
+
+
+static void on_barrier_before_done (void *data, struct wl_callback *callback, uint32_t time);
+static void on_barrier_after_done (void *data, struct wl_callback *callback, uint32_t time);
+
+static const struct wl_callback_listener barrier_before_listener = {
+  .done = on_barrier_before_done,
+};
+
+static const struct wl_callback_listener barrier_after_listener = {
+  .done = on_barrier_after_done,
 };
 
 
 static void
 pos_input_method_send_transaction (PosInputMethod *self, PosImTransaction *transaction)
 {
-  struct wl_display *display = wl_proxy_get_display ((struct wl_proxy *) self->input_method);
-
   transaction->serial = self->serial;
   transaction->dones = 0;
+  transaction->dones_at_barrier = 0;
+  transaction->barrier_returned = FALSE;
   transaction->sends++;
 
-  /* The barrier goes first. Every `done` the compositor sent before handling
-   * it arrives before the callback; each of those advanced the serial past
-   * the one this commit carries, so the commit was discarded. A `done` sent
-   * after the barrier was handled arrives after the callback and is never
-   * taken for a discard. Phoc does not answer a commit with `done`, so an
-   * applied commit produces nothing before the callback. */
-  self->barrier = wl_display_sync (display);
-  wl_callback_add_listener (self->barrier, &barrier_listener, self);
+  /* Every `done` the compositor sent before handling the leading barrier
+   * arrives before that barrier's callback; each of those advanced the
+   * serial past the one this commit carries, so the commit was discarded.
+   * The trailing barrier returns once the commit was handled. Phoc does not
+   * answer a commit with `done`, so nothing arrives between the two
+   * callbacks unless the compositor handled the barrier and the commit in
+   * different reads with a `done` in between, which leaves the outcome of
+   * the commit unknown. */
+  self->barrier_before = wl_display_sync (self->display);
+  wl_callback_add_listener (self->barrier_before, &barrier_before_listener, self);
 
   for (guint i = 0; i < transaction->requests->len; i++) {
     PosImRequest *request = &g_array_index (transaction->requests, PosImRequest, i);
@@ -202,6 +254,9 @@ pos_input_method_send_transaction (PosInputMethod *self, PosImTransaction *trans
     }
   }
   zwp_input_method_v2_commit (self->input_method, transaction->serial);
+
+  self->barrier_after = wl_display_sync (self->display);
+  wl_callback_add_listener (self->barrier_after, &barrier_after_listener, self);
   self->in_flight = transaction;
 }
 
@@ -221,30 +276,65 @@ pos_input_method_dispatch (PosInputMethod *self)
 
 
 static void
-on_barrier_done (void *data, struct wl_callback *callback, uint32_t time)
+on_barrier_before_done (void *data, struct wl_callback *callback, uint32_t time)
+{
+  PosInputMethod *self = POS_INPUT_METHOD (data);
+
+  g_assert (callback == self->barrier_before);
+  g_clear_pointer (&self->barrier_before, wl_callback_destroy);
+
+  g_assert (self->in_flight);
+  self->in_flight->dones_at_barrier = self->in_flight->dones;
+  self->in_flight->barrier_returned = TRUE;
+}
+
+
+static void
+on_barrier_after_done (void *data, struct wl_callback *callback, uint32_t time)
 {
   PosInputMethod *self = POS_INPUT_METHOD (data);
   PosImTransaction *transaction;
 
-  g_assert (callback == self->barrier);
-  g_clear_pointer (&self->barrier, wl_callback_destroy);
+  g_assert (callback == self->barrier_after);
+  g_clear_pointer (&self->barrier_after, wl_callback_destroy);
 
   transaction = g_steal_pointer (&self->in_flight);
-  g_assert (transaction);
+  g_assert (transaction && transaction->barrier_returned);
 
   if (transaction->dropped) {
     g_debug ("Dropping commit %u issued for a previous activation", transaction->serial);
     pos_im_transaction_free (transaction);
-  } else if (transaction->dones == 0) {
+  } else if (transaction->dones_at_barrier > 0) {
+    /* Discarded for certain: the serial had already advanced when the
+     * leading barrier, and so the commit behind it, was handled. */
+    if (transaction->cancelled) {
+      pos_input_method_fail_transaction (self, transaction,
+                                         POS_INPUT_METHOD_TRANSACTION_CONTEXT_CHANGED);
+    } else if (!self->submitted->active) {
+      g_debug ("Dropping commit %u discarded while inactive", transaction->serial);
+      pos_im_transaction_free (transaction);
+    } else if (transaction->sends >= POS_INPUT_METHOD_SEND_LIMIT) {
+      pos_input_method_fail_transaction (self, transaction,
+                                         POS_INPUT_METHOD_TRANSACTION_SEND_LIMIT);
+    } else if (g_get_monotonic_time () - transaction->created >=
+               pos_input_method_transaction_lifetime ()) {
+      pos_input_method_fail_transaction (self, transaction,
+                                         POS_INPUT_METHOD_TRANSACTION_LIFETIME);
+    } else {
+      g_debug ("Commit %u was discarded after %u done event(s), re-sending as %u",
+               transaction->serial, transaction->dones_at_barrier, self->serial);
+      pos_input_method_send_transaction (self, transaction);
+    }
+  } else if (transaction->dones > 0) {
+    /* A `done` between the barriers: the compositor handled them in
+     * different reads and may have discarded the commit or applied it before
+     * the application reported this change. Re-sending could apply it
+     * twice, so it is not re-sent. */
+    pos_input_method_fail_transaction (self, transaction,
+                                       POS_INPUT_METHOD_TRANSACTION_UNCONFIRMED);
+  } else {
     /* Nothing advanced the compositor's serial first: the commit was applied */
     pos_im_transaction_free (transaction);
-  } else if (!self->submitted->active) {
-    g_debug ("Dropping commit %u discarded while inactive", transaction->serial);
-    pos_im_transaction_free (transaction);
-  } else {
-    g_debug ("Commit %u was discarded after %u done event(s), re-sending as %u",
-             transaction->serial, transaction->dones, self->serial);
-    pos_input_method_send_transaction (self, transaction);
   }
 
   pos_input_method_dispatch (self);
@@ -252,7 +342,8 @@ on_barrier_done (void *data, struct wl_callback *callback, uint32_t time)
 
 
 /* Text issued for the previous activation must neither reach the text input
- * focused now nor be re-sent into it. */
+ * focused now nor be re-sent into it. The owner resets its own state on
+ * activation changes, so nothing is reported. */
 static void
 pos_input_method_drop_transactions (PosInputMethod *self)
 {
@@ -260,6 +351,41 @@ pos_input_method_drop_transactions (PosInputMethod *self)
     self->in_flight->dropped = TRUE;
   g_queue_clear_full (&self->queued, (GDestroyNotify) pos_im_transaction_free);
   g_clear_pointer (&self->building, pos_im_transaction_free);
+}
+
+
+/* The application changed text or cursor itself. Deleting relative to the
+ * cursor that was current when a transaction was formed is no longer what was
+ * asked for, so such transactions are given up on; literal text and preedit
+ * are kept for the new cursor. Returns the number of queued transactions
+ * removed; the caller reports them once the applied state is visible. */
+static guint
+pos_input_method_cancel_context_dependent (PosInputMethod *self)
+{
+  GList *link = self->queued.head;
+  guint removed = 0;
+
+  if (self->in_flight && self->in_flight->context_dependent)
+    self->in_flight->cancelled = TRUE;
+
+  while (link) {
+    GList *next = link->next;
+    PosImTransaction *transaction = link->data;
+
+    if (transaction->context_dependent) {
+      g_debug ("Cancelling a queued deletion after the application changed the text");
+      g_queue_delete_link (&self->queued, link);
+      pos_im_transaction_free (transaction);
+      removed++;
+    }
+    link = next;
+  }
+  if (self->building && self->building->context_dependent) {
+    g_clear_pointer (&self->building, pos_im_transaction_free);
+    removed++;
+  }
+
+  return removed;
 }
 
 
@@ -280,6 +406,8 @@ pos_input_method_add_request (PosInputMethod   *self,
   if (!self->building)
     self->building = pos_im_transaction_new ();
   g_array_append_val (self->building->requests, request);
+  if (kind == POS_IM_REQUEST_DELETE && (first || second))
+    self->building->context_dependent = TRUE;
 }
 
 
@@ -294,6 +422,7 @@ handle_activate (void                       *data,
   if (self->pending->active == TRUE)
     return;
 
+  self->activation_epoch++;
   self->pending->active = TRUE;
   g_clear_pointer (&self->pending->surrounding_text, g_free);
   self->pending->text_change_cause = POS_INPUT_METHOD_TEXT_CHANGE_CAUSE_IM;
@@ -314,6 +443,7 @@ handle_deactivate (void                       *data,
   if (self->pending->active == FALSE)
     return;
 
+  self->activation_epoch++;
   self->pending->active = FALSE;
   g_signal_emit (self, signals[PENDING_CHANGED], 0, self->pending);
 }
@@ -384,6 +514,7 @@ handle_done (void                       *data,
 {
   PosInputMethod *self = POS_INPUT_METHOD (data);
   g_autoptr (PosImState) current = self->submitted;
+  guint cancelled = 0;
 
   g_debug ("%s", __func__);
 
@@ -395,10 +526,17 @@ handle_done (void                       *data,
 
   self->submitted = pos_im_state_dup (self->pending);
 
-  if (current->active != self->submitted->active) {
+  /* Activation changes count even when a deactivate and activate pair is
+   * applied by one `done` and the input method ends up active again. */
+  if (self->applied_epoch != self->activation_epoch) {
+    self->applied_epoch = self->activation_epoch;
     pos_input_method_drop_transactions (self);
-    g_object_notify_by_pspec (G_OBJECT (self), props[PROP_ACTIVE]);
+  } else if (self->submitted->text_change_cause != POS_INPUT_METHOD_TEXT_CHANGE_CAUSE_IM) {
+    cancelled = pos_input_method_cancel_context_dependent (self);
   }
+
+  if (current->active != self->submitted->active)
+    g_object_notify_by_pspec (G_OBJECT (self), props[PROP_ACTIVE]);
 
   if (g_strcmp0 (current->surrounding_text, self->submitted->surrounding_text) ||
       current->cursor != self->submitted->cursor ||
@@ -417,6 +555,10 @@ handle_done (void                       *data,
   g_signal_emit (self, signals[DONE], 0);
 
   g_object_thaw_notify (G_OBJECT (self));
+
+  for (guint i = 0; i < cancelled; i++)
+    g_signal_emit (self, signals[TRANSACTION_FAILED], 0,
+                   POS_INPUT_METHOD_TRANSACTION_CONTEXT_CHANGED);
 }
 
 
@@ -448,6 +590,9 @@ pos_input_method_set_property (GObject      *object,
   PosInputMethod *self = POS_INPUT_METHOD (object);
 
   switch (property_id) {
+  case PROP_DISPLAY:
+    self->display = g_value_get_pointer (value);
+    break;
   case PROP_SEAT:
     self->seat = g_value_get_pointer (value);
     break;
@@ -497,9 +642,9 @@ pos_input_method_constructed (GObject *object)
 {
   PosInputMethod *self = POS_INPUT_METHOD(object);
 
+  g_assert (self->display);
   g_assert (self->seat);
   g_assert (self->manager);
-  g_assert (self->seat && self->manager);
 
   self->input_method = zwp_input_method_manager_v2_get_input_method (self->manager,
                                                                        self->seat);
@@ -513,7 +658,8 @@ pos_input_method_finalize (GObject *object)
 {
   PosInputMethod *self = POS_INPUT_METHOD(object);
 
-  g_clear_pointer (&self->barrier, wl_callback_destroy);
+  g_clear_pointer (&self->barrier_before, wl_callback_destroy);
+  g_clear_pointer (&self->barrier_after, wl_callback_destroy);
   g_clear_pointer (&self->in_flight, pos_im_transaction_free);
   g_queue_clear_full (&self->queued, (GDestroyNotify) pos_im_transaction_free);
   g_clear_pointer (&self->building, pos_im_transaction_free);
@@ -535,6 +681,15 @@ pos_input_method_class_init (PosInputMethodClass *klass)
   object_class->set_property = pos_input_method_set_property;
   object_class->get_property = pos_input_method_get_property;
 
+  /**
+   * PosInputMethod:display:
+   *
+   * The wl_display the manager and seat belong to.
+   */
+  props[PROP_DISPLAY] =
+    g_param_spec_pointer ("display", "", "",
+                          G_PARAM_WRITABLE |
+                          G_PARAM_CONSTRUCT_ONLY | G_PARAM_STATIC_STRINGS);
   /**
    * PosInputMethod:manager:
    *
@@ -641,6 +796,24 @@ pos_input_method_class_init (PosInputMethodClass *klass)
                   G_TYPE_NONE,
                   1,
                   G_TYPE_POINTER);
+  /**
+   * PosInputMethod::transaction-failed:
+   * @im: The input method
+   * @reason: Why the transaction was given up on
+   *
+   * A committed transaction will not be applied, or cannot be confirmed to
+   * have been, see [enum@PosInputMethodTransactionFailure]. Everything
+   * committed before it is unaffected; transactions committed after it are
+   * still sent in order.
+   */
+  signals[TRANSACTION_FAILED] =
+    g_signal_new ("transaction-failed",
+                  G_TYPE_FROM_CLASS (klass),
+                  G_SIGNAL_RUN_LAST,
+                  0, NULL, NULL, NULL,
+                  G_TYPE_NONE,
+                  1,
+                  POS_TYPE_INPUT_METHOD_TRANSACTION_FAILURE);
 }
 
 
@@ -654,10 +827,11 @@ pos_input_method_init (PosInputMethod *self)
 
 
 PosInputMethod *
-pos_input_method_new (gpointer manager, gpointer seat)
+pos_input_method_new (gpointer display, gpointer manager, gpointer seat)
 {
-  g_assert (seat && manager);
+  g_assert (display && seat && manager);
   return g_object_new (POS_TYPE_INPUT_METHOD,
+                       "display", display,
                        "manager", manager,
                        "seat", seat,
                        NULL);
@@ -789,21 +963,39 @@ pos_input_method_delete_surrounding_text (PosInputMethod *self,
  *
  * The compositor (wlroots `types/wlr_input_method_v2.c`) applies a commit
  * only when its serial equals the number of `done` events it has sent and
- * otherwise silently resets the pending requests. It does not answer commits:
- * Phoc (`src/input-method-relay.c`) sends `done` only for the application's
- * own text-input updates, for activation changes and after submitting the
- * preedit itself, so an application update already on its way makes a
- * commit stale and nothing announces the loss.
+ * otherwise silently resets the pending requests. It does not answer
+ * commits: Phoc (`src/input-method-relay.c`) sends `done` only for the
+ * application's own text-input updates, for activation changes and after
+ * submitting the preedit itself. Transactions are therefore sent one at a
+ * time in commit order, each between two `wl_display.sync` barriers.
  *
- * Transactions are therefore sent one at a time, in commit order, each
- * behind a `wl_display.sync` barrier. Distinct transactions never share the
- * compositor's single pending state, so none is merged into or overwritten
- * by another. A transaction the compositor discarded because a `done` was
- * applied while it was in flight is re-sent with the current serial as long
- * as the same activation lasts, so it is applied exactly once. Transactions
- * issued before an activation change are dropped instead of reaching the
- * text input focused afterwards. No `done` is ever waited for: a preedit or
- * text change the application does not report holds nothing back.
+ * For such a compositor this guarantees:
+ *
+ * - Distinct transactions are applied separately and in order; none shares
+ *   the compositor's single pending state with another.
+ * - No transaction is applied twice. It is re-sent only when a `done` was
+ *   applied before its leading barrier returned, which proves the compositor
+ *   discarded it, and only while the same activation lasts.
+ * - No `done` is waited for, so a change the application never reports
+ *   holds nothing back.
+ *
+ * And this is the limit: when the compositor handles the leading barrier and
+ * the commit in different reads and issues a `done` in between, the client
+ * cannot tell a discarded commit from one applied before the application
+ * reported that change. Such a transaction is not re-sent and is reported as
+ * `POS_INPUT_METHOD_TRANSACTION_UNCONFIRMED`; it may have been lost.
+ *
+ * A transaction that deletes surrounding text is given up on, and reported,
+ * if the application reports a text or cursor change of its own while it
+ * waits; its offsets were relative to the cursor that has moved. Literal
+ * text and preedit are re-sent for the new cursor. Re-sends stop at
+ * `POS_INPUT_METHOD_SEND_LIMIT` sends or
+ * `POS_INPUT_METHOD_TRANSACTION_LIFETIME_MS`, at most
+ * `POS_INPUT_METHOD_QUEUE_LIMIT` transactions wait to be sent, and every
+ * transaction given up on is reported through
+ * `PosInputMethod::transaction-failed`. Transactions committed before an
+ * activation change are dropped without report; the owner resets its own
+ * state on activation changes.
  */
 void
 pos_input_method_commit (PosInputMethod *self)
@@ -812,6 +1004,13 @@ pos_input_method_commit (PosInputMethod *self)
 
   if (!transaction)
     transaction = pos_im_transaction_new ();
+  transaction->created = g_get_monotonic_time ();
+
+  if (g_queue_get_length (&self->queued) >= POS_INPUT_METHOD_QUEUE_LIMIT) {
+    pos_input_method_fail_transaction (self, transaction,
+                                       POS_INPUT_METHOD_TRANSACTION_QUEUE_FULL);
+    return;
+  }
   g_queue_push_tail (&self->queued, transaction);
 
   pos_input_method_dispatch (self);

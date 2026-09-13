@@ -272,6 +272,15 @@ pos_wayland_get_default (void)
 }
 
 
+struct wl_display *
+pos_wayland_get_wl_display (PosWayland *self)
+{
+  g_assert (POS_IS_WAYLAND (self));
+
+  return self->display;
+}
+
+
 struct zwp_input_method_manager_v2 *
 pos_wayland_get_zwp_input_method_manager_v2 (PosWayland *self)
 {
