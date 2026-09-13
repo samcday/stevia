@@ -126,6 +126,7 @@ struct _PosCompleterVerbisage {
   gboolean replay_is_preedit;
   gboolean replaying;
   gboolean replaying_key;
+  gboolean replay_commit_seen;
   guint replay_ack_timeout;
   char *language;
   GDBusConnection *connection;
@@ -477,6 +478,25 @@ swipe_replay_ack_timeout (gpointer data)
 }
 
 
+/* Every commit the completer makes goes through here, so a replayed key can
+ * tell whether it actually changed the application's text. */
+static void
+swipe_emit_commit (PosCompleterVerbisage *self, const char *text, int before, int after)
+{
+  self->replay_commit_seen = TRUE;
+  g_signal_emit_by_name (self, "commit-string", text, before, after);
+}
+
+
+static void
+swipe_cancel_acknowledgement (PosCompleterVerbisage *self)
+{
+  self->replay_pending = FALSE;
+  self->replay_is_preedit = FALSE;
+  g_clear_handle_id (&self->replay_ack_timeout, g_source_remove);
+}
+
+
 static void
 swipe_await_acknowledgement (PosCompleterVerbisage *self, gboolean is_preedit)
 {
@@ -711,11 +731,23 @@ swipe_advance (PosCompleterVerbisage *self)
       g_autofree char *symbol = g_strdup (head->symbol);
 
       g_ptr_array_remove_index (self->swipe_entries, 0);
+      /* A key can commit text of its own - a separator, or a tap accepting the
+       * guess on screen. Expect an acknowledgement around it so the
+       * application's update for that commit is recognised as ours, instead of
+       * looking like someone else editing and cancelling what follows. The
+       * entry is already gone, so the acknowledgement plays nothing. */
+      self->replay_commit_seen = FALSE;
+      swipe_await_acknowledgement (self, TRUE);
       /* Replayed through the keyboard's own dispatch, so an unhandled key
        * such as Enter still reaches the virtual keyboard. */
       self->replaying_key = TRUE;
       g_signal_emit_by_name (self, "swipe-replay-key", symbol);
       self->replaying_key = FALSE;
+      if (!self->replay_commit_seen) {
+        /* The key only changed the preedit, which the application does not
+         * report back; there is nothing to wait for. */
+        swipe_cancel_acknowledgement (self);
+      }
       continue;
     }
 
@@ -749,7 +781,7 @@ swipe_advance (PosCompleterVerbisage *self)
       publish_completions (self);
       g_object_notify_by_pspec (G_OBJECT (self), props[PROP_PREEDIT]);
       g_object_thaw_notify (G_OBJECT (self));
-      g_signal_emit_by_name (self, "commit-string", text, 0, 0);
+      swipe_emit_commit (self, text, 0, 0);
       break;
     }
 
@@ -1346,7 +1378,7 @@ pos_completer_verbisage_feed_symbol (PosCompleter *iface, const char *symbol)
     if (pos_completer_base_wants_punctuation_swap (base, symbol) && self->preedit->len == 2)
       before = 1;
     cancel_lookup (self);
-    g_signal_emit_by_name (self, "commit-string", self->preedit->str, before, 0);
+    swipe_emit_commit (self, self->preedit->str, before, 0);
     pos_completer_verbisage_set_preedit (iface, NULL);
     return g_strcmp0 (symbol, "KEY_ENTER") != 0;
   }
@@ -1373,11 +1405,11 @@ pos_completer_verbisage_set_surrounding_text (PosCompleter *iface,
       !g_strcmp0 (pos_completer_base_get_after_text (base), after ?: ""))
     return;
   self->context_available = before != NULL && after != NULL;
-  /* A replayed commit changes the text itself, and the surface tells us which
-   * update is that acknowledgement. Any other change is the application or the
-   * user moving, which invalidates gestures that have not been played; text
-   * that is already committed is untouched. */
-  if (!self->replay_pending)
+  /* Our own commits change the text too. The keyboard says so before each one
+   * (expect_commit), and a replay additionally waits for it. Anything else is
+   * the application or the user moving, which invalidates gestures that have
+   * not been played; text that is already committed is untouched. */
+  if (!self->replay_pending && !self->awaiting_context)
     pos_completer_verbisage_invalidate_swipes (self);
   pos_completer_base_set_surrounding_text (base, before, after);
   self->awaiting_context = FALSE;
@@ -1577,9 +1609,14 @@ pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
       g_variant_n_children (trace) < 2 || g_variant_n_children (trace) > 512 ||
       g_variant_n_children (keys) == 0 || g_variant_n_children (keys) > 64)
     return FALSE;
-  /* Typed text in progress is not a gesture boundary. */
-  if (self->preedit->len && self->swipe_state != SWIPE_PREEDIT)
+  /* Typed text in progress is not a gesture boundary - including text that is
+   * still waiting its turn behind unplayed gestures. Without this the word
+   * being typed would be replaced by the gesture when replay reached it. */
+  if (!pos_completer_verbisage_at_word_boundary (self)) {
+    g_debug ("A word is still being typed; refusing the gesture");
+    g_signal_emit_by_name (self, "swipe-feedback", "not-at-boundary");
     return FALSE;
+  }
 
   if (swipe_count (self, SWIPE_ENTRY_GESTURE) >= MAX_SWIPE_JOBS) {
     /* Refuse the newest gesture; every word already accepted is kept. */
@@ -1649,6 +1686,24 @@ pos_completer_verbisage_replay_pending (PosCompleterVerbisage *self)
 
 
 /**
+ * pos_completer_verbisage_replay_untracked:
+ *
+ * The keyboard could not record what text state the commit it just made should
+ * produce, so nothing will ever acknowledge it. Carry on rather than wait for
+ * an acknowledgement that cannot arrive.
+ */
+void
+pos_completer_verbisage_replay_untracked (PosCompleterVerbisage *self)
+{
+  g_return_if_fail (POS_IS_COMPLETER_VERBISAGE (self));
+
+  if (!self->replay_pending || !self->replay_is_preedit)
+    return;
+  swipe_cancel_acknowledgement (self);
+}
+
+
+/**
  * pos_completer_verbisage_replay_acknowledged:
  *
  * The application acknowledged the exact commit the replay expected, so the
@@ -1669,6 +1724,50 @@ pos_completer_verbisage_replay_acknowledged (PosCompleterVerbisage *self)
   self->replay_is_preedit = FALSE;
   swipe_dispatch (self);
   swipe_advance (self);
+}
+
+
+/**
+ * pos_completer_verbisage_at_word_boundary:
+ *
+ * Whether a gesture may start now, judged against everything already accepted
+ * rather than only what is on screen. A key waiting behind unplayed gestures
+ * will leave a word being typed when its turn comes, and a gesture accepted
+ * now would replace that word instead of following it.
+ *
+ * Returns: %TRUE when a gesture would land at a word boundary.
+ */
+gboolean
+pos_completer_verbisage_at_word_boundary (PosCompleterVerbisage *self)
+{
+  gboolean typing;
+
+  g_return_val_if_fail (POS_IS_COMPLETER_VERBISAGE (self), FALSE);
+
+  /* Where the text will stand once everything accepted has been played. */
+  typing = self->preedit->len && self->swipe_state != SWIPE_PREEDIT;
+  for (guint i = 0; self->swipe_entries && i < self->swipe_entries->len; i++) {
+    SwipeEntry *entry = g_ptr_array_index (self->swipe_entries, i);
+
+    if (entry->kind == SWIPE_ENTRY_GESTURE) {
+      /* A recognized word becomes the guess on screen, which a following
+       * gesture commits rather than replaces. */
+      typing = FALSE;
+      continue;
+    }
+    if (g_str_equal (entry->symbol, "KEY_BACKSPACE")) {
+      /* It may or may not empty the word; treat it as still typing, which is
+       * the conservative answer. */
+      continue;
+    }
+    if (g_str_has_prefix (entry->symbol, "KEY_") ||
+        pos_completer_symbol_is_word_separator (entry->symbol, NULL)) {
+      typing = FALSE;
+      continue;
+    }
+    typing = TRUE;
+  }
+  return !typing;
 }
 
 
@@ -1705,8 +1804,10 @@ pos_completer_verbisage_cancel_newest_swipe (PosCompleterVerbisage *self)
 
     if (entry->kind != SWIPE_ENTRY_GESTURE)
       continue;
-    /* The head is off limits while its commit is in flight. */
-    if (i == 1 && self->replay_pending)
+    /* Only the entry whose own commit is in flight is off limits. A commit
+     * made for the guess on screen played no entry, so the head behind it is
+     * still the newest unplayed gesture and may be taken back. */
+    if (i == 1 && self->replay_pending && !self->replay_is_preedit)
       return FALSE;
     if (entry->state == SWIPE_JOB_RUNNING)
       self->swipe_running--;
@@ -1780,7 +1881,7 @@ pos_completer_verbisage_accept_swipe (PosCompleterVerbisage *self)
   /* Clear the composition marker before emitting to prevent a second accept
    * from a synchronous signal handler. Match the ordinary commit ordering. */
   cancel_lookup (self);
-  g_signal_emit_by_name (self, "commit-string", text, 0, 0);
+  swipe_emit_commit (self, text, 0, 0);
   pos_completer_verbisage_set_preedit (POS_COMPLETER (self), NULL);
   return TRUE;
 }

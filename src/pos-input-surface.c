@@ -184,6 +184,9 @@ struct _PosInputSurface {
 
 
 static void pos_input_surface_submit_symbol (PosInputSurface *self, const char *symbol);
+static void pos_input_surface_submit_symbol_full (PosInputSurface *self,
+                                                  const char      *symbol,
+                                                  gboolean         physical);
 static void select_layout_by_im_purpose (PosInputSurface *self);
 static void update_swipe_enabled (PosInputSurface *self);
 
@@ -607,9 +610,9 @@ on_osk_swipe (PosInputSurface *self, GVariant *trace, GVariant *keys, GtkWidget 
   completer = POS_COMPLETER_VERBISAGE (self->completer);
   capitalization = pos_osk_widget_get_swipe_capitalization (POS_OSK_WIDGET (osk));
   /* The queue owns ordering: it commits the word on screen and any words
-   * before this one first, each waiting for its acknowledgement. */
-  if (!pos_completer_verbisage_recognize_swipe (completer, trace, keys, capitalization))
-    pos_input_surface_trigger_feedback (self, KEY_PRESS_EVENT);
+   * before this one first, each waiting for its acknowledgement. A refusal it
+   * can explain plays its own feedback, so nothing is added here. */
+  pos_completer_verbisage_recognize_swipe (completer, trace, keys, capitalization);
 }
 
 
@@ -779,19 +782,26 @@ on_completer_commit_string (PosInputSurface *self,
   clear_completion_undo (self);
   g_debug ("%s: %s, (%d,%d)", __func__, text, before, after);
 
-  /* A replayed word only counts once the application shows it, so record the
-   * exact text state to wait for before the next word is played. */
+  /* A replayed commit only counts once the application shows it, so record the
+   * exact text state to wait for before the next word or key is played. */
   g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
-  if (replaying && !before && !after) {
+  if (replaying) {
     const char *surrounding;
     guint anchor, cursor;
 
     surrounding = pos_input_method_get_surrounding_text (self->input_method, &anchor, &cursor);
     /* No preedit is restored from this: it only records the text state the
-     * replayed word must produce. */
-    self->swipe_replay_ack =
-      pos_completion_undo_new (surrounding, cursor, anchor, text, "", NULL, NULL,
-                               pos_input_method_get_serial (self->input_method));
+     * replayed commit must produce. */
+    if (!before && !after) {
+      self->swipe_replay_ack =
+        pos_completion_undo_new (surrounding, cursor, anchor, text, "", NULL, NULL,
+                                 pos_input_method_get_serial (self->input_method));
+    }
+    if (!self->swipe_replay_ack) {
+      /* A commit that also deletes, or one this state cannot describe, has no
+       * expectation to match; say so instead of leaving replay waiting. */
+      pos_completer_verbisage_replay_untracked (POS_COMPLETER_VERBISAGE (self->completer));
+    }
   }
 
   if (before || after)
@@ -875,7 +885,9 @@ on_completer_replay_key (PosInputSurface *self, const char *symbol)
 {
   g_assert (POS_IS_INPUT_SURFACE (self));
 
-  pos_input_surface_submit_symbol (self, symbol);
+  /* The press and release this key came from are long over: apply what the
+   * symbol does, without the hold and repeat state of a finger on a key. */
+  pos_input_surface_submit_symbol_full (self, symbol, FALSE);
 }
 
 
@@ -935,11 +947,27 @@ on_osk_key_symbol (PosInputSurface *self, const char *symbol)
 static void
 pos_input_surface_submit_symbol (PosInputSurface *self, const char *symbol)
 {
+  pos_input_surface_submit_symbol_full (self, symbol, TRUE);
+}
+
+
+static void
+pos_input_surface_submit_symbol_full (PosInputSurface *self,
+                                      const char      *symbol,
+                                      gboolean         physical)
+{
   gboolean handled, is_bs;
 
-  g_debug ("Key: '%s' symbol", symbol);
+  g_debug ("Key: '%s' symbol%s", symbol, physical ? "" : " (replayed)");
 
-  is_bs = pos_input_surface_set_backspace_pressed (self, symbol);
+  /* Press bookkeeping belongs to a finger that is actually on the key. A
+   * replayed symbol has no press to hold and no release to come, so it must
+   * not arm the repeat timer that a hold would. */
+  if (physical) {
+    is_bs = pos_input_surface_set_backspace_pressed (self, symbol);
+  } else {
+    is_bs = symbol && g_str_equal (symbol, "KEY_BACKSPACE");
+  }
   if (is_bs && !self->latched_modifiers && undo_completion (self))
     return;
   clear_completion_undo (self);
@@ -2895,6 +2923,11 @@ pos_input_surface_set_visible (PosInputSurface *self, gboolean visible)
     return;
 
   clear_edit_history (self);
+  if (!visible) {
+    /* A hidden keyboard has no place to play accepted gestures into, and the
+     * text may be anywhere by the time it returns. */
+    invalidate_swipe_queue (self);
+  }
   self->surface_visible = visible;
   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_SURFACE_VISIBLE]);
 

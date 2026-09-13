@@ -20,9 +20,11 @@ gboolean pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
                                                  GVariant *keys,
                                                  guint capitalization);
 
+gboolean pos_completer_verbisage_at_word_boundary (PosCompleterVerbisage *self);
 guint    pos_completer_verbisage_pending_swipes (PosCompleterVerbisage *self);
 gboolean pos_completer_verbisage_replay_pending (PosCompleterVerbisage *self);
 void     pos_completer_verbisage_replay_acknowledged (PosCompleterVerbisage *self);
+void     pos_completer_verbisage_replay_untracked (PosCompleterVerbisage *self);
 gboolean pos_completer_verbisage_cancel_newest_swipe (PosCompleterVerbisage *self);
 void     pos_completer_verbisage_invalidate_swipes (PosCompleterVerbisage *self);
 void pos_completer_verbisage_cancel_swipe (PosCompleterVerbisage *self);
