@@ -55,9 +55,11 @@ env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY="stevia-tes
            GDK_BACKEND="wayland", GTK_IM_MODULE="wayland", GSK_RENDERER="cairo",
            GTK_A11Y="none", GSETTINGS_BACKEND="memory", NO_AT_BRIDGE="1",
            GTK_USE_PORTAL="0", GSETTINGS_SCHEMA_DIR=str(Path(args.schema_dir).resolve()),
-           POS_TEST_LAYOUT="us", POS_TEST_COMPLETER="verbisage", POS_DEBUG="force-show",
-           # Only the controllable-service cases hold requests this long.
-           POS_TEST_SWIPE_TIMEOUT_MS="8000" if args.case.startswith("queue-") else "")
+           POS_TEST_LAYOUT="us", POS_TEST_COMPLETER="verbisage", POS_DEBUG="force-show")
+# Only the controllable-service cases hold real requests this long; every other
+# case must use the keyboard's ordinary recognition timeout.
+if args.case.startswith("queue-"):
+    env["POS_TEST_SWIPE_TIMEOUT_MS"] = "8000"
 env.pop("LD_LIBRARY_PATH", None)
 env.pop("LD_PRELOAD", None)
 env.pop("GLYCIN_DISABLE_SANDBOX", None)

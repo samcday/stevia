@@ -528,7 +528,9 @@ on_swipe_job_finished (GObject *source, GAsyncResult *result, gpointer user_data
                                           swipe_retry_timeout, retry, swipe_retry_free);
       return;
     }
-    g_debug ("Recognition failed for gesture %" G_GUINT64_FORMAT, job->id);
+    /* The service's own message; it never contains user text. */
+    g_debug ("Recognition failed for gesture %" G_GUINT64_FORMAT ": %s", job->id,
+             error ? error->message : "no reply");
     job->state = SWIPE_JOB_FAILED;
     swipe_advance (self);
     return;
@@ -565,7 +567,7 @@ swipe_request_timeout (void)
   if (timeout < 0) {
     const char *configured = g_getenv ("POS_TEST_SWIPE_TIMEOUT_MS");
 
-    timeout = configured ? MAX (atoi (configured), 1) : LOOKUP_TIMEOUT_MS;
+    timeout = (configured && atoi (configured) > 0) ? atoi (configured) : LOOKUP_TIMEOUT_MS;
   }
   return timeout;
 }
