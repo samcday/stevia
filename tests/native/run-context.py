@@ -24,8 +24,9 @@ parser.add_argument("--stevia", default="/usr/bin/phosh-osk-stevia",
 parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swipe-rapid", "swipe-undo", "swipe-edit", "swipe-focus", "swipe-shift", "typed-undo", "typed-reselect", "undo-focus", "literal", "context-chain", "context-prefix", "context-swipe", "context-undo", "queue-overlap", "queue-enter", "queue-field-switch", "queue-failure", "queue-barrier", "queue-midword", "queue-second-field", "queue-cursor-move", "queue-hide", "queue-middle-failure", "queue-backspace-repeat", "queue-geometry", "queue-overflow", "queue-ack-expiry",
                                        "queue-punctuation", "queue-last-key-ack",
                                        "queue-ack-expiry-last-key", "queue-reverse-barrier",
-                                       "queue-middle-timeout", "queue-pending-ack-disable",
-                                       "queue-backspace-hold"], default="literal")
+                                       "queue-middle-timeout", "queue-pending-ack-reset",
+                                       "queue-backspace-hold", "queue-enter-suffix",
+                                       "queue-backspace-suffix"], default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
                     help="Dictionary used by the service; recorded for provenance")
@@ -129,19 +130,24 @@ env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY="stevia-tes
            XDG_CONFIG_HOME=str(output / "config"), XDG_DATA_HOME=str(output / "data"),
            WLR_BACKENDS="headless", WLR_HEADLESS_OUTPUTS="1", WLR_RENDERER="pixman",
            GDK_BACKEND="wayland", GTK_IM_MODULE="wayland", GSK_RENDERER="cairo",
-           GTK_A11Y="none", GSETTINGS_BACKEND="memory", NO_AT_BRIDGE="1",
+           GTK_A11Y="none", NO_AT_BRIDGE="1",
            GTK_USE_PORTAL="0", GSETTINGS_SCHEMA_DIR=str(Path(args.schema_dir).resolve()),
            POS_TEST_LAYOUT="us", POS_TEST_COMPLETER="verbisage", POS_DEBUG="force-show")
+# The reset case changes a real setting and needs the change to reach Stevia.
+# The keyfile backend is shared through this run's private XDG_CONFIG_HOME, so
+# the gsettings subprocess and the keyboard really see the same value. Every
+# other case stays on the process-local memory backend.
+env["GSETTINGS_BACKEND"] = ("keyfile" if args.case == "queue-pending-ack-reset"
+                            else "memory")
 # Only the controllable-service cases hold real requests this long; every other
 # case must use the keyboard's ordinary recognition timeout.
 if args.case.startswith("queue-"):
     env["POS_TEST_SWIPE_TIMEOUT_MS"] = "8000"
-# The ordering case deliberately freezes the application to leave a commit
-# waiting with nothing queued behind it. The keyboard has to keep waiting for
-# that acknowledgement through the freeze instead of dropping it at the ordinary
-# two-second deadline, so only this case lengthens the deadline. The expiry
-# cases below keep the production default and depend on it.
-if args.case == "queue-last-key-ack":
+# These cases deliberately freeze the application to build up a replay that is
+# waiting. The keyboard has to keep waiting through the freeze instead of
+# dropping it at the ordinary two-second deadline, so only these lengthen the
+# deadline. The expiry cases keep the production default and depend on it.
+if args.case in ("queue-last-key-ack", "queue-backspace-suffix", "queue-pending-ack-reset"):
     env["POS_TEST_SWIPE_ACK_TIMEOUT_MS"] = "60000"
 env.pop("LD_LIBRARY_PATH", None)
 env.pop("LD_PRELOAD", None)
@@ -411,7 +417,16 @@ def set_swipe_typing(enabled):
     time.sleep(.4)
 
 
-def drag_word(word, expected, *, focus_away=False, trail=False, wait=True, allow_words=None):
+def gsettings_value(schema, key):
+    """The effective value of a setting, read through the same backend."""
+    call = subprocess.run(["gsettings", "get", schema, key], env=env,
+                          capture_output=True, text=True, timeout=5)
+    assert call.returncode == 0, f"gsettings get: {call.stderr.strip()}"
+    return call.stdout.strip()
+
+
+def drag_word(word, expected, *, focus_away=False, trail=False, wait=True, allow_words=None,
+              assert_first=True):
     before_buffer, before_preedit = state("buffer"), state("preedit")
     rows = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
     controls = []
@@ -468,7 +483,7 @@ def drag_word(word, expected, *, focus_away=False, trail=False, wait=True, allow
         return
     expected_buffer = before_buffer + (before_preedit + " " if before_preedit else "")
     wait_state(expected_buffer, expected, f"swipe editable guess {expected}")
-    if not before_preedit:
+    if not before_preedit and assert_first:
         assert not any(e["event"] == "buffer" and e["text"] != before_buffer for e in events()), \
             "First swipe committed text before acceptance"
     if trail:
@@ -494,8 +509,8 @@ def drag_word(word, expected, *, focus_away=False, trail=False, wait=True, allow
     screenshot(f"swipe-{number}-preedit.png", settle=True)
 
 
-def hold_at(x, y, milliseconds):
-    """Press and hold a point for the given time, then release it.
+def hold_and_watch(x, y, milliseconds):
+    """Press and hold a point, recording every distinct buffer while held.
 
     The pointer stays still, so this is a real finger resting on a key rather
     than the click the other helpers send. It is how the physical repeat path
@@ -509,10 +524,21 @@ def hold_at(x, y, milliseconds):
                             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, start_new_session=True)
     processes.append(hold)
+    observed = []
+    while hold.poll() is None:
+        current = state("buffer")
+        if not observed or observed[-1] != current:
+            observed.append(current)
+        time.sleep(.05)
     assert hold.wait(timeout=8) == 0, hold.stderr.read()
     processes.remove(hold)
     result["actions"].append({"step": f"hold released {x},{y}",
-                              "time": time.monotonic()})
+                              "time": time.monotonic(), "observed": observed})
+    time.sleep(.1)
+    current = state("buffer")
+    if not observed or observed[-1] != current:
+        observed.append(current)
+    return observed
 
 
 try:
@@ -621,6 +647,14 @@ try:
             assert "button-pressed" in feedback_requests(), \
                 f"no missing-acknowledgement feedback: {feedback_requests()}"
             result["feedback_before_thaw"] = feedback_requests()
+            # Both the completer's wait and the surface expectation must be
+            # cleared at expiry, before the application can deliver a late
+            # matching update that would clear the expectation for them.
+            log = (output / "stevia.log").read_text(errors="replace")
+            assert "A replayed word was never acknowledged" in log, \
+                "the completer did not give up before the application resumed"
+            assert "Dropped the replay expectation the queue gave up on" in log, \
+                "the surface expectation was not cleared at expiry"
             thaw_probe()
 
             service_control("Hold", "false")
@@ -739,27 +773,43 @@ try:
             service_control("Hold", "false")
             drag_word("hello", "word3")
             wait_state("", "word3", "fresh gesture works after showing it again")
-        elif args.case == "queue-pending-ack-disable":
-            # A commit waiting to be acknowledged when swipe typing is switched
-            # off must not be replayed against whatever text the surface sees
-            # afterwards: the reset has to forget the expectation, while the
-            # commit already on its way still reaches the application.
+        elif args.case == "queue-pending-ack-reset":
+            # Space is queued while the recognition is still held, so releasing
+            # it leaves a real replay acknowledgement pending with x and Space
+            # behind it. Resetting swipe typing must drop that suffix without a
+            # late acknowledgement first replaying it. The setting change has to
+            # reach Stevia, so this case uses the shared keyfile backend.
             drag_word("hello", None, wait=False, allow_words=allowed)
             wait_held_requests(1, "recognition outstanding")
+            key(" ")
+            key("x")
+            key(" ")
+
             freeze_probe()
             service_control("Release", "0", "alpha")
-            time.sleep(.4)
-            # The queued key commits the guess and now waits for the
-            # acknowledgement the frozen application cannot send.
-            key(" ")
-            time.sleep(.3)
+            time.sleep(.6)
+            # The commit really is waiting: the application is stopped and the
+            # queued x and Space have not been replayed.
+            result["keyboard_commit_before_reset"] = "commit_string(\"alpha \")" in \
+                (output / "stevia.log").read_text(errors="replace")
+            assert result["keyboard_commit_before_reset"], \
+                "the replay commit was not waiting before the reset"
+
             set_swipe_typing(False)
+            assert "Swipe typing disabled; dropping accepted gestures" in \
+                (output / "stevia.log").read_text(errors="replace"), \
+                "the setting change did not reach Stevia's reset handler"
+            assert gsettings_value("mobi.phosh.osk", "swipe-typing") == "false", \
+                "the effective setting did not change"
             thaw_probe()
-            time.sleep(.8)
+            time.sleep(1.0)
+            # The late commit lands, but the queued suffix was dropped by the
+            # reset rather than replayed after the acknowledgement.
             assert state("buffer") == "alpha ", \
-                f"the committed text was lost: {state('buffer')!r}"
-            assert "button-pressed" not in feedback_requests(), \
-                f"the reset was reported as a failure: {feedback_requests()}"
+                f"the queued suffix was not dropped: {state('buffer')!r}"
+            assert state("preedit") == "", \
+                f"a word was replayed after the reset: {state('preedit')!r}"
+
             set_swipe_typing(True)
             service_control("Hold", "false")
             drag_word("hello", "word2")
@@ -853,22 +903,63 @@ try:
             time.sleep(2.0)
             assert state("buffer") == "alpha x" and state("preedit") == "", \
                 f"a released Backspace kept deleting: {state('buffer')!r}/{state('preedit')!r}"
+        elif args.case == "queue-backspace-suffix":
+            # A replayed Backspace is performed through the virtual keyboard, so
+            # it changes application text with no completer commit. The deletion
+            # must finish before the keys behind it are built on the result.
+            drag_word("hello", None, wait=False, allow_words=allowed3)
+            wait_held_requests(1, "recognition outstanding")
+            key(" ")
+            freeze_probe()
+            service_control("Release", "0", "alpha")
+            time.sleep(.5)
+            # The alpha-space commit is now waiting with nothing queued. The
+            # Backspace has no gesture to cancel, so it is deferred.
+            key("BACKSPACE")
+            key("x")
+            key(" ")
+            drag_word("world", None, wait=False, allow_words=allowed3)
+            wait_held_requests(1, "the later gesture is outstanding")
+            thaw_probe()
+
+            # Deleting the space leaves "alpha", so x and its separator produce
+            # "alphax "; the later gesture waits behind all of that.
+            wait_for(lambda: state("buffer") == "alphax ",
+                     "the virtual deletion finished before the suffix", timeout=15)
+            assert state("preedit") == "", \
+                f"the deletion left a preedit behind: {state('preedit')!r}"
+            service_control("Release", "0", "beta")
+            wait_state("alphax ", "beta", "the later gesture landed in order")
+            # No repeat after the replayed Backspace has finished.
+            time.sleep(1.0)
+            assert state("buffer") == "alphax ", \
+                f"the replayed Backspace kept deleting: {state('buffer')!r}"
+            key(" ")
+            wait_state("alphax beta ", "", "Space accepts the last word")
         elif args.case == "queue-backspace-hold":
             # The counterpart to the replayed Backspace: a finger really resting
-            # on the key must still repeat, and lifting it must stop. Separating
-            # replay from physical bookkeeping must not break the real hold.
+            # on the key must repeat more than once, and lifting it must stop.
+            # Enough words are committed that a bounded hold cannot empty the
+            # field, or continued deletion would be invisible.
             service_control("Hold", "false")
-            drag_word("hello", "word1")
-            key(" ")
-            wait_state("word1 ", "", "text to delete with a held key")
-            hold_at(338, 645, 1600)
-            wait_for(lambda: state("buffer") != "word1 ",
-                     "holding Backspace deleted text", timeout=5)
-            settled = state("buffer")
+            text = ""
+            for index in range(6):
+                drag_word("hello", f"word{index + 1}", assert_first=(index == 0))
+                key(" ")
+                text += f"word{index + 1} "
+                wait_state(text, "", f"committed word {index + 1}")
+            observed = hold_and_watch(338, 645, 1100)
+            # More than the single deletion one press makes, and the field is
+            # not empty at release.
+            assert len(observed) >= 3, \
+                f"Backspace did not repeat while held: {observed}"
+            assert observed[-1] != text, f"the hold deleted nothing: {observed}"
+            assert observed[-1] != "", f"the hold was not bounded: {observed}"
+            released = observed[-1]
             # Well past the repeat interval: the lifted key must not keep going.
             time.sleep(1.0)
-            assert state("buffer") == settled, \
-                f"Backspace kept deleting after release: {settled!r} then {state('buffer')!r}"
+            assert state("buffer") == released, \
+                f"Backspace kept deleting after release: {released!r} then {state('buffer')!r}"
         elif args.case == "queue-geometry":
             # Each gesture keeps the geometry and case it was drawn with, even
             # though the keyboard changes underneath the ones still waiting.
@@ -973,6 +1064,32 @@ try:
             service_control("Release", "0", "alpha")
             # The word, then a real Enter: the text view gains the newline.
             wait_state("alpha\n", "", "deferred Enter reached the application")
+        elif args.case == "queue-enter-suffix":
+            # Enter commits no text of its own but still inserts a newline. It
+            # must neither be treated as a failed edit nor let the input behind
+            # it replay before that newline lands.
+            drag_word("hello", None, wait=False, allow_words=allowed3)
+            wait_held_requests(1, "recognition outstanding")
+            key(" ")
+            key("ENTER")
+            key("x")
+            key(" ")
+            drag_word("world", None, wait=False, allow_words=allowed3)
+            wait_held_requests(2, "the later gesture is outstanding")
+
+            service_control("Release", "0", "alpha")
+            # No suffix: the word, the newline, then x on the new line.
+            wait_for(lambda: state("buffer") == "alpha \nx ",
+                     "Enter inserted its newline and x followed", timeout=15)
+            assert state("preedit") == "", \
+                f"the newline left a preedit behind: {state('preedit')!r}"
+            assert "button-pressed" not in feedback_requests(), \
+                f"a valid Enter was reported as a failed edit: {feedback_requests()}"
+
+            service_control("Release", "0", "beta")
+            wait_state("alpha \nx ", "beta", "the later gesture landed in order")
+            key(" ")
+            wait_state("alpha \nx beta ", "", "Space accepts the last word")
         elif args.case == "queue-field-switch":
             drag_word("hello", None, wait=False, allow_words=allowed)
             drag_word("world", None, wait=False, allow_words=allowed)

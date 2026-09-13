@@ -178,6 +178,96 @@ test_focus_discard (void)
 }
 
 
+/* A deletion plus insertion keeps the real original context for an in-flight
+ * preedit acknowledgement and the deletion-only intermediate, while expecting
+ * the post-edit text. */
+static void
+test_replacing_keeps_original_context (void)
+{
+  g_autoptr (PosCompletionUndo) undo =
+    pos_completion_undo_new_replacing ("alpha ", 6, 6, 1, 0, ". ", "", NULL, NULL, 10);
+
+  g_assert_nonnull (undo);
+  g_assert_false (pos_completion_undo_matches (undo, "alpha. ", 7, 7));
+  /* The preedit-only acknowledgement already in flight reports the original
+   * context; it must be tolerated rather than invalidating the snapshot. */
+  g_assert_true (pos_completion_undo_observe (undo, "alpha ", 6, 6, 11, TRUE));
+  g_assert_false (pos_completion_undo_matches (undo, "alpha. ", 7, 7));
+  /* The application reports the deletion before the insertion. */
+  g_assert_true (pos_completion_undo_observe (undo, "alpha", 5, 5, 12, TRUE));
+  g_assert_false (pos_completion_undo_matches (undo, "alpha. ", 7, 7));
+  /* The final deletion-plus-insertion state is what becomes ready. */
+  g_assert_true (pos_completion_undo_observe (undo, "alpha. ", 7, 7, 13, TRUE));
+  g_assert_true (pos_completion_undo_matches (undo, "alpha. ", 7, 7));
+
+  /* A deletion after the caret is described at the same original context. */
+  g_clear_pointer (&undo, pos_completion_undo_free);
+  undo = pos_completion_undo_new_replacing ("alpha ", 5, 5, 0, 1, ".", "", NULL, NULL, 10);
+  g_assert_nonnull (undo);
+  g_assert_true (pos_completion_undo_observe (undo, "alpha", 5, 5, 11, TRUE));
+  g_assert_false (pos_completion_undo_matches (undo, "alpha.", 6, 6));
+  g_assert_true (pos_completion_undo_observe (undo, "alpha.", 6, 6, 12, TRUE));
+  g_assert_true (pos_completion_undo_matches (undo, "alpha.", 6, 6));
+}
+
+
+static void
+test_replacing_rejections (void)
+{
+  /* A selection is not a caret edit. */
+  g_assert_null (pos_completion_undo_new_replacing ("alpha ", 3, 0, 1, 0, ".", "",
+                                                     NULL, NULL, 0));
+  /* Deleting before the start or beyond the text. */
+  g_assert_null (pos_completion_undo_new_replacing ("alpha", 1, 1, 2, 0, ".", "",
+                                                     NULL, NULL, 0));
+  g_assert_null (pos_completion_undo_new_replacing ("alpha", 5, 5, 0, 2, ".", "",
+                                                     NULL, NULL, 0));
+  /* A deletion that splits a character. */
+  g_assert_null (pos_completion_undo_new_replacing ("é", 2, 2, 1, 0, ".", "",
+                                                     NULL, NULL, 0));
+  g_assert_null (pos_completion_undo_new_replacing ("é", 0, 0, 0, 1, ".", "",
+                                                     NULL, NULL, 0));
+  /* A replacing commit must insert something. */
+  g_assert_null (pos_completion_undo_new_replacing ("alpha ", 6, 6, 1, 0, "", "",
+                                                     NULL, NULL, 0));
+  /* No surrounding-text support. */
+  g_assert_null (pos_completion_undo_new_replacing (NULL, 0, 0, 0, 0, ".", "",
+                                                     NULL, NULL, 0));
+}
+
+
+/* An edit performed through the virtual keyboard changes application text with
+ * no input-method commit, so its report is accepted without the input-method
+ * change cause while foreign edits are still rejected. */
+static void
+test_virtual_edit_observer (void)
+{
+  g_autoptr (PosCompletionUndo) undo =
+    pos_completion_undo_new_virtual ("alpha ", 6, 6, 1, 0, "", 10);
+
+  g_assert_nonnull (undo);
+  g_assert_true (pos_completion_undo_observe (undo, "alpha", 5, 5, 11, FALSE));
+  g_assert_true (pos_completion_undo_matches (undo, "alpha", 5, 5));
+
+  g_clear_pointer (&undo, pos_completion_undo_free);
+  undo = pos_completion_undo_new_virtual ("alpha ", 6, 6, 0, 0, "\n", 10);
+  g_assert_nonnull (undo);
+  g_assert_true (pos_completion_undo_observe (undo, "alpha \n", 7, 7, 11, FALSE));
+  g_assert_true (pos_completion_undo_matches (undo, "alpha \n", 7, 7));
+
+  /* A different text is still a foreign edit, even without the IM cause. */
+  g_clear_pointer (&undo, pos_completion_undo_free);
+  undo = pos_completion_undo_new_virtual ("alpha ", 6, 6, 1, 0, "", 10);
+  g_assert_false (pos_completion_undo_observe (undo, "beta", 4, 4, 11, FALSE));
+  g_assert_false (pos_completion_undo_observe (undo, "alpha", 5, 5, 12, FALSE));
+
+  /* An ordinary input-method snapshot still requires its own cause. */
+  g_clear_pointer (&undo, pos_completion_undo_free);
+  undo = pos_completion_undo_new ("", 0, 0, "hello ", "helo", NULL, NULL, 10);
+  g_assert_false (pos_completion_undo_observe (undo, "hello ", 6, 6, 11, FALSE));
+}
+
+
 int
 main (int argc, char *argv[])
 {
@@ -189,6 +279,10 @@ main (int argc, char *argv[])
   g_test_add_func ("/pos/completion-undo/invalid-changes", test_invalid_changes);
   g_test_add_func ("/pos/completion-undo/constructor-rejections", test_constructor_rejections);
   g_test_add_func ("/pos/completion-undo/focus-discard", test_focus_discard);
+  g_test_add_func ("/pos/completion-undo/replacing-keeps-original-context",
+                   test_replacing_keeps_original_context);
+  g_test_add_func ("/pos/completion-undo/replacing-rejections", test_replacing_rejections);
+  g_test_add_func ("/pos/completion-undo/virtual-edit-observer", test_virtual_edit_observer);
 
   return g_test_run ();
 }

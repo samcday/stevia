@@ -63,6 +63,9 @@ typedef struct {
   gboolean busy_swipes;
   guint busy_replies;
   guint acks;
+  /* A replayed key the completer does not handle is performed through the
+   * virtual keyboard, which changes application text without a commit. */
+  gboolean virtual_replay_edits;
   GPtrArray *commits_seen;
   GPtrArray *feedback;
   /* Keys the completer did not consume: in the keyboard these reach the
@@ -454,8 +457,11 @@ on_swipe_feedback (PosCompleter *completer, const char *reason, Fixture *fixture
 static void
 on_replay_key (PosCompleter *completer, const char *symbol, Fixture *fixture)
 {
-  if (!pos_completer_feed_symbol (completer, symbol))
-    g_ptr_array_add (fixture->unhandled_keys, g_strdup (symbol));
+  if (pos_completer_feed_symbol (completer, symbol))
+    return;
+  g_ptr_array_add (fixture->unhandled_keys, g_strdup (symbol));
+  if (fixture->virtual_replay_edits)
+    pos_completer_verbisage_replay_application_edit (POS_COMPLETER_VERBISAGE (completer));
 }
 
 
@@ -2005,6 +2011,53 @@ test_queue_pending_ack_orders_input (Fixture *fixture, gconstpointer unused)
 }
 
 
+/* A replayed key the completer does not handle is performed through the virtual
+ * keyboard and changes application text with no completer commit. The queue
+ * must wait for that edit before replaying anything behind it. */
+static void
+test_queue_virtual_edit_waits (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+
+  fixture->virtual_replay_edits = TRUE;
+  fixture->hold_swipes = TRUE;
+  fixture->hold_ack = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  pos_completer_feed_symbol (fixture->completer, " ");
+  wait_held_count (fixture, 1);
+
+  release_held_at (fixture, 0);
+  fixture->hold_swipes = FALSE;
+  wait_commits (fixture, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->commits_seen, 0), ==, "w1 ");
+  g_assert_true (pos_completer_verbisage_replay_pending (self));
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+
+  /* A Backspace now has no gesture to cancel, so it queues behind the pending
+   * acknowledgement, and x queues behind it. */
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, "KEY_BACKSPACE"));
+  g_assert_true (pos_completer_feed_symbol (fixture->completer, "x"));
+
+  /* The application acknowledges w1; the virtual Backspace replays next. */
+  fixture->hold_ack = FALSE;
+  pos_completer_verbisage_replay_acknowledged (self);
+  spin (120);
+
+  /* The Backspace was not a completer commit, so the queue stays at that edit
+   * and x has not been replayed yet. */
+  g_assert_true (pos_completer_verbisage_replay_pending (self));
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 1);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_cmpuint (fixture->unhandled_keys->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->unhandled_keys, 0), ==, "KEY_BACKSPACE");
+
+  /* Only when the application reports the deletion does x replay. */
+  pos_completer_verbisage_replay_acknowledged (self);
+  spin (80);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "x");
+}
+
+
 /* Giving up on a commit nothing acknowledged is reported even when the list
  * behind it was already empty, so the keyboard clears what it expected too. */
 static void
@@ -2823,6 +2876,7 @@ main (int argc, char **argv)
   ADD_TEST ("queue-backspace-during-ack", test_queue_backspace_during_acknowledgement);
   ADD_TEST ("queue-punctuation-barrier", test_queue_punctuation_barrier);
   ADD_TEST ("queue-pending-ack-orders", test_queue_pending_ack_orders_input);
+  ADD_TEST ("queue-virtual-edit-waits", test_queue_virtual_edit_waits);
   ADD_TEST ("queue-expiry-no-suffix", test_queue_expiry_without_suffix);
   ADD_TEST ("queue-separator-bytes", test_queue_separator_bytes_match_unbuffered);
   ADD_TEST ("queue-deferred-enter", test_queue_deferred_enter_is_not_swallowed);
