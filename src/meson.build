@@ -37,7 +37,6 @@ libpos_sources = files(
   'pos-char-popup.h',
   'pos-clipboard-manager.c',
   'pos-clipboard-manager.h',
-  'pos-commit-pacer.h',
   'pos-completer-base.c',
   'pos-completer-base.h',
   'pos-completer-manager.c',

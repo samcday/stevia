@@ -38,6 +38,28 @@ foreach name : tests
   test('@0@'.format(name), test, depends: compile_schemas, env: test_env)
 endforeach
 
+# Protocol-level input method fixture: an in-process compositor stub speaks
+# zwp_input_method_v2 to the real PosInputMethod.
+wayland_server_dep = dependency('wayland-server', version: '>=1.14')
+im_server_header = custom_target(
+  'input-method-unstable-v2 server header',
+  input: meson.project_source_root() / 'protocol' / 'input-method-unstable-v2.xml',
+  output: 'input-method-unstable-v2-server-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+name = 'test-input-method'
+test(
+  name,
+  executable(
+    name,
+    [f'@name@.c', 'pos-test-im-server.c', im_server_header],
+    pie: true,
+    dependencies: [libpos_dep, wayland_server_dep],
+  ),
+  depends: compile_schemas,
+  env: test_env,
+)
+
 if presage_dep.found()
   # Create a dummy db for testing
   presage_test_db = custom_target(
