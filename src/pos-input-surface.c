@@ -618,6 +618,8 @@ on_swipe_typing_changed (PosInputSurface *self)
 {
   clear_edit_history (self);
   self->swipe_typing = g_settings_get_boolean (self->osk_settings, "swipe-typing");
+  if (!self->swipe_typing)
+    invalidate_swipe_queue (self);
   update_swipe_enabled (self);
 }
 
@@ -862,6 +864,31 @@ on_osk_key_cancelled (PosInputSurface *self)
   g_assert (POS_IS_INPUT_SURFACE (self));
 
   pos_input_surface_set_backspace_pressed (self, NULL);
+}
+
+
+/* A key typed behind unplayed gestures has reached its turn. Apply it through
+ * the ordinary key path so an unconsumed key still reaches the virtual
+ * keyboard: a deferred Enter must really submit. */
+static void
+on_completer_replay_key (PosInputSurface *self, const char *symbol)
+{
+  g_assert (POS_IS_INPUT_SURFACE (self));
+
+  pos_input_surface_submit_symbol (self, symbol);
+}
+
+
+/* The gesture queue could not do what was asked. Tell the user: a refused
+ * gesture and a dropped word are both invisible otherwise. */
+static void
+on_completer_swipe_feedback (PosInputSurface *self, const char *reason)
+{
+  g_assert (POS_IS_INPUT_SURFACE (self));
+
+  g_debug ("Gesture queue: %s", reason);
+  /* Deliberately not the ordinary key feedback: nothing was typed. */
+  pos_input_surface_trigger_feedback (self, BUTTON_PRESS_EVENT);
 }
 
 
@@ -1365,6 +1392,9 @@ on_visible_child_changed (PosInputSurface *self)
 
   pos_input_surface_toggle_shortcuts_bar (self);
   update_swipe_enabled (self);
+  /* Before any early return: the emoji and terminal surfaces are as much a
+   * different place as another layout is. */
+  invalidate_swipe_queue (self);
 
   if (!POS_IS_OSK_WIDGET (child))
     return;
@@ -1384,9 +1414,8 @@ on_visible_child_changed (PosInputSurface *self)
   /* Recheck completion bar visibility */
   g_object_notify_by_pspec (G_OBJECT (self), props[PROP_COMPLETER_ACTIVE]);
 
-  /* A different layout, and possibly a different completer: the geometry and
-   * language a queued gesture was taken under no longer apply. */
-  invalidate_swipe_queue (self);
+  /* A different layout, and possibly a different completer. The queue was
+   * already invalidated above, before any early return. */
   publish_layout_geometry (self);
 }
 
@@ -1497,6 +1526,14 @@ pos_input_surface_set_completer (PosInputSurface *self, PosCompleter *completer)
 
   if (self->completer != NULL) {
     g_debug ("Adding completer '%s'", G_OBJECT_CLASS_NAME (G_OBJECT_GET_CLASS (self->completer)));
+    if (POS_IS_COMPLETER_VERBISAGE (self->completer)) {
+      g_object_connect (self->completer,
+                        "swapped-signal::swipe-replay-key",
+                        G_CALLBACK (on_completer_replay_key), self,
+                        "swapped-signal::swipe-feedback",
+                        G_CALLBACK (on_completer_swipe_feedback), self,
+                        NULL);
+    }
     g_object_connect (self->completer,
                       "swapped-signal::notify::completions",
                       G_CALLBACK (on_completer_completions_changed), self,
@@ -1865,6 +1902,9 @@ on_im_hint_changed (PosInputSurface *self, GParamSpec *pspec, PosInputMethod *im
   g_assert (POS_IS_INPUT_METHOD (im));
 
   clear_edit_history (self);
+  /* A sensitive or hidden-text hint makes this field one no accepted gesture
+   * may be played into, whatever the completion mode does next. */
+  invalidate_swipe_queue (self);
   update_swipe_enabled (self);
   g_debug ("Hint changed: 0x%.2x", pos_input_method_get_hint (im));
   if ((self->completion_mode & PHOSH_OSK_COMPLETION_MODE_HINT) == 0)
@@ -1955,8 +1995,13 @@ on_im_done (PosInputSurface *self)
       !pos_completion_undo_observe (self->completion_undo, text, cursor, anchor, serial, im_change))
     clear_completion_undo (self);
   if (self->swipe_replay_ack &&
-      !pos_completion_undo_observe (self->swipe_replay_ack, text, cursor, anchor, serial, im_change))
-    g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
+      !pos_completion_undo_observe (self->swipe_replay_ack, text, cursor, anchor, serial, im_change)) {
+    /* The text moved somewhere the replayed word cannot be reconciled with.
+     * Dropping only our expectation would leave the queue waiting for an
+     * acknowledgement that can never come, swallowing later input. */
+    g_debug ("Replayed word no longer reconcilable with the text; resetting the queue");
+    invalidate_swipe_queue (self);
+  }
 }
 
 
@@ -1969,6 +2014,9 @@ on_im_pending_changed (PosInputSurface *self, PosImState *state)
     self->context_suspended = TRUE;
     if (POS_IS_COMPLETER_VERBISAGE (self->completer))
       pos_completer_verbisage_set_enabled (POS_COMPLETER_VERBISAGE (self->completer), FALSE);
+    /* notify::active need not fire for a batched pair, so the queue is reset
+     * here too: nothing accepted for the old field may reach the new one. */
+    invalidate_swipe_queue (self);
     clear_edit_history (self);
     if (POS_IS_COMPLETER_VERBISAGE (self->completer)) {
       g_signal_handlers_block_by_func (self->completer, on_completer_preedit_changed, self);

@@ -36,6 +36,9 @@
 #define SWIPE_JOB_DEADLINE_MS 5000
 /* Keys typed while gestures are still unplayed are applied after them. */
 #define MAX_DEFERRED_KEYS 16
+/* How long a replayed word may wait for the application to show it before the
+ * rest of the queue is dropped. */
+#define SWIPE_ACK_TIMEOUT_MS 2000
 
 enum {
   PROP_0,
@@ -63,14 +66,26 @@ typedef enum {
   SWIPE_JOB_FAILED,   /* terminal failure, empty result or timeout */
 } SwipeJobState;
 
+typedef enum {
+  SWIPE_ENTRY_GESTURE,
+  SWIPE_ENTRY_KEY,
+} SwipeEntryKind;
+
 /**
- * SwipeJob:
+ * SwipeEntry:
  *
- * One accepted gesture. Everything the request needs is captured when the
- * gesture is accepted, so a later resize, layer change or Shift release cannot
- * alter a request that was already taken.
+ * One thing the user did, in the order they did it: a gesture or a key. Both
+ * live in the same list so a key typed between two gestures stays between
+ * them. Recognition may run ahead, but what reaches the application follows
+ * this order.
+ *
+ * A gesture captures everything its request needs when it is accepted, so a
+ * later resize, layer change or Shift release cannot alter a request that was
+ * already taken.
  */
 typedef struct {
+  SwipeEntryKind kind;
+  /* Gesture */
   guint64        id;
   guint64        session;
   GVariant      *parameters;
@@ -81,7 +96,17 @@ typedef struct {
   gint64         deadline;
   guint          retry_id;
   GCancellable  *cancellable;
-} SwipeJob;
+  /* Key */
+  char          *symbol;
+} SwipeEntry;
+
+/* A retry knows which gesture it belongs to, so a timer can never disturb
+ * another entry and disposal removes the right source. */
+typedef struct {
+  GWeakRef completer;
+  guint64  id;
+  guint64  session;
+} SwipeRetry;
 
 
 struct _PosCompleterVerbisage {
@@ -92,15 +117,16 @@ struct _PosCompleterVerbisage {
   SwipeState swipe_state;
   guint swipe_capitalization;
   GVariant *swipe_parameters;
-  /* Accepted gestures in input order, and the keys typed behind them. */
-  GPtrArray *swipe_jobs;
-  GPtrArray *deferred_keys;
+  /* Gestures and the keys typed between them, in one input order. */
+  GPtrArray *swipe_entries;
   guint64 swipe_next_id;
   guint64 swipe_session;
   guint swipe_running;
   gboolean replay_pending;
   gboolean replay_is_preedit;
   gboolean replaying;
+  gboolean replaying_key;
+  guint replay_ack_timeout;
   char *language;
   GDBusConnection *connection;
   GCancellable *cancellable;
@@ -333,75 +359,132 @@ build_context (PosCompleterVerbisage *self)
 
 /* ── Buffered gesture recognition ──────────────────────────────────────────
  *
- * Accepted gestures are held in input order. Recognition runs concurrently and
- * may finish out of order, but a reply only ever fills its own entry: text is
- * replayed from the head, one word at a time, each waiting for the
- * application to acknowledge the commit before the next is played. The last
- * word becomes the ordinary editable swipe preedit and leaves the queue there.
+ * Gestures and the keys typed between them are held in one list, in the order
+ * the user made them. Recognition runs concurrently and may finish out of
+ * order, but a reply only ever fills its own entry and only the head is ever
+ * played, so what reaches the application keeps the original order.
+ *
+ * A recognized word becomes the ordinary editable guess. Whatever follows it -
+ * the next gesture, a key, a separator - then acts on that guess with its
+ * usual meaning, which is what keeps a buffered gesture and an unbuffered one
+ * producing identical text.
  */
 
 static void publish_completions (PosCompleterVerbisage *self);
 static void swipe_dispatch (PosCompleterVerbisage *self);
 static void swipe_advance (PosCompleterVerbisage *self);
 static gboolean swipe_retry_timeout (gpointer data);
-static void swipe_promote_to_preedit (PosCompleterVerbisage *self, SwipeJob *job);
+static void swipe_promote_to_preedit (PosCompleterVerbisage *self, SwipeEntry *entry);
 
 
 static void
-swipe_job_free (SwipeJob *job)
+swipe_entry_free (SwipeEntry *entry)
 {
-  g_clear_handle_id (&job->retry_id, g_source_remove);
-  if (job->cancellable)
-    g_cancellable_cancel (job->cancellable);
-  g_clear_object (&job->cancellable);
-  g_clear_pointer (&job->parameters, g_variant_unref);
-  g_clear_pointer (&job->words, g_strfreev);
-  g_free (job);
+  g_clear_handle_id (&entry->retry_id, g_source_remove);
+  if (entry->cancellable)
+    g_cancellable_cancel (entry->cancellable);
+  g_clear_object (&entry->cancellable);
+  g_clear_pointer (&entry->parameters, g_variant_unref);
+  g_clear_pointer (&entry->words, g_strfreev);
+  g_free (entry->symbol);
+  g_free (entry);
 }
 
 
-static SwipeJob *
-swipe_job_at (PosCompleterVerbisage *self, guint index)
+static void
+swipe_retry_free (gpointer data)
 {
-  if (!self->swipe_jobs || index >= self->swipe_jobs->len)
+  SwipeRetry *retry = data;
+
+  g_weak_ref_clear (&retry->completer);
+  g_free (retry);
+}
+
+
+static SwipeEntry *
+swipe_entry_at (PosCompleterVerbisage *self, guint index)
+{
+  if (!self->swipe_entries || index >= self->swipe_entries->len)
     return NULL;
-  return g_ptr_array_index (self->swipe_jobs, index);
+  return g_ptr_array_index (self->swipe_entries, index);
 }
 
 
-static SwipeJob *
+static SwipeEntry *
 swipe_job_by_id (PosCompleterVerbisage *self, guint64 id, guint64 session)
 {
   if (session != self->swipe_session)
     return NULL;
-  for (guint i = 0; self->swipe_jobs && i < self->swipe_jobs->len; i++) {
-    SwipeJob *job = g_ptr_array_index (self->swipe_jobs, i);
+  for (guint i = 0; self->swipe_entries && i < self->swipe_entries->len; i++) {
+    SwipeEntry *entry = g_ptr_array_index (self->swipe_entries, i);
 
-    if (job->id == id)
-      return job;
+    if (entry->kind == SWIPE_ENTRY_GESTURE && entry->id == id)
+      return entry;
   }
   return NULL;
 }
 
 
-/* Drop every unplayed gesture and any input deferred behind it. Already
- * committed text is never touched. */
+static guint
+swipe_count (PosCompleterVerbisage *self, SwipeEntryKind kind)
+{
+  guint count = 0;
+
+  for (guint i = 0; self->swipe_entries && i < self->swipe_entries->len; i++) {
+    SwipeEntry *entry = g_ptr_array_index (self->swipe_entries, i);
+
+    count += entry->kind == kind ? 1 : 0;
+  }
+  return count;
+}
+
+
+/* Drop every unplayed gesture, every key waiting behind one, the expectation
+ * for a commit in flight and any timer belonging to them. Already committed
+ * text is never touched. */
 static void
 swipe_queue_clear (PosCompleterVerbisage *self, const char *reason)
 {
-  gboolean had_work = (self->swipe_jobs && self->swipe_jobs->len) ||
-                      (self->deferred_keys && self->deferred_keys->len);
+  gboolean had_work = self->swipe_entries && self->swipe_entries->len;
 
-  /* Replies still in flight belong to the session that is ending. */
+  /* Replies and timers still in flight belong to the session that is ending. */
   self->swipe_session++;
   self->swipe_running = 0;
   self->replay_pending = FALSE;
-  if (self->swipe_jobs)
-    g_ptr_array_set_size (self->swipe_jobs, 0);
-  if (self->deferred_keys)
-    g_ptr_array_set_size (self->deferred_keys, 0);
+  self->replay_is_preedit = FALSE;
+  g_clear_handle_id (&self->replay_ack_timeout, g_source_remove);
+  if (self->swipe_entries)
+    g_ptr_array_set_size (self->swipe_entries, 0);
   if (had_work && reason)
     g_signal_emit_by_name (self, "swipe-feedback", reason);
+}
+
+
+static gboolean
+swipe_replay_ack_timeout (gpointer data)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (data);
+
+  self->replay_ack_timeout = 0;
+  if (!self->replay_pending)
+    return G_SOURCE_REMOVE;
+
+  /* The application never showed the word we committed. Stop here rather than
+   * play the rest into a text state we no longer understand. */
+  g_debug ("A replayed word was never acknowledged; dropping the unplayed rest");
+  swipe_queue_clear (self, "acknowledgement-missing");
+  return G_SOURCE_REMOVE;
+}
+
+
+static void
+swipe_await_acknowledgement (PosCompleterVerbisage *self, gboolean is_preedit)
+{
+  self->replay_pending = TRUE;
+  self->replay_is_preedit = is_preedit;
+  g_clear_handle_id (&self->replay_ack_timeout, g_source_remove);
+  self->replay_ack_timeout = g_timeout_add (SWIPE_ACK_TIMEOUT_MS,
+                                            swipe_replay_ack_timeout, self);
 }
 
 
@@ -414,7 +497,7 @@ on_swipe_job_finished (GObject *source, GAsyncResult *result, gpointer user_data
   g_autoptr (GVariant) reply =
     g_dbus_connection_call_finish (G_DBUS_CONNECTION (source), result, &error);
   g_autoptr (GPtrArray) words = NULL;
-  SwipeJob *job;
+  SwipeEntry *job;
 
   if (!self)
     return;
@@ -432,11 +515,17 @@ on_swipe_job_finished (GObject *source, GAsyncResult *result, gpointer user_data
     if (error && strstr (error->message, "busy") &&
         job->busy_retries < SWIPE_BUSY_RETRIES &&
         g_get_monotonic_time () < job->deadline) {
+      SwipeRetry *retry = g_new0 (SwipeRetry, 1);
+
       job->busy_retries++;
       job->state = SWIPE_JOB_WAITING;
       g_debug ("Recognition busy; retrying gesture %" G_GUINT64_FORMAT, job->id);
-      job->retry_id = g_timeout_add (SWIPE_BUSY_BACKOFF_MS * job->busy_retries,
-                                     (GSourceFunc) swipe_retry_timeout, self);
+      g_weak_ref_init (&retry->completer, self);
+      retry->id = job->id;
+      retry->session = job->session;
+      job->retry_id = g_timeout_add_full (G_PRIORITY_DEFAULT,
+                                          SWIPE_BUSY_BACKOFF_MS * job->busy_retries,
+                                          swipe_retry_timeout, retry, swipe_retry_free);
       return;
     }
     g_debug ("Recognition failed for gesture %" G_GUINT64_FORMAT, job->id);
@@ -466,7 +555,7 @@ on_swipe_job_finished (GObject *source, GAsyncResult *result, gpointer user_data
 
 
 static void
-swipe_job_start (PosCompleterVerbisage *self, SwipeJob *job)
+swipe_job_start (PosCompleterVerbisage *self, SwipeEntry *job)
 {
   Lookup *lookup;
 
@@ -513,7 +602,7 @@ on_swipe_bus_ready (GObject *source, GAsyncResult *result, gpointer user_data)
 static void
 swipe_dispatch (PosCompleterVerbisage *self)
 {
-  if (!self->swipe_jobs || self->swipe_jobs->len == 0)
+  if (swipe_count (self, SWIPE_ENTRY_GESTURE) == 0)
     return;
 
   if (!self->connection || g_dbus_connection_is_closed (self->connection)) {
@@ -526,11 +615,12 @@ swipe_dispatch (PosCompleterVerbisage *self)
     return;
   }
 
-  for (guint i = 0; i < self->swipe_jobs->len && self->swipe_running < SWIPE_WORKERS; i++) {
-    SwipeJob *job = g_ptr_array_index (self->swipe_jobs, i);
+  for (guint i = 0; i < self->swipe_entries->len && self->swipe_running < SWIPE_WORKERS; i++) {
+    SwipeEntry *entry = g_ptr_array_index (self->swipe_entries, i);
 
-    if (job->state == SWIPE_JOB_WAITING && job->retry_id == 0)
-      swipe_job_start (self, job);
+    if (entry->kind == SWIPE_ENTRY_GESTURE && entry->state == SWIPE_JOB_WAITING &&
+        entry->retry_id == 0)
+      swipe_job_start (self, entry);
   }
 }
 
@@ -538,16 +628,18 @@ swipe_dispatch (PosCompleterVerbisage *self)
 static gboolean
 swipe_retry_timeout (gpointer data)
 {
-  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (data);
+  SwipeRetry *retry = data;
+  g_autoptr (PosCompleterVerbisage) self = g_weak_ref_get (&retry->completer);
+  SwipeEntry *job;
 
-  for (guint i = 0; self->swipe_jobs && i < self->swipe_jobs->len; i++) {
-    SwipeJob *job = g_ptr_array_index (self->swipe_jobs, i);
-
-    if (job->retry_id) {
-      job->retry_id = 0;
-      break;
-    }
-  }
+  if (!self)
+    return G_SOURCE_REMOVE;
+  /* Only this gesture's own retry id is cleared, whatever order the retries
+   * of other gestures fire in. */
+  job = swipe_job_by_id (self, retry->id, retry->session);
+  if (!job)
+    return G_SOURCE_REMOVE;
+  job->retry_id = 0;
   swipe_dispatch (self);
   return G_SOURCE_REMOVE;
 }
@@ -555,7 +647,7 @@ swipe_retry_timeout (gpointer data)
 
 /* Apply the capitalization captured when the gesture was accepted. */
 static GStrv
-swipe_job_words (SwipeJob *job)
+swipe_job_words (SwipeEntry *job)
 {
   GStrv words;
 
@@ -571,91 +663,78 @@ swipe_job_words (SwipeJob *job)
 }
 
 
-/* Run the keys that were typed while gestures were still unplayed. */
-static void
-swipe_flush_deferred (PosCompleterVerbisage *self)
-{
-  g_autoptr (GPtrArray) keys = NULL;
-
-  if (!self->deferred_keys || self->deferred_keys->len == 0)
-    return;
-  if (self->swipe_jobs && self->swipe_jobs->len)
-    return;
-
-  keys = g_ptr_array_ref (self->deferred_keys);
-  self->deferred_keys = g_ptr_array_new_with_free_func (g_free);
-  for (guint i = 0; i < keys->len; i++)
-    pos_completer_feed_symbol (POS_COMPLETER (self), g_ptr_array_index (keys, i));
-}
-
-
 /**
  * swipe_advance:
  *
- * Replay from the head only. A word with anything behind it - another gesture
- * or a key typed after it - is committed with one separator and waits for the
- * application to acknowledge that commit. The last word becomes the ordinary
- * editable preedit and frees its slot there, because from that point it is
- * just text with the existing completion-selection undo behaviour.
+ * Play the head, and only the head.
+ *
+ * A recognized word becomes the editable guess; a key is handed back to the
+ * keyboard's ordinary key handling, which is what makes a buffered gesture
+ * followed by Space produce exactly the same text as an unbuffered one. A
+ * gesture behind a visible guess commits that guess with one separator first
+ * and waits for the application to show it.
  */
 static void
 swipe_advance (PosCompleterVerbisage *self)
 {
-  SwipeJob *head;
-
-  if (self->replaying || self->replay_pending)
+  if (self->replaying)
     return;
-
-  head = swipe_job_at (self, 0);
-  if (!head) {
-    swipe_flush_deferred (self);
-    return;
-  }
-  if (head->state == SWIPE_JOB_WAITING || head->state == SWIPE_JOB_RUNNING) {
-    /* An entry that finished behind the head waits its turn; finishing early
-     * frees nothing. */
-    return;
-  }
-
-  if (head->state == SWIPE_JOB_FAILED) {
-    /* Stop at this position: the words after it were gestured in a context
-     * this one would have changed, so they are cancelled rather than silently
-     * appended in the failed word's place. Committed text is untouched, and
-     * deferred keys go with them so a queued Enter cannot fire afterwards. */
-    swipe_queue_clear (self, "recognition-failed");
-    return;
-  }
 
   self->replaying = TRUE;
-  if (self->swipe_state == SWIPE_PREEDIT && self->preedit->len) {
-    /* The guess on screen is the word before every queued one, so it is
-     * committed first. It is not a queue entry, so its acknowledgement
-     * advances nothing. */
-    g_autofree char *text = g_strconcat (self->preedit->str, " ", NULL);
+  while (!self->replay_pending) {
+    SwipeEntry *head = swipe_entry_at (self, 0);
 
-    self->swipe_state = SWIPE_NONE;
-    g_clear_pointer (&self->ranked, g_strfreev);
-    g_string_assign (self->preedit, "");
-    self->replay_pending = TRUE;
-    self->replay_is_preedit = TRUE;
-    g_object_freeze_notify (G_OBJECT (self));
-    publish_completions (self);
-    g_object_notify_by_pspec (G_OBJECT (self), props[PROP_PREEDIT]);
-    g_object_thaw_notify (G_OBJECT (self));
-    g_signal_emit_by_name (self, "commit-string", text, 0, 0);
-  } else if (self->swipe_jobs->len == 1 &&
-             (!self->deferred_keys || self->deferred_keys->len == 0)) {
+    if (!head)
+      break;
+
+    if (head->kind == SWIPE_ENTRY_KEY) {
+      g_autofree char *symbol = g_strdup (head->symbol);
+
+      g_ptr_array_remove_index (self->swipe_entries, 0);
+      /* Replayed through the keyboard's own dispatch, so an unhandled key
+       * such as Enter still reaches the virtual keyboard. */
+      self->replaying_key = TRUE;
+      g_signal_emit_by_name (self, "swipe-replay-key", symbol);
+      self->replaying_key = FALSE;
+      continue;
+    }
+
+    if (head->state == SWIPE_JOB_WAITING || head->state == SWIPE_JOB_RUNNING) {
+      /* An entry that finished behind the head waits its turn; finishing
+       * early frees nothing. */
+      break;
+    }
+
+    if (head->state == SWIPE_JOB_FAILED) {
+      /* Stop at this position: the words after it were gestured in a context
+       * this one would have changed, so they are cancelled rather than
+       * silently appended in the failed word's place. Committed text is
+       * untouched, and the keys behind them go too, so a queued Enter cannot
+       * fire afterwards. */
+      swipe_queue_clear (self, "recognition-failed");
+      break;
+    }
+
+    if (self->swipe_state == SWIPE_PREEDIT && self->preedit->len) {
+      /* The guess on screen is the word before this gesture, so it is
+       * committed first. It is not a queue entry, so its acknowledgement
+       * advances nothing. */
+      g_autofree char *text = g_strconcat (self->preedit->str, " ", NULL);
+
+      self->swipe_state = SWIPE_NONE;
+      g_clear_pointer (&self->ranked, g_strfreev);
+      g_string_assign (self->preedit, "");
+      swipe_await_acknowledgement (self, TRUE);
+      g_object_freeze_notify (G_OBJECT (self));
+      publish_completions (self);
+      g_object_notify_by_pspec (G_OBJECT (self), props[PROP_PREEDIT]);
+      g_object_thaw_notify (G_OBJECT (self));
+      g_signal_emit_by_name (self, "commit-string", text, 0, 0);
+      break;
+    }
+
     swipe_promote_to_preedit (self, head);
-    g_ptr_array_remove_index (self->swipe_jobs, 0);
-  } else {
-    g_auto (GStrv) words = swipe_job_words (head);
-    g_autofree char *text = g_strconcat (words[0], " ", NULL);
-
-    /* The entry stays until the commit is acknowledged, so a missing
-     * acknowledgement stops replay here instead of running ahead. */
-    self->replay_pending = TRUE;
-    self->replay_is_preedit = FALSE;
-    g_signal_emit_by_name (self, "commit-string", text, 0, 0);
+    g_ptr_array_remove_index (self->swipe_entries, 0);
   }
   self->replaying = FALSE;
 }
@@ -1208,20 +1287,25 @@ pos_completer_verbisage_feed_symbol (PosCompleter *iface, const char *symbol)
   PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (iface);
   g_autofree char *previous = NULL;
 
-  if (self->swipe_jobs->len) {
+  if (!self->replaying_key && self->swipe_entries->len) {
+    SwipeEntry *entry;
+
     /* Backspace takes back the newest gesture that has not been played,
      * instead of deleting text that is already committed. */
     if (g_str_equal (symbol, "KEY_BACKSPACE") &&
         pos_completer_verbisage_cancel_newest_swipe (self))
       return TRUE;
-    /* Anything else is an ordered barrier: the gestures in front of it are
-     * replayed first, then it is applied with the ordinary semantics. */
-    if (self->deferred_keys->len >= MAX_DEFERRED_KEYS) {
+    /* Anything else keeps its place in the input order: it is applied after
+     * the gestures in front of it and before any gesture after it. */
+    if (swipe_count (self, SWIPE_ENTRY_KEY) >= MAX_DEFERRED_KEYS) {
       g_debug ("Too much input deferred behind unplayed gestures");
       g_signal_emit_by_name (self, "swipe-feedback", "deferred-full");
       return TRUE;
     }
-    g_ptr_array_add (self->deferred_keys, g_strdup (symbol));
+    entry = g_new0 (SwipeEntry, 1);
+    entry->kind = SWIPE_ENTRY_KEY;
+    entry->symbol = g_strdup (symbol);
+    g_ptr_array_add (self->swipe_entries, entry);
     swipe_advance (self);
     return TRUE;
   }
@@ -1379,8 +1463,7 @@ pos_completer_verbisage_finalize (GObject *object)
   g_free (self->layout_upload);
   g_free (self->layout_token);
   g_free (self->name_owner);
-  g_clear_pointer (&self->swipe_jobs, g_ptr_array_unref);
-  g_clear_pointer (&self->deferred_keys, g_ptr_array_unref);
+  g_clear_pointer (&self->swipe_entries, g_ptr_array_unref);
   g_clear_pointer (&self->layout_tokens, g_hash_table_unref);
   G_OBJECT_CLASS (pos_completer_verbisage_parent_class)->finalize (object);
 }
@@ -1401,6 +1484,17 @@ pos_completer_verbisage_class_init (PosCompleterVerbisageClass *klass)
    * stable identifier, not a message for the user.
    */
   g_signal_new ("swipe-feedback", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
+                0, NULL, NULL, NULL, G_TYPE_NONE, 1, G_TYPE_STRING);
+  /**
+   * PosCompleterVerbisage::swipe-replay-key:
+   * @symbol: the key symbol to apply now
+   *
+   * A key that was typed behind unplayed gestures has reached its place in the
+   * input order. The keyboard applies it through its ordinary key handling, so
+   * a key the completer does not consume - Enter, for example - still reaches
+   * the virtual keyboard.
+   */
+  g_signal_new ("swipe-replay-key", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
                 0, NULL, NULL, NULL, G_TYPE_NONE, 1, G_TYPE_STRING);
 
   object_class->set_property = pos_completer_verbisage_set_property;
@@ -1433,8 +1527,7 @@ pos_completer_verbisage_init (PosCompleterVerbisage *self)
   self->preedit = g_string_new (NULL);
   self->language = g_strdup ("en_US");
   self->layout_tokens = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
-  self->swipe_jobs = g_ptr_array_new_with_free_func ((GDestroyNotify) swipe_job_free);
-  self->deferred_keys = g_ptr_array_new_with_free_func (g_free);
+  self->swipe_entries = g_ptr_array_new_with_free_func ((GDestroyNotify) swipe_entry_free);
 }
 
 
@@ -1454,7 +1547,7 @@ pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
                                         GVariant *keys,
                                         guint capitalization)
 {
-  SwipeJob *job;
+  SwipeEntry *job;
 
   g_return_val_if_fail (POS_IS_COMPLETER_VERBISAGE (self), FALSE);
   g_return_val_if_fail (g_variant_is_of_type (trace, G_VARIANT_TYPE ("a(ddu)")), FALSE);
@@ -1468,14 +1561,15 @@ pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
   if (self->preedit->len && self->swipe_state != SWIPE_PREEDIT)
     return FALSE;
 
-  if (self->swipe_jobs->len >= MAX_SWIPE_JOBS) {
+  if (swipe_count (self, SWIPE_ENTRY_GESTURE) >= MAX_SWIPE_JOBS) {
     /* Refuse the newest gesture; every word already accepted is kept. */
     g_debug ("Gesture queue is full; rejecting the new gesture");
     g_signal_emit_by_name (self, "swipe-feedback", "queue-full");
     return FALSE;
   }
 
-  job = g_new0 (SwipeJob, 1);
+  job = g_new0 (SwipeEntry, 1);
+  job->kind = SWIPE_ENTRY_GESTURE;
   job->id = ++self->swipe_next_id;
   job->session = self->swipe_session;
   job->capitalization = capitalization;
@@ -1486,7 +1580,7 @@ pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
   job->parameters = g_variant_ref_sink (
     g_variant_new ("(@a(ddu)@a(sdddd)us)", g_variant_ref (trace), g_variant_ref (keys),
                      (guint) MAX_RESULTS, self->language));
-  g_ptr_array_add (self->swipe_jobs, job);
+  g_ptr_array_add (self->swipe_entries, job);
 
   swipe_dispatch (self);
   swipe_advance (self);
@@ -1496,7 +1590,7 @@ pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
 
 /* Give the head's result to the ordinary editable-preedit path. */
 static void
-swipe_promote_to_preedit (PosCompleterVerbisage *self, SwipeJob *job)
+swipe_promote_to_preedit (PosCompleterVerbisage *self, SwipeEntry *job)
 {
   g_auto (GStrv) words = swipe_job_words (job);
   g_autoptr (GPtrArray) unique = g_ptr_array_new_with_free_func (g_free);
@@ -1548,9 +1642,10 @@ pos_completer_verbisage_replay_acknowledged (PosCompleterVerbisage *self)
   if (!self->replay_pending)
     return;
   self->replay_pending = FALSE;
+  g_clear_handle_id (&self->replay_ack_timeout, g_source_remove);
   /* Accepting the guess that was on screen played no queue entry. */
-  if (!self->replay_is_preedit && self->swipe_jobs->len)
-    g_ptr_array_remove_index (self->swipe_jobs, 0);
+  if (!self->replay_is_preedit && self->swipe_entries->len)
+    g_ptr_array_remove_index (self->swipe_entries, 0);
   self->replay_is_preedit = FALSE;
   swipe_dispatch (self);
   swipe_advance (self);
@@ -1567,7 +1662,7 @@ pos_completer_verbisage_pending_swipes (PosCompleterVerbisage *self)
 {
   g_return_val_if_fail (POS_IS_COMPLETER_VERBISAGE (self), 0);
 
-  return self->swipe_jobs ? self->swipe_jobs->len : 0;
+  return swipe_count (self, SWIPE_ENTRY_GESTURE);
 }
 
 
@@ -1581,25 +1676,29 @@ pos_completer_verbisage_pending_swipes (PosCompleterVerbisage *self)
 gboolean
 pos_completer_verbisage_cancel_newest_swipe (PosCompleterVerbisage *self)
 {
-  SwipeJob *job;
-
   g_return_val_if_fail (POS_IS_COMPLETER_VERBISAGE (self), FALSE);
 
-  if (!self->swipe_jobs->len)
-    return FALSE;
-  /* The head is only off limits while its commit is in flight. */
-  if (self->swipe_jobs->len == 1 && self->replay_pending)
-    return FALSE;
+  /* The newest gesture, and with it anything typed after it, since those keys
+   * were meant to follow that word. */
+  for (guint i = self->swipe_entries->len; i > 0; i--) {
+    SwipeEntry *entry = g_ptr_array_index (self->swipe_entries, i - 1);
 
-  job = g_ptr_array_index (self->swipe_jobs, self->swipe_jobs->len - 1);
-  if (job->state == SWIPE_JOB_RUNNING)
-    self->swipe_running--;
-  /* Bumping the id it would be found by makes its late reply unmatchable. */
-  job->id = 0;
-  g_ptr_array_remove_index (self->swipe_jobs, self->swipe_jobs->len - 1);
-  swipe_dispatch (self);
-  swipe_advance (self);
-  return TRUE;
+    if (entry->kind != SWIPE_ENTRY_GESTURE)
+      continue;
+    /* The head is off limits while its commit is in flight. */
+    if (i == 1 && self->replay_pending)
+      return FALSE;
+    if (entry->state == SWIPE_JOB_RUNNING)
+      self->swipe_running--;
+    /* Clearing the id it would be found by makes its late reply unmatchable. */
+    entry->id = 0;
+    g_ptr_array_remove_range (self->swipe_entries, i - 1,
+                              self->swipe_entries->len - (i - 1));
+    swipe_dispatch (self);
+    swipe_advance (self);
+    return TRUE;
+  }
+  return FALSE;
 }
 
 
@@ -1731,6 +1830,9 @@ pos_completer_verbisage_set_enabled (PosCompleterVerbisage *self, gboolean enabl
   if (!enabled) {
     self->context_available = FALSE;
     self->awaiting_context = FALSE;
+    /* Nothing may be played while the completer is off, including a word
+     * whose commit is still waiting to be acknowledged. */
+    swipe_queue_clear (self, NULL);
     pos_completer_base_set_surrounding_text (POS_COMPLETER_BASE (self), NULL, NULL);
   }
   update_lookup (self);
