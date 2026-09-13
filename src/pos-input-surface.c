@@ -1496,14 +1496,34 @@ select_layout_change_state (GSimpleAction *action,
 
 static void pos_input_surface_set_completer (PosInputSurface *self, PosCompleter *completer);
 
+/* The language the selected source actually provides. Explicit completion
+ * metadata wins; otherwise the layout's own locale is used. A physical layout
+ * name or variant is geometry, not a locale, and never becomes a region here.
+ * Returns %NULL when no language is actually known. */
+static char *
+selected_language_tag (PosCompletionInfo *info, PosOskWidget *osk)
+{
+  if (info) {
+    if (gm_str_is_null_or_empty (info->lang))
+      return NULL;
+    if (gm_str_is_null_or_empty (info->region) || strpbrk (info->lang, "-_"))
+      return g_strdup (info->lang);
+    return g_strdup_printf ("%s_%s", info->lang, info->region);
+  }
+
+  return g_strdup (pos_osk_widget_get_locale (osk));
+}
+
 /* Switch the completion engine and it's configuration */
 static void
 pos_input_surface_switch_completion (PosInputSurface *self, PosOskWidget *osk)
 {
   PosCompletionInfo *info;
-  gboolean success;
   PosCompleter *default_completer;
+  g_autofree char *tag = NULL;
   g_autoptr (GError) err = NULL;
+  const char *lang = NULL;
+  const char *region = NULL;
 
   default_completer = pos_completer_manager_get_default_completer (self->completer_manager);
 
@@ -1511,17 +1531,33 @@ pos_input_surface_switch_completion (PosInputSurface *self, PosOskWidget *osk)
   if (info) {
     /* Layout with completion info */
     pos_input_surface_set_completer (self, info->completer);
-    success = pos_completer_set_language (self->completer, info->lang, info->region, &err);
-    if (!success)
-      g_warning ("Failed to switch completer: %s", err->message);
+    tag = selected_language_tag (info, osk);
+    lang = info->lang;
+    region = info->region;
   } else if (default_completer) {
     /* Layout without completion info - use default completer */
-    const char *lang = pos_osk_widget_get_lang (osk);
-    const char *region = pos_osk_widget_get_region (osk);
-
     pos_input_surface_set_completer (self, default_completer);
-    success = pos_completer_set_language (self->completer, lang, region, &err);
-    if (!success) {
+    tag = selected_language_tag (NULL, osk);
+    lang = pos_osk_widget_get_lang (osk);
+    region = pos_osk_widget_get_region (osk);
+  } else {
+    pos_completion_bar_set_completions (POS_COMPLETION_BAR (self->completion_bar), NULL);
+    return;
+  }
+
+  if (POS_IS_COMPLETER_VERBISAGE (self->completer)) {
+    /* The selected tag is the one identifier completion, prediction and
+     * gestures all use. An unavailable language is not replaced with English:
+     * literal typing stays and suggestions stay unavailable. */
+    if (!pos_completer_verbisage_set_language_tag (
+          POS_COMPLETER_VERBISAGE (self->completer), tag, &err)) {
+      g_warning ("Failed to set completion language '%s': %s",
+                 tag ?: "(unset)", err ? err->message : "unknown error");
+    }
+  } else {
+    /* Unrelated completers keep their language/region inputs and their
+     * existing fallback to the configured defaults. */
+    if (!pos_completer_set_language (self->completer, lang, region, &err)) {
       g_warning ("Failed to set completion language: %s-%s: %s, switching to '%s-%s' instead",
                  lang, region, err->message, POS_COMPLETER_DEFAULT_LANG,
                  POS_COMPLETER_DEFAULT_REGION);

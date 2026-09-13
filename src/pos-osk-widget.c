@@ -2402,23 +2402,23 @@ pos_osk_widget_set_layer (PosOskWidget *self, PosOskWidgetLayer layer)
 static void
 parse_lang (PosOskWidget *self, const char *layout, const char *variant)
 {
-  g_auto (GStrv) parts = NULL;
+  const char *locale = self->layout.locale;
+  const char *separator = locale ? strchr (locale, '-') : NULL;
 
   g_clear_pointer (&self->lang, g_free);
   g_clear_pointer (&self->region, g_free);
 
-  parts = g_strsplit (self->layout.locale, "-", -1);
-  g_assert (g_strv_length (parts) < 3);
-
-  /* Keyboard layout has locale like `pt-PT` */
-  if (g_strv_length (parts) == 2) {
-    self->lang = g_ascii_strdown (parts[0], -1);
-    self->region = g_ascii_strdown (parts[1], -1);
+  /* Keyboard layout has a locale like `pt-PT` or `zh-Hant-TW`: the first
+   * component is the language, the rest is kept together as the region. The
+   * complete locale stays available through pos_osk_widget_get_locale(). */
+  if (separator) {
+    self->lang = g_ascii_strdown (locale, separator - locale);
+    self->region = g_ascii_strdown (separator + 1, -1);
     return;
   }
 
   /* Keyboard layout has language (`en`), region is from layout (`us`) */
-  self->lang = g_strdup (self->layout.locale);
+  self->lang = g_strdup (locale);
   if (gm_str_is_null_or_empty (variant)) {
     self->region = g_strdup (layout);
     return;
@@ -2591,6 +2591,24 @@ pos_osk_widget_get_region (PosOskWidget *self)
   g_return_val_if_fail (POS_IS_OSK_WIDGET (self), NULL);
 
   return self->region;
+}
+
+/**
+ * pos_osk_widget_get_locale:
+ * @self: The osk widget
+ *
+ * The locale the layout declares, preserved verbatim, e.g. `en`, `fr` or
+ * `pt-PT`. This is the widget's language identity; the physical layout name
+ * and variant are geometry and are not folded into it.
+ *
+ * Returns:(nullable): The declared locale
+ */
+const char *
+pos_osk_widget_get_locale (PosOskWidget *self)
+{
+  g_return_val_if_fail (POS_IS_OSK_WIDGET (self), NULL);
+
+  return self->layout.locale;
 }
 
 /**

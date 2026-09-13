@@ -31,7 +31,8 @@ parser.add_argument("--case", choices=["swipe", "swipe-tap", "swipe-next", "swip
                                        "queue-job-deadline-late-success",
                                        "queue-job-deadline-late-playback",
                                        "queue-job-deadline-busy",
-                                       "queue-backspace-utf8-suffix"], default="literal")
+                                       "queue-backspace-utf8-suffix",
+                                       "language-routing", "language-dvorak"], default="literal")
 parser.add_argument("--service-command", default='["/usr/bin/verbisaged", "--mode", "dbus"]')
 parser.add_argument("--dictionary", default="/usr/share/android-patricia-dictionaries/en_US.dict",
                     help="Dictionary used by the service; recorded for provenance")
@@ -166,6 +167,12 @@ if args.case in ("queue-last-key-ack", "queue-backspace-suffix", "queue-pending-
 if args.case.startswith("queue-job-deadline"):
     env["POS_TEST_SWIPE_JOB_DEADLINE_MS"] = (
         "1500" if args.case == "queue-job-deadline-late-playback" else "700")
+# The language cases select a non-default physical layout; the locale in that
+# layout, not the layout or variant name, is the language identity.
+if args.case == "language-routing":
+    env["POS_TEST_LAYOUT"] = "fr"
+elif args.case == "language-dvorak":
+    env["POS_TEST_LAYOUT"] = "us+dvorak"
 env.pop("LD_LIBRARY_PATH", None)
 env.pop("LD_PRELOAD", None)
 env.pop("GLYCIN_DISABLE_SANDBOX", None)
@@ -321,6 +328,11 @@ def service_control(method, *args):
 def service_count(method):
     # gdbus prints "(uint32 2,)": the type name has digits of its own.
     return int(re.search(r"uint32\s+(\d+)", service_control(method)).group(1))
+
+
+def service_languages():
+    """Distinct language tags the controllable service has seen, in order."""
+    return re.findall(r"'([^']*)'", service_control("Languages"))
 
 
 def wait_held_requests(count, label, timeout=10):
@@ -1411,6 +1423,27 @@ try:
             type_word("hello")
             key(" ")
             wait_state("hello ", "", "ordinary taps work after canceled gesture")
+    elif args.case.startswith("language-"):
+        # The layout's own locale, not its physical name or variant, must be
+        # the tag that reaches the service. The controllable service records
+        # every distinct tag its dictionary calls carried.
+        key("a")
+        wait_for(lambda: state("preedit") != "", "the typed preedit appeared")
+        if args.case == "language-routing":
+            wait_for(lambda: service_languages() == ["fr"],
+                     "the fr locale reached the service", timeout=8)
+            assert "en_US" not in service_languages(), \
+                f"an English fallback was requested: {service_languages()}"
+            assert "en" not in service_languages(), \
+                f"the physical layout name leaked into the tag: {service_languages()}"
+        elif args.case == "language-dvorak":
+            wait_for(lambda: service_languages() == ["en"],
+                     "the bare en locale reached the service", timeout=8)
+            assert "en_dvorak" not in service_languages(), \
+                f"the physical variant became a region: {service_languages()}"
+            assert "en_US" not in service_languages(), \
+                f"a US region was invented from geometry: {service_languages()}"
+        result["languages"] = service_languages()
     else:
         word = "hello" if args.case == "literal" else "helo"
         type_word(word)

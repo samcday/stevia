@@ -56,6 +56,7 @@ CONTROL_XML = """
   <method name='Overlap'><arg type='u' direction='out'/></method>
   <method name='Payload'>
     <arg type='u' direction='in'/><arg type='s' direction='out'/></method>
+  <method name='Languages'><arg type='as' direction='out'/></method>
 </interface></node>
 """
 
@@ -72,9 +73,16 @@ class Service:
         self.outstanding = 0
         # What each request actually carried, in arrival order.
         self.payloads = []
+        # Every distinct language tag a request carried, in arrival order.
+        self.languages = []
         # The most requests that were ever outstanding at the same moment: with
         # one worker this can never exceed one.
         self.overlap = 0
+
+    def note_language(self, lang):
+        if lang not in self.languages:
+            self.languages.append(lang)
+            log("language", lang=lang)
 
     # -- dictionary ---------------------------------------------------------
     def dictionary_call(self, connection, sender, path, interface, method, params, invocation):
@@ -82,10 +90,15 @@ class Service:
             invocation.return_value(GLib.Variant("(s)", ("test-layout",)))
         elif method == "ForgetLayout":
             invocation.return_value(GLib.Variant("(b)", (True,)))
-        elif method in ("CompleteWith", "PredictWith"):
+        elif method == "CompleteWith":
+            self.note_language(params.unpack()[3])
+            invocation.return_value(GLib.Variant("(a(sd))", ([],)))
+        elif method == "PredictWith":
+            self.note_language(params.unpack()[2])
             invocation.return_value(GLib.Variant("(a(sd))", ([],)))
         elif method == "RecognizeSwipe":
             trace, keys, _max, lang = params.unpack()
+            self.note_language(lang)
             # Record what this request carried, so a test can check that a
             # gesture kept its own geometry while the keyboard changed.
             labels = [key[0] for key in keys]
@@ -128,6 +141,8 @@ class Service:
             invocation.return_value(GLib.Variant("(u)", (self.requests,)))
         elif method == "Overlap":
             invocation.return_value(GLib.Variant("(u)", (self.overlap,)))
+        elif method == "Languages":
+            invocation.return_value(GLib.Variant("(as)", (self.languages,)))
         elif method == "Payload":
             index = params.unpack()[0]
             if index >= len(self.payloads):

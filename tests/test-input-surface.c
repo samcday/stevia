@@ -69,6 +69,63 @@ test_swipe_purpose (void)
 }
 
 
+static void
+test_selected_language_tag (void)
+{
+  PosCompletionInfo info = { .lang = "fr", .region = NULL };
+  g_autofree char *tag = NULL;
+
+  /* Completion-source metadata wins over physical fallback geometry. */
+  tag = selected_language_tag (&info, NULL);
+  g_assert_cmpstr (tag, ==, "fr");
+
+  g_free (tag);
+  info.region = "BR";
+  tag = selected_language_tag (&info, NULL);
+  g_assert_cmpstr (tag, ==, "fr_BR");
+
+  /* A complete tag is not joined again. */
+  g_free (tag);
+  info.lang = "fr_FR-br";
+  info.region = "unused";
+  tag = selected_language_tag (&info, NULL);
+  g_assert_cmpstr (tag, ==, "fr_FR-br");
+
+  /* An unset source language selects nothing. */
+  g_free (tag);
+  info.lang = "";
+  info.region = NULL;
+  tag = selected_language_tag (&info, NULL);
+  g_assert_null (tag);
+}
+
+
+static void
+test_selected_locale_tag (void)
+{
+  PosOskWidget *osk = pos_osk_widget_new (PHOSH_OSK_FEATURE_DEFAULT);
+  g_autofree char *tag = NULL;
+
+  g_object_ref_sink (osk);
+  g_assert_true (pos_osk_widget_set_layout (osk, "pt", "pt", "Portuguese", "pt", NULL, NULL));
+  g_assert_cmpstr (pos_osk_widget_get_locale (osk), ==, "pt-PT");
+  tag = selected_language_tag (NULL, osk);
+  g_assert_cmpstr (tag, ==, "pt-PT");
+
+  /* A physical variant is geometry, not a region. */
+  g_free (tag);
+  g_assert_true (pos_osk_widget_set_layout (osk, "us+dvorak", "us", "English (US, Dvorak)",
+                                            "us", "dvorak", NULL));
+  g_assert_cmpstr (pos_osk_widget_get_locale (osk), ==, "en");
+  g_assert_cmpstr (pos_osk_widget_get_region (osk), ==, "dvorak");
+  tag = selected_language_tag (NULL, osk);
+  g_assert_cmpstr (tag, ==, "en");
+
+  gtk_widget_destroy (GTK_WIDGET (osk));
+  g_object_unref (osk);
+}
+
+
 int
 main (int argc, char *argv[])
 {
@@ -84,6 +141,8 @@ main (int argc, char *argv[])
   g_test_add_func ("/pos/osk-input-surface/swipe-layout", test_swipe_layout);
 
   g_test_add_func ("/pos/osk-input-surface/swipe-purpose", test_swipe_purpose);
+  g_test_add_func ("/pos/osk-input-surface/selected-language-tag", test_selected_language_tag);
+  g_test_add_func ("/pos/osk-input-surface/selected-locale-tag", test_selected_locale_tag);
 
   ret = g_test_run ();
 

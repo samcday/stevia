@@ -45,6 +45,15 @@ gboolean      pos_completer_verbisage_restore_swipe (PosCompleterVerbisage *self
  * [method@Pos.OskWidget.get_layout_geometry]; %NULL disables layout use. */
 void pos_completer_verbisage_set_layout (PosCompleterVerbisage *self, GVariant *geometry);
 
+/* Select the complete language tag sent to the service. The tag is kept as
+ * selected, including region and variant components; an empty or %NULL tag
+ * clears the selection. A real change drops unplayed gestures, deferred keys,
+ * retry timers and acknowledgements and cancels ordinary lookups while
+ * committed text stays; re-selecting the same tag keeps accepted work. */
+gboolean pos_completer_verbisage_set_language_tag (PosCompleterVerbisage *self,
+                                                   const char *tag,
+                                                   GError **error);
+
 void pos_completer_verbisage_set_enabled (PosCompleterVerbisage *self, gboolean enabled);
 void pos_completer_verbisage_expect_commit (PosCompleterVerbisage *self);
 void pos_completer_verbisage_acknowledge_swipe (PosCompleterVerbisage *self,

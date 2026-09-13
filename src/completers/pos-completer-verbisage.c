@@ -18,6 +18,8 @@
 #define INTERFACE "org.verbisage.Dictionary1"
 #define MAX_RESULTS 6
 #define MAX_WORD_CHARS 128
+/* The daemon's language validation bound. */
+#define MAX_LANGUAGE_TAG_BYTES 64
 #define LOOKUP_DELAY_MS 60
 #define LOOKUP_TIMEOUT_MS 1000
 /* Enough to keep the layers a user alternates between (normal, shifted,
@@ -1519,6 +1521,68 @@ pos_completer_verbisage_set_surrounding_text (PosCompleter *iface,
 }
 
 
+/* A tag the daemon's language validation accepts: nonempty, bounded and made
+ * of ASCII alphanumerics plus the separators the service allows. */
+static gboolean
+language_tag_is_valid (const char *tag)
+{
+  if (gm_str_is_null_or_empty (tag) || strlen (tag) > MAX_LANGUAGE_TAG_BYTES)
+    return FALSE;
+  for (const char *p = tag; *p; p++) {
+    if (!g_ascii_isalnum (*p) && !strchr ("_-@.", *p))
+      return FALSE;
+  }
+  return TRUE;
+}
+
+
+/**
+ * pos_completer_verbisage_set_language_tag:
+ * @self: The completer
+ * @tag: (nullable): The complete selected language tag, or %NULL to clear
+ * @error: The error location
+ *
+ * Select the language tag sent to the service for completion, prediction and
+ * gestures. The tag is used exactly as selected, so a regional/variant tag
+ * such as `fr_FR-br` and a bare language both reach the service unchanged. A
+ * real change is a session change for unplayed work: accepted gestures,
+ * deferred keys, retry timers and acknowledgements are dropped and ordinary
+ * lookups are cancelled. Committed text and the literal preedit stay.
+ *
+ * Returns: %TRUE when the tag was selected or cleared.
+ */
+gboolean
+pos_completer_verbisage_set_language_tag (PosCompleterVerbisage *self,
+                                          const char *tag,
+                                          GError **error)
+{
+  gboolean clearing = gm_str_is_null_or_empty (tag);
+
+  g_return_val_if_fail (POS_IS_COMPLETER_VERBISAGE (self), FALSE);
+
+  if (!clearing && !language_tag_is_valid (tag)) {
+    /* Deliberately not echoing the rejected tag: it can be arbitrarily long. */
+    g_set_error_literal (error, POS_COMPLETER_ERROR, POS_COMPLETER_ERROR_LANG_INIT,
+                         "Invalid language tag");
+    return FALSE;
+  }
+  if (g_strcmp0 (self->language, clearing ? NULL : tag) == 0)
+    return TRUE;
+
+  if (self->language) {
+    /* Nothing accepted for the old language may reach the application, and
+     * its late replies and retries must not restart work. Already committed
+     * text is untouched by the queue clear. */
+    swipe_queue_clear (self, NULL);
+    g_clear_pointer (&self->language, g_free);
+  }
+  if (!clearing)
+    self->language = g_strdup (tag);
+  update_lookup (self);
+  return TRUE;
+}
+
+
 static gboolean
 pos_completer_verbisage_set_language (PosCompleter *iface,
                                      const char *lang,
@@ -1526,19 +1590,21 @@ pos_completer_verbisage_set_language (PosCompleter *iface,
                                      GError **error)
 {
   PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (iface);
+  g_autofree char *tag = NULL;
 
-  g_clear_pointer (&self->language, g_free);
-  if (g_ascii_strcasecmp (lang, "en") != 0 ||
-      (region && *region && g_ascii_strcasecmp (region, "us") != 0)) {
-    update_lookup (self);
+  if (gm_str_is_null_or_empty (lang)) {
     g_set_error_literal (error, POS_COMPLETER_ERROR, POS_COMPLETER_ERROR_LANG_INIT,
-                         "The Verbisage trial supports en_US only");
+                         "No language selected");
     return FALSE;
   }
+  /* A complete tag in `lang` is kept as-is; a separate region is joined once
+   * with an underscore and the region's own spelling preserved. */
+  if (gm_str_is_null_or_empty (region) || strpbrk (lang, "-_@."))
+    tag = g_strdup (lang);
+  else
+    tag = g_strdup_printf ("%s_%s", lang, region);
 
-  self->language = g_strdup ("en_US");
-  update_lookup (self);
-  return TRUE;
+  return pos_completer_verbisage_set_language_tag (self, tag, error);
 }
 
 
@@ -1679,7 +1745,8 @@ pos_completer_verbisage_init (PosCompleterVerbisage *self)
 {
   self->enabled = TRUE;
   self->preedit = g_string_new (NULL);
-  self->language = g_strdup ("en_US");
+  /* No language is fabricated before the keyboard selects one. */
+  self->language = NULL;
   self->layout_tokens = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
   self->swipe_entries = g_ptr_array_new_with_free_func ((GDestroyNotify) swipe_entry_free);
 }

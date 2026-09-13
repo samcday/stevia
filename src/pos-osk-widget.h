@@ -37,6 +37,9 @@ PosOskWidgetMode  pos_osk_widget_get_mode   (PosOskWidget *self);
 const char       *pos_osk_widget_get_layout_id (PosOskWidget *self);
 const char       *pos_osk_widget_get_lang   (PosOskWidget *self);
 const char       *pos_osk_widget_get_region (PosOskWidget *self);
+/* The layout's own locale, preserved verbatim. This is the language identity;
+ * the physical layout name and variant are geometry, not a locale. */
+const char       *pos_osk_widget_get_locale (PosOskWidget *self);
 void              pos_osk_widget_set_features (PosOskWidget *self, PhoshOskFeatures features);
 const char *const *pos_osk_widget_get_symbols (PosOskWidget *self);
 void              pos_osk_widget_set_key_height (PosOskWidget *self, guint key_height);
