@@ -427,6 +427,31 @@ swipe_job_by_id (PosCompleterVerbisage *self, guint64 id, guint64 session)
 }
 
 
+static gboolean
+swipe_job_expired (const SwipeEntry *job)
+{
+  return g_get_monotonic_time () >= job->deadline;
+}
+
+
+/* Retire a gesture where it stands. Its retry timer goes away and a request
+ * still in flight is cancelled and its worker slot returned, so a late reply
+ * can neither play nor leak the running count. The entry itself stays in the
+ * queue so playback stops at its position instead of skipping to the input
+ * behind it. */
+static void
+swipe_job_fail (PosCompleterVerbisage *self, SwipeEntry *job)
+{
+  g_clear_handle_id (&job->retry_id, g_source_remove);
+  if (job->state == SWIPE_JOB_RUNNING) {
+    if (job->cancellable)
+      g_cancellable_cancel (job->cancellable);
+    self->swipe_running--;
+  }
+  job->state = SWIPE_JOB_FAILED;
+}
+
+
 static guint
 swipe_count (PosCompleterVerbisage *self, SwipeEntryKind kind)
 {
@@ -561,6 +586,17 @@ on_swipe_job_finished (GObject *source, GAsyncResult *result, gpointer user_data
     return;
   }
 
+  /* A success that arrives after this gesture's lifetime is no longer valid:
+   * the input behind it was accepted for a text state that has since been
+   * overtaken. Retire it at its position instead of playing it. */
+  if (swipe_job_expired (job)) {
+    g_debug ("Gesture %" G_GUINT64_FORMAT " exceeded its job deadline", job->id);
+    job->state = SWIPE_JOB_FAILED;
+    swipe_dispatch (self);
+    swipe_advance (self);
+    return;
+  }
+
   words = g_ptr_array_new_with_free_func (g_free);
   {
     g_autoptr (GVariantIter) iter = NULL;
@@ -595,6 +631,18 @@ swipe_request_timeout (void)
     timeout = (configured && atoi (configured) > 0) ? atoi (configured) : LOOKUP_TIMEOUT_MS;
   }
   return timeout;
+}
+
+
+/* How long one accepted gesture may take, from admission until it is played.
+ * Read on each admission rather than cached, so a test can set the POS_TEST_*
+ * override for one gesture at a time; unset, it is the ordinary deadline. */
+static int
+swipe_job_deadline (void)
+{
+  const char *configured = g_getenv ("POS_TEST_SWIPE_JOB_DEADLINE_MS");
+
+  return (configured && atoi (configured) > 0) ? atoi (configured) : SWIPE_JOB_DEADLINE_MS;
 }
 
 
@@ -677,6 +725,21 @@ swipe_dispatch (PosCompleterVerbisage *self)
     return;
   }
 
+  /* Retire waiting gestures that outlived their lifetime instead of starting
+   * them late. The failed entry keeps its place so playback stops there, and
+   * deadlines follow admission order, so one pass is enough. Expiring can
+   * clear the queue, so stop iterating afterwards. */
+  for (guint i = 0; i < self->swipe_entries->len; i++) {
+    SwipeEntry *entry = g_ptr_array_index (self->swipe_entries, i);
+
+    if (entry->kind == SWIPE_ENTRY_GESTURE && entry->state == SWIPE_JOB_WAITING &&
+        entry->retry_id == 0 && swipe_job_expired (entry)) {
+      swipe_job_fail (self, entry);
+      swipe_advance (self);
+      return;
+    }
+  }
+
   for (guint i = 0; i < self->swipe_entries->len && self->swipe_running < SWIPE_WORKERS; i++) {
     SwipeEntry *entry = g_ptr_array_index (self->swipe_entries, i);
 
@@ -702,6 +765,13 @@ swipe_retry_timeout (gpointer data)
   if (!job)
     return G_SOURCE_REMOVE;
   job->retry_id = 0;
+  /* The wait outlived the gesture: a retry must not restart it. */
+  if (swipe_job_expired (job)) {
+    g_debug ("Gesture %" G_GUINT64_FORMAT " exceeded its job deadline", job->id);
+    swipe_job_fail (self, job);
+    swipe_advance (self);
+    return G_SOURCE_REMOVE;
+  }
   swipe_dispatch (self);
   return G_SOURCE_REMOVE;
 }
@@ -772,6 +842,12 @@ swipe_advance (PosCompleterVerbisage *self)
       }
       continue;
     }
+
+    /* A gesture that outlived its lifetime never plays, even when its result
+     * is already in hand. Retire it in place so playback stops here instead
+     * of skipping to the input behind it. */
+    if (head->state != SWIPE_JOB_FAILED && swipe_job_expired (head))
+      swipe_job_fail (self, head);
 
     if (head->state == SWIPE_JOB_WAITING || head->state == SWIPE_JOB_RUNNING) {
       /* An entry that finished behind the head waits its turn; finishing
@@ -1657,7 +1733,7 @@ pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
   job->session = self->swipe_session;
   job->capitalization = capitalization;
   job->state = SWIPE_JOB_WAITING;
-  job->deadline = g_get_monotonic_time () + SWIPE_JOB_DEADLINE_MS * G_TIME_SPAN_MILLISECOND;
+  job->deadline = g_get_monotonic_time () + swipe_job_deadline () * G_TIME_SPAN_MILLISECOND;
   /* Captured now: a later resize, layer change or Shift release cannot alter
    * a request that has already been accepted. */
   job->parameters = g_variant_ref_sink (
