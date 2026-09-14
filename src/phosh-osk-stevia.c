@@ -290,7 +290,8 @@ create_input_surface (PosApp *self)
                                pos_wayland_get_wl_seat (wayland));
 
   im =
-    pos_input_method_new (pos_wayland_get_zwp_input_method_manager_v2 (wayland),
+    pos_input_method_new (pos_wayland_get_wl_display (wayland),
+                          pos_wayland_get_zwp_input_method_manager_v2 (wayland),
                           pos_wayland_get_wl_seat (wayland));
 
   force_completion = !!(_debug_flags & POS_DEBUG_FLAG_FORCE_COMPLETEION);

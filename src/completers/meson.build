@@ -156,7 +156,7 @@ libpos_completer_verbisage_lib = static_library(
   libpos_completer_verbisage_sources,
   include_directories: pos_includes,
   install: false,
-  dependencies: [gio_dep, glib_dep],
+  dependencies: [gio_dep, glib_dep, gmobile_dep, json_glib_dep],
 )
 libpos_completer_verbisage_dep = declare_dependency(
   include_directories: libpos_completer_includes,

@@ -68,6 +68,32 @@ typedef enum {
 } PosInputMethodTextChangeCause;
 
 /**
+ * PosInputMethodTransactionFailure:
+ * @POS_INPUT_METHOD_TRANSACTION_UNCONFIRMED: the compositor handled the
+ *   barrier before the commit and the commit itself in different reads with
+ *   a `done` in between, so whether the commit was applied cannot be told;
+ *   it was not re-sent
+ * @POS_INPUT_METHOD_TRANSACTION_CONTEXT_CHANGED: it deleted text relative to
+ *   a cursor the application moved, or text it changed, while it waited
+ * @POS_INPUT_METHOD_TRANSACTION_SEND_LIMIT: the compositor discarded it again
+ *   after its last permitted send
+ * @POS_INPUT_METHOD_TRANSACTION_LIFETIME: the compositor discarded it after
+ *   it had lived longer than a transaction may
+ * @POS_INPUT_METHOD_TRANSACTION_QUEUE_FULL: it was refused because too many
+ *   transactions were already waiting to be sent
+ *
+ * Why the input method gave up on a committed transaction, see
+ * `PosInputMethod::transaction-failed`.
+ */
+typedef enum {
+  POS_INPUT_METHOD_TRANSACTION_UNCONFIRMED = 0,
+  POS_INPUT_METHOD_TRANSACTION_CONTEXT_CHANGED,
+  POS_INPUT_METHOD_TRANSACTION_SEND_LIMIT,
+  POS_INPUT_METHOD_TRANSACTION_LIFETIME,
+  POS_INPUT_METHOD_TRANSACTION_QUEUE_FULL,
+} PosInputMethodTransactionFailure;
+
+/**
  * PosInputMethodPurpose:
  *
  * Input purpose as specified by text input protocol.

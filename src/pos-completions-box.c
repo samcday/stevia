@@ -146,6 +146,20 @@ pos_completions_box_size_allocate (GtkWidget *widget, GtkAllocation *allocation)
       child_allocation.x = allocation->x + allocation->width -
                            (child_allocation.x - allocation->x) - child_allocation.width;
 
+    /* Lets a test select a completion by name instead of by a fixed slot. */
+    {
+      GtkWidget *toplevel = gtk_widget_get_toplevel (widget);
+      int surface_x = child_allocation.x, surface_y = child_allocation.y;
+
+      if (gtk_widget_is_toplevel (toplevel)) {
+        gtk_widget_translate_coordinates (widget, toplevel, child_allocation.x,
+                                          child_allocation.y, &surface_x, &surface_y);
+      }
+      g_debug ("completion %d '%s' x: %d, width: %d, y: %d, height: %d", i,
+               (const char *) g_object_get_data (G_OBJECT (child), "pos-text") ?: "",
+               surface_x, child_allocation.width, surface_y, child_allocation.height);
+    }
+
     gtk_widget_size_allocate_with_baseline (child, &child_allocation, -1);
   }
 }
