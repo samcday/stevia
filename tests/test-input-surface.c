@@ -50,7 +50,15 @@ test_swipe_layout (void)
   pos_osk_widget_set_layer (osk, POS_OSK_WIDGET_LAYER_SYMBOLS);
   g_assert_false (swipe_layout_supported (osk));
   pos_osk_widget_set_layer (osk, POS_OSK_WIDGET_LAYER_NORMAL);
+  /* Letter layers of any script are gesture layers; which words come back is
+   * the selected language's dictionary's business. */
   g_assert_true (pos_osk_widget_set_layout (osk, "de", "de", "German", "de", NULL, NULL));
+  g_assert_true (swipe_layout_supported (osk));
+  g_assert_true (pos_osk_widget_set_layout (osk, "gr", "gr", "Greek", "gr", NULL, NULL));
+  g_assert_true (swipe_layout_supported (osk));
+  pos_osk_widget_set_layer (osk, POS_OSK_WIDGET_LAYER_CAPS);
+  g_assert_true (swipe_layout_supported (osk));
+  pos_osk_widget_set_layer (osk, POS_OSK_WIDGET_LAYER_SYMBOLS);
   g_assert_false (swipe_layout_supported (osk));
   gtk_widget_destroy (GTK_WIDGET (osk));
   g_object_unref (osk);

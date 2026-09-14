@@ -348,7 +348,19 @@ test_swipe_pointer (SwipeFixture *fixture, gconstpointer unused)
   g_assert_cmpuint (fixture->swipes, ==, 1);
   g_assert_cmpstr (fixture->typed->str, ==, "h");
   g_assert_cmpuint (g_variant_n_children (fixture->trace), ==, 4);
-  g_assert_cmpuint (g_variant_n_children (fixture->keys), ==, 26);
+  /* The gesture carries the whole letter layer it was drawn on, not an
+   * alphabet-only reduction of it: 26 letters plus comma, space and period. */
+  g_assert_true (g_variant_is_of_type (fixture->keys, G_VARIANT_TYPE ("a(sasdddd)")));
+  g_assert_cmpuint (g_variant_n_children (fixture->keys), ==, 29);
+  g_assert_true (g_variant_equal (fixture->keys,
+                                  pos_osk_widget_get_layout_geometry (fixture->osk)));
+  g_assert_true (geometry_has_symbol (fixture->keys, "q"));
+  g_assert_false (geometry_has_symbol (fixture->keys, "Q"));
+  g_assert_true (geometry_has_symbol (fixture->keys, POS_OSK_SYMBOL_SPACE));
+  /* The period key's popup carries the apostrophe, the alternate a "don't"
+   * gesture would need and part of the geometry the committed US fixture is
+   * generated from. */
+  g_assert_true (geometry_has_alternate (fixture->keys, ".", "'"));
   g_variant_get_child (fixture->trace, 0, "(ddu)", &x, &y, &time);
   g_assert_cmpuint (time, ==, 0);
   g_assert_cmpstr (pos_osk_key_get_symbol (pos_osk_widget_locate_key (fixture->osk, x, y)), ==, "h");
@@ -356,6 +368,54 @@ test_swipe_pointer (SwipeFixture *fixture, gconstpointer unused)
   g_assert_cmpuint (time, ==, 150);
   g_assert_nonnull (fixture->osk->swipe_points);
   g_assert_cmpuint (fixture->osk->trail_tick, !=, 0);
+}
+
+
+/* A gesture across d, o, n and the period key, released at t. This is the
+ * path whose captured geometry the committed US fixture is generated from,
+ * through tests/native/export-layout-fixture.py: the period key's apostrophe
+ * alternate is what a "don't" gesture would need. Paired client/service
+ * recognition is not exercised by any test yet; this only pins the client
+ * geometry the fixture is built from. */
+static void
+test_swipe_word_path (SwipeFixture *fixture, gconstpointer unused)
+{
+  pointer_event (fixture, GDK_BUTTON_PRESS, "d", 100);
+  pointer_event (fixture, GDK_MOTION_NOTIFY, "o", 150);
+  pointer_event (fixture, GDK_MOTION_NOTIFY, "n", 200);
+  pointer_event (fixture, GDK_MOTION_NOTIFY, ".", 250);
+  pointer_event (fixture, GDK_BUTTON_RELEASE, "t", 300);
+  g_assert_cmpuint (fixture->swipes, ==, 1);
+  g_assert_cmpstr (fixture->typed->str, ==, "");
+  g_assert_cmpuint (g_variant_n_children (fixture->keys), ==, 29);
+  g_assert_true (geometry_has_alternate (fixture->keys, ".", "'"));
+  g_assert_true (geometry_has_symbol (fixture->keys, "d"));
+  g_assert_true (geometry_has_symbol (fixture->keys, "t"));
+}
+
+
+/* Any text key of a letter layer can start a gesture, punctuation included;
+ * the space bar stays a cursor key and never starts one. */
+static void
+test_swipe_punctuation_start (SwipeFixture *fixture, gconstpointer unused)
+{
+  pointer_event (fixture, GDK_BUTTON_PRESS, ",", 100);
+  pointer_event (fixture, GDK_MOTION_NOTIFY, "o", 150);
+  pointer_event (fixture, GDK_BUTTON_RELEASE, "l", 200);
+  g_assert_cmpuint (fixture->swipes, ==, 1);
+  g_assert_cmpstr (fixture->typed->str, ==, "");
+  g_assert_true (geometry_has_symbol (fixture->keys, ","));
+
+  pointer_event (fixture, GDK_BUTTON_PRESS, POS_OSK_SYMBOL_SPACE, 300);
+  pointer_event (fixture, GDK_MOTION_NOTIFY, "e", 350);
+  pointer_event (fixture, GDK_BUTTON_RELEASE, "l", 400);
+  g_assert_cmpuint (fixture->swipes, ==, 1);
+  /* The space drag reached the ordinary key handling, not a gesture: with
+   * KEY_DRAG the space is typed when the pointer leaves it and the key under
+   * the release completes it, exactly as for any other key. Cursor motion is
+   * entered by a long press, which these synthetic events never produce. */
+  g_assert_cmpstr (fixture->typed->str, ==, " l");
+  g_assert_null (strstr (fixture->typed->str, "KEY_"));
 }
 
 
@@ -628,15 +688,13 @@ test_swipe_dispatch_caps (SwipeFixture *fixture, gconstpointer unused)
     g_assert_cmpuint (fixture->osk->trail_tick, >, 0);
     g_assert_cmpuint (fixture->osk->swipe_points->len, >, 1);
     g_assert_false (pos_osk_widget_swipe_in_progress (fixture->osk));
-    g_assert_cmpuint (g_variant_n_children (fixture->keys), ==, 26);
-    for (guint i = 0; i < 26; i++) {
-      const char *label;
-      double left, top, width, height;
-
-      g_variant_get_child (fixture->keys, i, "(&sdddd)", &label, &left, &top, &width, &height);
-      g_assert_cmpuint (strlen (label), ==, 1);
-      g_assert_true (g_ascii_islower (label[0]));
-    }
+    /* Captured on the layer it was drawn on: the layout's own capitals, with
+     * the unshifted letter of the same physical key among the alternates. */
+    g_assert_true (g_variant_is_of_type (fixture->keys, G_VARIANT_TYPE ("a(sasdddd)")));
+    g_assert_cmpuint (g_variant_n_children (fixture->keys), ==, 29);
+    g_assert_true (geometry_has_symbol (fixture->keys, "Q"));
+    g_assert_false (geometry_has_symbol (fixture->keys, "q"));
+    g_assert_true (geometry_has_alternate (fixture->keys, "Q", "q"));
   }
 }
 
@@ -1032,6 +1090,8 @@ main (int argc, char *argv[])
 #define SWIPE_TEST(name, function) \
   g_test_add ("/pos/osk-widget/swipe/" name, SwipeFixture, NULL, swipe_setup, function, swipe_teardown)
   SWIPE_TEST ("pointer-tap", test_swipe_pointer);
+  SWIPE_TEST ("word-path", test_swipe_word_path);
+  SWIPE_TEST ("punctuation-start", test_swipe_punctuation_start);
   SWIPE_TEST ("touch-multitouch", test_swipe_touch);
   SWIPE_TEST ("touch-cancel", test_swipe_cancel_event);
   SWIPE_TEST ("lifecycle", test_swipe_lifecycle);

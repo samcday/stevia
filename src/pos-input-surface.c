@@ -164,6 +164,12 @@ struct _PosInputSurface {
   /* Swipe gesture */
   GtkGesture                 *swipe_down;
   gboolean                    swipe_typing;
+  /* Counts every input-context change that invalidates accepted gestures. A
+   * gesture snapshots it when it starts; a different value on release means
+   * the gesture was drawn in a context that no longer exists. */
+  guint64                     swipe_context;
+  guint64                     swipe_start_context;
+  gboolean                    swipe_started;
   /* The commit the gesture queue is currently waiting to see land. The queue
    * itself owns the accepted gestures; this is only the text-state
    * expectation for the one word being replayed. */
@@ -225,6 +231,7 @@ clear_edit_history (PosInputSurface *self)
 static void
 invalidate_swipe_queue (PosInputSurface *self)
 {
+  self->swipe_context++;
   g_clear_pointer (&self->swipe_replay_ack, pos_completion_undo_free);
   self->pending_virtual_enter = FALSE;
   if (POS_IS_COMPLETER_VERBISAGE (self->completer))
@@ -513,13 +520,15 @@ swipe_purpose_supported (PosInputMethodPurpose purpose, guint hints)
 }
 
 
+/* Gestures are drawn on letter layers of any script: the normal and shifted
+ * layers, whose displayed geometry and alternate labels are registered with
+ * the service. Symbol layers are not gesture layers. Which languages actually
+ * recognize words is decided by the selected language's dictionary. */
 static gboolean
 swipe_layout_supported (PosOskWidget *osk)
 {
-  return g_strcmp0 (pos_osk_widget_get_lang (osk), "en") == 0 &&
-         g_strcmp0 (pos_osk_widget_get_region (osk), "us") == 0 &&
-         (pos_osk_widget_get_layer (osk) == POS_OSK_WIDGET_LAYER_NORMAL ||
-          pos_osk_widget_get_layer (osk) == POS_OSK_WIDGET_LAYER_CAPS);
+  return pos_osk_widget_get_layer (osk) == POS_OSK_WIDGET_LAYER_NORMAL ||
+         pos_osk_widget_get_layer (osk) == POS_OSK_WIDGET_LAYER_CAPS;
 }
 
 
@@ -601,22 +610,46 @@ on_osk_swipe_cancelled (PosInputSurface *self)
 }
 
 
+/* A possible gesture started: remember the input context it is drawn in. */
 static void
-on_osk_swipe (PosInputSurface *self, GVariant *trace, GVariant *keys, GtkWidget *osk)
+on_osk_swipe_started (PosInputSurface *self)
+{
+  self->swipe_start_context = self->swipe_context;
+  self->swipe_started = TRUE;
+}
+
+
+static void
+on_osk_swipe (PosInputSurface *self, GVariant *trace, GVariant *geometry, GtkWidget *osk)
 {
   PosCompleterVerbisage *completer;
   guint capitalization;
+  gboolean same_context = self->swipe_started &&
+                          self->swipe_start_context == self->swipe_context;
 
+  self->swipe_started = FALSE;
   clear_completion_undo (self);
+  /* The gesture was drawn in the context captured when it started. If the
+   * field, selection, purpose, language or completer changed meanwhile, the
+   * two contexts are not mixed: the gesture is refused with feedback rather
+   * than accepted into whichever context is current now. */
+  if (!same_context) {
+    g_debug ("The input context changed during the gesture; refusing it");
+    pos_input_surface_trigger_feedback (self, BUTTON_PRESS_EVENT);
+    return;
+  }
   if (!swipe_eligible (self, osk))
     return;
 
   completer = POS_COMPLETER_VERBISAGE (self->completer);
   capitalization = pos_osk_widget_get_swipe_capitalization (POS_OSK_WIDGET (osk));
-  /* The queue owns ordering: it commits the word on screen and any words
-   * before this one first, each waiting for its acknowledgement. A refusal it
-   * can explain plays its own feedback, so nothing is added here. */
-  pos_completer_verbisage_recognize_swipe (completer, trace, keys, capitalization);
+  /* The geometry is the layer the gesture was drawn on, captured at its start
+   * by the keyboard; the completer registers it, or reuses its token, for
+   * exactly this gesture. The queue owns ordering: it commits the word on
+   * screen and any words before this one first, each waiting for its
+   * acknowledgement. A refusal it can explain plays its own feedback, so
+   * nothing is added here. */
+  pos_completer_verbisage_recognize_swipe (completer, trace, geometry, capitalization);
 }
 
 
@@ -2793,6 +2826,7 @@ insert_osk (PosInputSurface   *self,
   g_object_connect (osk_widget,
                     "swapped-signal::geometry-changed", G_CALLBACK (on_osk_geometry_changed), self,
                     "swapped-signal::swipe", G_CALLBACK (on_osk_swipe), self,
+                    "swapped-signal::swipe-started", G_CALLBACK (on_osk_swipe_started), self,
                     "swapped-signal::swipe-cancelled", G_CALLBACK (on_osk_swipe_cancelled), self,
                     "swapped-signal::notify::layer", G_CALLBACK (update_swipe_enabled), self,
                     "swapped-signal::key-cancelled", G_CALLBACK (on_osk_key_cancelled), self,

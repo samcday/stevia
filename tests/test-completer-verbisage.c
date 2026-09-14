@@ -24,7 +24,7 @@ static const char service_xml[] =
   "<method name='PredictWith'><arg type='as' direction='in'/><arg type='u' direction='in'/>"
   "<arg type='s' direction='in'/><arg type='(ss)' direction='in'/><arg type='a(sd)' direction='out'/></method>"
   "<method name='RecognizeSwipe'><arg type='a(ddu)' direction='in'/>"
-  "<arg type='a(sdddd)' direction='in'/><arg type='u' direction='in'/>"
+  "<arg type='s' direction='in'/><arg type='u' direction='in'/>"
   "<arg type='s' direction='in'/><arg type='a(sd)' direction='out'/></method>"
   "</interface></node>";
 
@@ -55,6 +55,18 @@ typedef struct {
   char *last_upload;
   char *last_token;
   gboolean reject_tokens;
+  /* The tokens the service currently knows, each naming the upload it was
+   * issued for. Evicting forgets them all; a later registration of the same
+   * upload gets a token of the next generation, so a recovered token can be
+   * told from the one it replaced. */
+  GHashTable *layouts;
+  /* Every token a gesture request quoted, and the upload each named, in
+   * arrival order; every token a completion request quoted. */
+  GPtrArray *swipe_tokens;
+  GPtrArray *swipe_uploads;
+  GPtrArray *completion_tokens;
+  /* The service keeps rejecting every gesture token as unknown. */
+  gboolean reject_swipe_tokens;
   /* Stands in for the input surface: acknowledge replayed commits unless a
    * case is specifically about a missing acknowledgement. */
   gboolean hold_ack;
@@ -226,13 +238,20 @@ answer (GDBusMethodInvocation *invocation)
 }
 
 
+/* Bumped by each eviction, so the token issued afterwards for the same
+ * upload differs from the one the service forgot. */
+static guint token_generation;
+
+
 /* The service dedupes by content, so equal uploads must map to equal tokens. */
 static char *
 token_for (const char *upload)
 {
   g_autofree char *digest = g_compute_checksum_for_string (G_CHECKSUM_SHA256, upload, -1);
 
-  return g_strndup (digest, 16);
+  if (token_generation == 0)
+    return g_strndup (digest, 16);
+  return g_strdup_printf ("%.16s-%u", digest, token_generation);
 }
 
 
@@ -245,7 +264,19 @@ answer_registration (Fixture *fixture, GDBusMethodInvocation *invocation)
 
   g_variant_get (parameters, "(&s)", &upload);
   token = token_for (upload);
+  g_hash_table_insert (fixture->layouts, g_strdup (token), g_strdup (upload));
   g_dbus_method_invocation_return_value (invocation, g_variant_new ("(s)", token));
+}
+
+
+/* The service dropped every registered layout: its cache evicted them, or a
+ * restarted daemon starts with an empty registry. Tokens issued so far are
+ * unknown from now on. */
+static void
+evict_layouts (Fixture *fixture)
+{
+  g_hash_table_remove_all (fixture->layouts);
+  token_generation++;
 }
 
 
@@ -294,12 +325,24 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
   fixture->requests++;
   if (g_str_equal (method, "RecognizeSwipe")) {
     g_autoptr (GVariant) trace = NULL;
-    g_autoptr (GVariant) keys = NULL;
+    const char *token, *upload;
 
     fixture->swipe_requests++;
-    g_variant_get (parameters, "(@a(ddu)@a(sdddd)u&s)", &trace, &keys, &max, &language);
+    g_variant_get (parameters, "(@a(ddu)&su&s)", &trace, &token, &max, &language);
     g_assert_cmpuint (g_variant_n_children (trace), ==, 3);
-    g_assert_cmpuint (g_variant_n_children (keys), ==, 26);
+    g_ptr_array_add (fixture->swipe_tokens, g_strdup (token));
+    upload = g_hash_table_lookup (fixture->layouts, token);
+    if (upload == NULL || fixture->reject_swipe_tokens) {
+      /* What the service answers for a token it never issued or has since
+       * evicted: the same error the completion path recovers from. */
+      g_autofree char *message = g_strdup_printf ("unknown layout token '%s'", token);
+
+      g_dbus_method_invocation_return_dbus_error (invocation,
+                                                  "org.freedesktop.DBus.Error.InvalidArgs",
+                                                  message);
+      return;
+    }
+    g_ptr_array_add (fixture->swipe_uploads, g_strdup (upload));
     word = "swipe";
   } else if (g_str_equal (method, "PredictWith")) {
     fixture->prediction_requests++;
@@ -324,6 +367,7 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
     g_assert_cmpuint (g_variant_n_children (points), ==, 0);
     g_free (fixture->last_token);
     fixture->last_token = g_strdup (token);
+    g_ptr_array_add (fixture->completion_tokens, g_strdup (token));
 
     if (fixture->reject_token_requests && *token) {
       g_autofree char *message = g_strdup_printf ("unknown layout token '%s'", token);
@@ -335,7 +379,7 @@ on_call (GDBusConnection *connection, const char *sender, const char *path,
       return;
     }
 
-    if (fixture->reject_tokens && *token) {
+    if ((fixture->reject_tokens || !g_hash_table_contains (fixture->layouts, token)) && *token) {
       g_autofree char *message = g_strdup_printf ("unknown layout token '%s'", token);
 
       g_dbus_method_invocation_return_dbus_error (invocation,
@@ -486,6 +530,11 @@ setup (Fixture *fixture, gconstpointer unused)
   g_assert_no_error (error);
   fixture->held = g_ptr_array_new_with_free_func (g_object_unref);
   fixture->held_registrations = g_ptr_array_new_with_free_func (g_object_unref);
+  fixture->layouts = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, g_free);
+  fixture->swipe_tokens = g_ptr_array_new_with_free_func (g_free);
+  fixture->swipe_uploads = g_ptr_array_new_with_free_func (g_free);
+  fixture->completion_tokens = g_ptr_array_new_with_free_func (g_free);
+  token_generation = 0;
   fixture->commits_seen = g_ptr_array_new_with_free_func (g_free);
   fixture->feedback = g_ptr_array_new_with_free_func (g_free);
   fixture->unhandled_keys = g_ptr_array_new_with_free_func (g_free);
@@ -583,6 +632,10 @@ teardown (Fixture *fixture, gconstpointer unused)
   g_ptr_array_unref (fixture->commits_seen);
   g_ptr_array_unref (fixture->feedback);
   g_ptr_array_unref (fixture->unhandled_keys);
+  g_hash_table_unref (fixture->layouts);
+  g_ptr_array_unref (fixture->swipe_tokens);
+  g_ptr_array_unref (fixture->swipe_uploads);
+  g_ptr_array_unref (fixture->completion_tokens);
   g_string_free (fixture->app_text, TRUE);
   g_free (fixture->committed);
   g_free (fixture->last_word);
@@ -1027,6 +1080,28 @@ static GVariant *
 shifted_geometry (void)
 {
   const char *const labels[] = {"Q", "W", "E", "R", "T", "Y", NULL};
+
+  return geometry (0.0, labels);
+}
+
+
+/* The first row of a Greek layer: six keys, none of them ASCII. */
+static GVariant *
+greek_geometry (void)
+{
+  const char *const labels[] = {"ς", "ε", "ρ", "τ", "υ", "θ", NULL};
+
+  return geometry (0.0, labels);
+}
+
+
+/* Accented keys as layers really carry them: a precomposed ñ, an e with its
+ * é alternate, and a decomposed e + combining acute the service is expected
+ * to canonicalize itself. */
+static GVariant *
+accented_geometry (void)
+{
+  const char *const labels[] = {"ñ", "e", "e\xcc\x81", "ü", NULL};
 
   return geometry (0.0, labels);
 }
@@ -1494,28 +1569,52 @@ test_input_limit (Fixture *fixture, gconstpointer unused)
 }
 
 
-static void
-request_swipe_capitalized (Fixture *fixture, guint capitalization)
+/* The letter layer the historical fixture gestures are drawn on: a 26-key
+ * grid, exported the way the keyboard exports a displayed layer. */
+static GVariant *
+fixture_geometry (void)
 {
-  GVariantBuilder trace, keys;
-  g_autoptr (GVariant) points = NULL;
-  g_autoptr (GVariant) geometry = NULL;
+  GVariantBuilder keys;
 
-  g_variant_builder_init (&trace, G_VARIANT_TYPE ("a(ddu)"));
-  g_variant_builder_add (&trace, "(ddu)", 10.0, 20.0, 0u);
-  g_variant_builder_add (&trace, "(ddu)", 80.0, 40.0, 70u);
-  g_variant_builder_add (&trace, "(ddu)", 120.0, 20.0, 140u);
-  g_variant_builder_init (&keys, G_VARIANT_TYPE ("a(sdddd)"));
+  g_variant_builder_init (&keys, G_VARIANT_TYPE ("a(sasdddd)"));
   for (char c = 'a'; c <= 'z'; c++) {
     char label[] = {c, 0};
-    g_variant_builder_add (&keys, "(sdddd)", label,
+    GVariantBuilder alternates;
+
+    g_variant_builder_init (&alternates, G_VARIANT_TYPE ("as"));
+    g_variant_builder_add (&keys, "(s@asdddd)", label, g_variant_builder_end (&alternates),
                            (double) ((c - 'a') % 10 * 30),
                            (double) ((c - 'a') / 10 * 50), 30.0, 50.0);
   }
+  return g_variant_ref_sink (g_variant_builder_end (&keys));
+}
+
+
+/* A gesture whose first point marks it: 10 is the standard fixture gesture
+ * the service answers with its ranked list, any other mark is answered with
+ * "w<mark>". The gesture is drawn on @geometry, captured when it started. */
+static gboolean
+request_swipe_on (Fixture *fixture, int mark, guint capitalization, GVariant *geometry)
+{
+  GVariantBuilder trace;
+  g_autoptr (GVariant) points = NULL;
+
+  g_variant_builder_init (&trace, G_VARIANT_TYPE ("a(ddu)"));
+  g_variant_builder_add (&trace, "(ddu)", (double) mark, 20.0, 0u);
+  g_variant_builder_add (&trace, "(ddu)", 80.0, 40.0, 70u);
+  g_variant_builder_add (&trace, "(ddu)", 120.0, 20.0, 140u);
   points = g_variant_ref_sink (g_variant_builder_end (&trace));
-  geometry = g_variant_ref_sink (g_variant_builder_end (&keys));
-  pos_completer_verbisage_recognize_swipe (POS_COMPLETER_VERBISAGE (fixture->completer),
-                                         points, geometry, capitalization);
+  return pos_completer_verbisage_recognize_swipe (POS_COMPLETER_VERBISAGE (fixture->completer),
+                                                  points, geometry, capitalization);
+}
+
+
+static void
+request_swipe_capitalized (Fixture *fixture, guint capitalization)
+{
+  g_autoptr (GVariant) geometry = fixture_geometry ();
+
+  request_swipe_on (fixture, 10, capitalization, geometry);
 }
 
 
@@ -1530,26 +1629,10 @@ request_swipe (Fixture *fixture)
 static gboolean
 request_marked_swipe (Fixture *fixture, int mark, guint capitalization)
 {
-  GVariantBuilder trace, keys;
-  g_autoptr (GVariant) points = NULL;
-  g_autoptr (GVariant) geometry = NULL;
+  g_autoptr (GVariant) geometry = fixture_geometry ();
 
   g_assert_cmpint (mark, !=, 10);
-  g_variant_builder_init (&trace, G_VARIANT_TYPE ("a(ddu)"));
-  g_variant_builder_add (&trace, "(ddu)", (double) mark, 20.0, 0u);
-  g_variant_builder_add (&trace, "(ddu)", 80.0, 40.0, 70u);
-  g_variant_builder_add (&trace, "(ddu)", 120.0, 20.0, 140u);
-  g_variant_builder_init (&keys, G_VARIANT_TYPE ("a(sdddd)"));
-  for (char c = 'a'; c <= 'z'; c++) {
-    char label[] = {c, 0};
-    g_variant_builder_add (&keys, "(sdddd)", label,
-                           (double) ((c - 'a') % 10 * 30),
-                           (double) ((c - 'a') / 10 * 50), 30.0, 50.0);
-  }
-  points = g_variant_ref_sink (g_variant_builder_end (&trace));
-  geometry = g_variant_ref_sink (g_variant_builder_end (&keys));
-  return pos_completer_verbisage_recognize_swipe (POS_COMPLETER_VERBISAGE (fixture->completer),
-                                                  points, geometry, capitalization);
+  return request_swipe_on (fixture, mark, capitalization, geometry);
 }
 
 
@@ -2999,6 +3082,310 @@ test_queue_daemon_disappearance (Fixture *fixture, gconstpointer unused)
 }
 
 
+/* A gesture registers the layer it was drawn on, serialized exactly as
+ * completion uploads that layer, and quotes the token on its request. The
+ * same layer is registered once; a layer of another script and key count is
+ * a layer like any other. */
+static void
+test_gesture_registers_its_layer (Fixture *fixture, gconstpointer unused)
+{
+  g_autoptr (GVariant) normal = normal_geometry ();
+  g_autoptr (GVariant) greek = greek_geometry ();
+  g_autofree char *normal_token = NULL;
+  g_autofree char *greek_token = NULL;
+  const char *const expected[] = {"w1 ", "w2 ", NULL};
+
+  g_assert_true (request_swipe_on (fixture, 1, 0, normal));
+  wait_completion (fixture->completer, "w1");
+  g_assert_cmpuint (fixture->layout_registrations, ==, 1);
+  g_assert_nonnull (strstr (fixture->last_upload, "\"label\":\"q\""));
+  g_assert_nonnull (strstr (fixture->last_upload, "\"alt_labels\":[\"é\"]"));
+  g_assert_nonnull (strstr (fixture->last_upload, "\"width\":30"));
+  normal_token = token_for (fixture->last_upload);
+  g_assert_cmpuint (fixture->swipe_tokens->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_tokens, 0), ==, normal_token);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_uploads, 0), ==, fixture->last_upload);
+  g_assert_cmpuint (fixture->forget_requests, ==, 0);
+
+  /* The same layer again costs no round trip. */
+  g_assert_true (request_swipe_on (fixture, 2, 0, normal));
+  wait_completion (fixture->completer, "w2");
+  g_assert_cmpuint (fixture->layout_registrations, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_tokens, 1), ==, normal_token);
+
+  /* Six Greek keys are not dropped for being neither ASCII nor 26. */
+  g_assert_true (request_swipe_on (fixture, 3, 0, greek));
+  wait_completion (fixture->completer, "w3");
+  g_assert_cmpuint (fixture->layout_registrations, ==, 2);
+  g_assert_nonnull (strstr (fixture->last_upload, "\"label\":\"ς\""));
+  g_assert_null (strstr (fixture->last_upload, "\"label\":\"q\""));
+  greek_token = token_for (fixture->last_upload);
+  g_assert_cmpstr (greek_token, !=, normal_token);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_tokens, 2), ==, greek_token);
+  assert_commits (fixture, expected);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "w3");
+}
+
+
+/* Accented and decomposed labels travel byte for byte; the service, not the
+ * keyboard, decides how to canonicalize them. A layer without any usable key
+ * is refused before anything is registered or requested. */
+static void
+test_gesture_unicode_layer (Fixture *fixture, gconstpointer unused)
+{
+  g_autoptr (GVariant) accented = accented_geometry ();
+  g_autoptr (GVariant) empty =
+    g_variant_ref_sink (g_variant_new_array (G_VARIANT_TYPE ("(sasdddd)"), NULL, 0));
+  g_autofree char *token = NULL;
+
+  g_assert_false (request_swipe_on (fixture, 1, 0, empty));
+  spin (30);
+  g_assert_cmpuint (fixture->layout_registrations, ==, 0);
+  g_assert_cmpuint (fixture->swipe_requests, ==, 0);
+  g_assert_cmpuint (fixture->feedback->len, ==, 0);
+
+  g_assert_true (request_swipe_on (fixture, 2, 1, accented));
+  wait_completion (fixture->completer, "W2");
+  g_assert_cmpuint (fixture->layout_registrations, ==, 1);
+  g_assert_nonnull (strstr (fixture->last_upload, "\"label\":\"ñ\""));
+  g_assert_nonnull (strstr (fixture->last_upload, "\"label\":\"e\xcc\x81\""));
+  g_assert_nonnull (strstr (fixture->last_upload, "\"label\":\"ü\""));
+  g_assert_nonnull (strstr (fixture->last_upload, "\"alt_labels\":[\"é\"]"));
+  token = token_for (fixture->last_upload);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_tokens, 0), ==, token);
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "W2");
+}
+
+
+/* Each gesture keeps the layer it was drawn on and the case it was drawn
+ * with, whatever completion registered or the keyboard showed afterwards,
+ * and whatever order the replies come back in. */
+static void
+test_gesture_keeps_its_layer (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) normal = normal_geometry ();
+  g_autoptr (GVariant) shifted = shifted_geometry ();
+  g_autofree char *normal_token = NULL;
+  g_autofree char *shifted_token = NULL;
+  const char *const expected[] = {"w1 ", NULL};
+
+  /* Completion works on the unshifted layer the keyboard shows. */
+  pos_completer_verbisage_set_layout (self, normal);
+  wait_registration (fixture, 1);
+  normal_token = token_for (fixture->last_upload);
+
+  fixture->hold_swipes = TRUE;
+  g_assert_true (request_swipe_on (fixture, 1, 0, normal));
+  wait_held_count (fixture, 1);
+  /* Shift: the keyboard shows and registers the shifted layer, and the next
+   * gesture is drawn on it. */
+  pos_completer_verbisage_set_layout (self, shifted);
+  wait_registration (fixture, 2);
+  shifted_token = token_for (fixture->last_upload);
+  g_assert_true (request_swipe_on (fixture, 2, 1, shifted));
+  wait_held_count (fixture, 2);
+  /* Back to the unshifted layer before either reply: the gestures already
+   * taken are not touched. */
+  pos_completer_verbisage_set_layout (self, normal);
+  spin (30);
+  g_assert_cmpuint (fixture->layout_registrations, ==, 2);
+
+  g_assert_cmpuint (fixture->swipe_tokens->len, ==, 2);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_tokens, 0), ==, normal_token);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_tokens, 1), ==, shifted_token);
+  g_assert_nonnull (strstr (g_ptr_array_index (fixture->swipe_uploads, 0), "\"label\":\"q\""));
+  g_assert_nonnull (strstr (g_ptr_array_index (fixture->swipe_uploads, 1), "\"label\":\"Q\""));
+
+  /* Replies in reverse order: the words still land in input order, each in
+   * the case its own gesture captured. */
+  fixture->hold_swipes = FALSE;
+  release_held_at (fixture, 1);
+  spin (30);
+  release_held_at (fixture, 0);
+  wait_commits (fixture, 1);
+  assert_commits (fixture, expected);
+  wait_completion (fixture->completer, "W2");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "W2");
+  /* Completion still quotes the layer the keyboard shows. */
+  pos_completer_set_preedit (fixture->completer, NULL);
+  pos_completer_set_preedit (fixture->completer, "hel");
+  wait_completion (fixture->completer, "hello");
+  g_assert_cmpstr (fixture->last_token, ==, normal_token);
+}
+
+
+/* The service forgot the layer between a gesture's admission and its request:
+ * the gesture registers its own saved upload once more, within its lifetime,
+ * and is recognized with the token that replaces the evicted one. */
+static void
+test_gesture_evicted_token_recovers_once (Fixture *fixture, gconstpointer unused)
+{
+  g_autoptr (GVariant) normal = normal_geometry ();
+  g_autofree char *first_token = NULL;
+  g_autofree char *second_token = NULL;
+
+  g_assert_true (request_swipe_on (fixture, 1, 0, normal));
+  wait_completion (fixture->completer, "w1");
+  g_assert_cmpuint (fixture->layout_registrations, ==, 1);
+  first_token = token_for (fixture->last_upload);
+
+  /* The daemon's cache evicts the entry, or a restarted daemon starts empty:
+   * the token this keyboard still holds is unknown from now on. */
+  evict_layouts (fixture);
+  g_assert_true (request_swipe_on (fixture, 2, 0, normal));
+  wait_completion (fixture->completer, "w2");
+  /* One rejected request, one re-registration of this gesture's own upload,
+   * one recognized request, and no feedback for the user. */
+  g_assert_cmpuint (fixture->layout_registrations, ==, 2);
+  g_assert_cmpuint (fixture->swipe_tokens->len, ==, 3);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_tokens, 1), ==, first_token);
+  second_token = token_for (fixture->last_upload);
+  g_assert_cmpstr (second_token, !=, first_token);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_tokens, 2), ==, second_token);
+  g_assert_cmpuint (fixture->feedback->len, ==, 0);
+
+  /* The recovered entry serves the next gesture without a round trip. */
+  g_assert_true (request_swipe_on (fixture, 3, 0, normal));
+  wait_completion (fixture->completer, "w3");
+  g_assert_cmpuint (fixture->layout_registrations, ==, 2);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_tokens, 3), ==, second_token);
+}
+
+
+/* A layer the service keeps rejecting is registered again exactly once for a
+ * gesture. The second rejection fails the gesture at its position with
+ * feedback, cancels what was gestured behind it, and nothing alternates
+ * between registering and being rejected. */
+static void
+test_gesture_unknown_token_is_bounded (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) normal = normal_geometry ();
+
+  fixture->reject_swipe_tokens = TRUE;
+  g_assert_true (request_swipe_on (fixture, 1, 0, normal));
+  /* Drawn on the same layer while the first is still registering it: one
+   * registration serves both. */
+  g_assert_true (request_swipe_on (fixture, 2, 0, normal));
+  wait_pending_swipes (fixture, 0);
+  spin (300);
+  g_assert_cmpuint (fixture->layout_registrations, ==, 2);
+  g_assert_cmpuint (fixture->swipe_tokens->len, ==, 4);
+  g_assert_cmpuint (fixture->feedback->len, ==, 1);
+  g_assert_cmpstr (g_ptr_array_index (fixture->feedback, 0), ==, "recognition-failed");
+  g_assert_cmpstr (pos_completer_get_preedit (fixture->completer), ==, "");
+  g_assert_cmpuint (fixture->commits_seen->len, ==, 0);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 0);
+
+  /* Once the service accepts the layer again, a fresh gesture registers it
+   * anew, since the rejected entry was forgotten. */
+  fixture->reject_swipe_tokens = FALSE;
+  g_assert_true (request_swipe_on (fixture, 3, 0, normal));
+  wait_completion (fixture->completer, "w3");
+  g_assert_cmpuint (fixture->layout_registrations, ==, 3);
+  g_assert_cmpuint (fixture->swipe_tokens->len, ==, 5);
+}
+
+
+/* Recovering a gesture's evicted layer never touches the layout completion is
+ * using: completion keeps quoting its own token and recovers its own layer on
+ * its own terms when that token is rejected. */
+static void
+test_gesture_recovery_spares_completion_layout (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GVariant) normal = normal_geometry ();
+  g_autoptr (GVariant) shifted = shifted_geometry ();
+  g_autofree char *normal_token = NULL;
+  g_autofree char *shifted_token = NULL;
+  g_autofree char *recovered_token = NULL;
+
+  pos_completer_verbisage_set_layout (self, normal);
+  wait_registration (fixture, 1);
+  normal_token = token_for (fixture->last_upload);
+
+  /* A gesture on the shifted layer registers that layer for itself. */
+  fixture->hold_swipes = TRUE;
+  g_assert_true (request_swipe_on (fixture, 1, 1, shifted));
+  wait_held_count (fixture, 1);
+  g_assert_cmpuint (fixture->layout_registrations, ==, 2);
+  shifted_token = token_for (fixture->last_upload);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_tokens, 0), ==, shifted_token);
+
+  /* Everything is evicted while the request is out. Its rejection makes the
+   * gesture register its own layer again, and only its own. */
+  evict_layouts (fixture);
+  release_held_rejected (fixture);
+  wait_held_count (fixture, 1);
+  g_assert_cmpuint (fixture->layout_registrations, ==, 3);
+  g_assert_nonnull (strstr (fixture->last_upload, "\"label\":\"Q\""));
+  recovered_token = token_for (fixture->last_upload);
+  g_assert_cmpstr (recovered_token, !=, shifted_token);
+  g_assert_cmpstr (g_ptr_array_index (fixture->swipe_tokens, 1), ==, recovered_token);
+  fixture->hold_swipes = FALSE;
+  release_held (fixture);
+  wait_completion (fixture->completer, "W1");
+
+  /* Completion still quotes its own, now evicted, token: the gesture's
+   * recovery replaced neither the token nor the layer it names. Its own
+   * recovery then registers the unshifted layer, not the gesture's. */
+  pos_completer_set_preedit (fixture->completer, NULL);
+  pos_completer_set_preedit (fixture->completer, "hel");
+  wait_completion (fixture->completer, "hello");
+  g_assert_cmpuint (fixture->completion_tokens->len, ==, 2);
+  g_assert_cmpstr (g_ptr_array_index (fixture->completion_tokens, 0), ==, normal_token);
+  g_assert_cmpuint (fixture->layout_registrations, ==, 4);
+  g_assert_nonnull (strstr (fixture->last_upload, "\"label\":\"q\""));
+  g_assert_cmpstr (g_ptr_array_index (fixture->completion_tokens, 1), ==, fixture->last_token);
+  g_assert_cmpstr (fixture->last_token, !=, normal_token);
+  g_assert_cmpstr (fixture->last_token, !=, recovered_token);
+}
+
+
+/* A gesture carries the language selected when it was accepted, even when it
+ * is only dispatched after an equivalent spelling was selected; a gesture
+ * accepted after that carries the new spelling. */
+static void
+test_gesture_keeps_its_language (Fixture *fixture, gconstpointer unused)
+{
+  PosCompleterVerbisage *self = POS_COMPLETER_VERBISAGE (fixture->completer);
+  g_autoptr (GError) error = NULL;
+  const char *const expected[] = {"w1 ", "w2 ", "w3 ", NULL};
+
+  fixture->hold_swipes = TRUE;
+  g_assert_true (request_marked_swipe (fixture, 1, 0));
+  g_assert_true (request_marked_swipe (fixture, 2, 0));
+  /* The third waits for a worker, so it is requested only later. */
+  g_assert_true (request_marked_swipe (fixture, 3, 0));
+  wait_held_count (fixture, 2);
+  g_assert_cmpuint (fixture->layout_registrations, ==, 1);
+
+  g_assert_true (pos_completer_verbisage_set_language_tag (self, "EN-us", &error));
+  g_assert_no_error (error);
+  g_assert_cmpuint (pos_completer_verbisage_pending_swipes (self), ==, 3);
+
+  /* The first reply frees a worker for the third gesture, accepted under the
+   * old spelling. */
+  release_held_at (fixture, 0);
+  wait_held_count (fixture, 2);
+  g_assert_cmpstr (fixture->last_lang, ==, "en_US");
+
+  /* A gesture accepted now carries the new spelling. */
+  fixture->expected_lang = "EN-us";
+  g_assert_true (request_marked_swipe (fixture, 4, 0));
+  release_held_at (fixture, 0);
+  wait_held_count (fixture, 2);
+  g_assert_cmpstr (fixture->last_lang, ==, "EN-us");
+
+  fixture->hold_swipes = FALSE;
+  release_held (fixture);
+  wait_pending_swipes (fixture, 0);
+  wait_completion (fixture->completer, "w4");
+  assert_commits (fixture, expected);
+}
+
+
 static void
 test_swipe_snapshot (Fixture *fixture, gconstpointer unused)
 {
@@ -3283,6 +3670,13 @@ main (int argc, char **argv)
   ADD_TEST ("queue-retry-disposal", test_queue_retry_disposal);
   ADD_TEST ("queue-empty-result", test_queue_empty_result_is_a_failure);
   ADD_TEST ("queue-daemon-gone", test_queue_daemon_disappearance);
+  ADD_TEST ("gesture-registers-layer", test_gesture_registers_its_layer);
+  ADD_TEST ("gesture-unicode-layer", test_gesture_unicode_layer);
+  ADD_TEST ("gesture-keeps-layer", test_gesture_keeps_its_layer);
+  ADD_TEST ("gesture-evicted-token", test_gesture_evicted_token_recovers_once);
+  ADD_TEST ("gesture-unknown-token-bounded", test_gesture_unknown_token_is_bounded);
+  ADD_TEST ("gesture-recovery-spares-completion", test_gesture_recovery_spares_completion_layout);
+  ADD_TEST ("gesture-keeps-language", test_gesture_keeps_its_language);
   ADD_TEST ("swipe-snapshot", test_swipe_snapshot);
   ADD_TEST ("swipe-snapshot-invalid", test_swipe_snapshot_invalid);
   ADD_TEST ("swipe-snapshot-equivalent", test_swipe_snapshot_language_equivalence);

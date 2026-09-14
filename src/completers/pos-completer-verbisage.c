@@ -57,7 +57,6 @@ static GParamSpec *props[PROP_LAST_PROP];
 
 typedef enum {
   SWIPE_NONE,
-  SWIPE_PENDING,
   SWIPE_PREEDIT,
 } SwipeState;
 
@@ -90,7 +89,17 @@ typedef struct {
   /* Gesture */
   guint64        id;
   guint64        session;
-  GVariant      *parameters;
+  /* Captured when the gesture was accepted and never replaced: its trace,
+   * the upload of the layer it was drawn on, the language selected then and
+   * its capitalization. The token is the service's name for that upload. It
+   * is registered for this gesture when the shared cache has none, and
+   * registered once more if the service has since forgotten it. */
+  GVariant      *trace;
+  char          *upload;
+  char          *token;
+  char          *language;
+  gboolean       registering;
+  gboolean       recovered;
   guint          capitalization;
   SwipeJobState  state;
   GStrv          words;
@@ -110,6 +119,15 @@ typedef struct {
   guint64  session;
 } SwipeRetry;
 
+/* A registration made for one gesture, so its reply can only ever give that
+ * gesture its token and never touch the layout completion is using. */
+typedef struct {
+  GWeakRef completer;
+  guint64  id;
+  guint64  session;
+  char    *upload;
+} SwipeRegistration;
+
 
 struct _PosCompleterVerbisage {
   PosCompleterBase parent;
@@ -118,7 +136,6 @@ struct _PosCompleterVerbisage {
   GStrv ranked;
   SwipeState swipe_state;
   guint swipe_capitalization;
-  GVariant *swipe_parameters;
   /* Gestures and the keys typed between them, in one input order. */
   GPtrArray *swipe_entries;
   guint64 swipe_next_id;
@@ -231,7 +248,6 @@ cancel_lookup (PosCompleterVerbisage *self)
     g_cancellable_cancel (self->cancellable);
   g_clear_object (&self->cancellable);
   g_clear_pointer (&self->ranked, g_strfreev);
-  g_clear_pointer (&self->swipe_parameters, g_variant_unref);
   self->swipe_state = SWIPE_NONE;
   self->swipe_capitalization = 0;
 }
@@ -379,6 +395,14 @@ static void swipe_advance (PosCompleterVerbisage *self);
 static gboolean swipe_retry_timeout (gpointer data);
 static void swipe_promote_to_preedit (PosCompleterVerbisage *self, SwipeEntry *entry);
 static int swipe_ack_timeout (void);
+static void swipe_job_register (PosCompleterVerbisage *self, SwipeEntry *job);
+static const char *cached_layout_token (PosCompleterVerbisage *self, const char *upload);
+static void forget_cached_layout_token (PosCompleterVerbisage *self,
+                                        const char *upload,
+                                        const char *token);
+static void cache_layout_token_for_upload (PosCompleterVerbisage *self,
+                                           const char *upload,
+                                           const char *token);
 
 
 static void
@@ -388,11 +412,25 @@ swipe_entry_free (SwipeEntry *entry)
   if (entry->cancellable)
     g_cancellable_cancel (entry->cancellable);
   g_clear_object (&entry->cancellable);
-  g_clear_pointer (&entry->parameters, g_variant_unref);
+  g_clear_pointer (&entry->trace, g_variant_unref);
+  g_free (entry->upload);
+  g_free (entry->token);
+  g_free (entry->language);
   g_clear_pointer (&entry->words, g_strfreev);
   g_free (entry->symbol);
   g_free (entry);
 }
+
+
+static void
+swipe_registration_free (SwipeRegistration *registration)
+{
+  g_weak_ref_clear (&registration->completer);
+  g_free (registration->upload);
+  g_free (registration);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (SwipeRegistration, swipe_registration_free)
 
 
 static void
@@ -562,6 +600,27 @@ on_swipe_job_finished (GObject *source, GAsyncResult *result, gpointer user_data
   if (!reply) {
     if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
       return;
+    /* The service no longer knows the layout this gesture was drawn on: the
+     * shared entry was evicted, or a restarted daemon never had it. The
+     * rejected token stops serving this layer to any gesture, whatever
+     * becomes of this one - the cache entry still naming it is dropped, and
+     * a newer registration of the same layer stays. Within the gesture's
+     * own lifetime it registers its saved upload once more and recognizes
+     * again; the layout completion is using is not involved, and a second
+     * rejection is terminal for this gesture. */
+    if (error && g_dbus_error_is_remote_error (error) &&
+        strstr (error->message, "unknown layout token")) {
+      forget_cached_layout_token (self, job->upload, job->token);
+      if (!job->recovered && g_get_monotonic_time () < job->deadline) {
+        g_debug ("The layout of gesture %" G_GUINT64_FORMAT " is unknown; registering it again",
+                 job->id);
+        job->recovered = TRUE;
+        g_clear_pointer (&job->token, g_free);
+        job->state = SWIPE_JOB_WAITING;
+        swipe_dispatch (self);
+        return;
+      }
+    }
     /* A busy service is temporary: retry with backoff until this gesture's
      * own deadline. Everything else is terminal for this word. */
     if (error && strstr (error->message, "busy") &&
@@ -665,6 +724,23 @@ swipe_ack_timeout (void)
 }
 
 
+/* Whether another gesture is already registering this exact layer. Its token
+ * will serve every gesture drawn on that layer, so no second round trip is
+ * made for the same upload while one is out. */
+static gboolean
+swipe_upload_registering (PosCompleterVerbisage *self, const char *upload)
+{
+  for (guint i = 0; i < self->swipe_entries->len; i++) {
+    SwipeEntry *entry = g_ptr_array_index (self->swipe_entries, i);
+
+    if (entry->kind == SWIPE_ENTRY_GESTURE && entry->registering &&
+        g_str_equal (entry->upload, upload))
+      return TRUE;
+  }
+  return FALSE;
+}
+
+
 static void
 swipe_job_start (PosCompleterVerbisage *self, SwipeEntry *job)
 {
@@ -676,6 +752,20 @@ swipe_job_start (PosCompleterVerbisage *self, SwipeEntry *job)
     return;
   }
 
+  /* The layer the gesture was drawn on: reuse the token the shared registry
+   * already has for that exact upload, otherwise register it for this
+   * gesture. The token completion is using is neither consulted nor touched. */
+  if (job->token == NULL) {
+    const char *cached = cached_layout_token (self, job->upload);
+
+    if (cached == NULL) {
+      if (!swipe_upload_registering (self, job->upload))
+        swipe_job_register (self, job);
+      return;
+    }
+    job->token = g_strdup (cached);
+  }
+
   lookup = lookup_new (self);
   lookup->job_id = job->id;
   lookup->job_session = job->session;
@@ -684,9 +774,72 @@ swipe_job_start (PosCompleterVerbisage *self, SwipeEntry *job)
   g_clear_object (&job->cancellable);
   job->cancellable = g_cancellable_new ();
   g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "RecognizeSwipe",
-                          job->parameters, G_VARIANT_TYPE ("(a(sd))"), G_DBUS_CALL_FLAGS_NONE,
+                          g_variant_new ("(@a(ddu)sus)", job->trace, job->token,
+                                         (guint) MAX_RESULTS, job->language),
+                          G_VARIANT_TYPE ("(a(sd))"), G_DBUS_CALL_FLAGS_NONE,
                           swipe_request_timeout (), job->cancellable,
                           on_swipe_job_finished, lookup);
+}
+
+
+static void
+on_swipe_layout_registered (GObject *source, GAsyncResult *result, gpointer user_data)
+{
+  g_autoptr (SwipeRegistration) registration = user_data;
+  g_autoptr (PosCompleterVerbisage) self = g_weak_ref_get (&registration->completer);
+  g_autoptr (GError) error = NULL;
+  g_autoptr (GVariant) reply =
+    g_dbus_connection_call_finish (G_DBUS_CONNECTION (source), result, &error);
+  const char *token = NULL;
+  SwipeEntry *job;
+
+  if (!self)
+    return;
+  /* Only the gesture this registration was made for, in its own session, and
+   * only while it is still waiting for it. */
+  job = swipe_job_by_id (self, registration->id, registration->session);
+  if (!job || !job->registering || job->state != SWIPE_JOB_WAITING)
+    return;
+  job->registering = FALSE;
+  if (reply)
+    g_variant_get (reply, "(&s)", &token);
+  if (gm_str_is_null_or_empty (token)) {
+    /* There is no recognition without a registered layout: the gesture
+     * fails at its position, like any other terminal service failure. */
+    g_debug ("Registering the layout of gesture %" G_GUINT64_FORMAT " failed: %s", job->id,
+             error ? error->message : "empty token");
+    job->state = SWIPE_JOB_FAILED;
+    /* A gesture that was waiting for this registration registers on its
+     * own; playback stops at the failed one when it reaches the head. */
+    swipe_dispatch (self);
+    swipe_advance (self);
+    return;
+  }
+  job->token = g_strdup (token);
+  /* Later gestures and completion on this layer may reuse the entry; the
+   * token completion is currently quoting stays as it is. */
+  cache_layout_token_for_upload (self, registration->upload, token);
+  swipe_dispatch (self);
+  swipe_advance (self);
+}
+
+
+/* Register this gesture's own saved upload. The reply is matched to the
+ * gesture by id and session, never to whatever layer is displayed by then. */
+static void
+swipe_job_register (PosCompleterVerbisage *self, SwipeEntry *job)
+{
+  SwipeRegistration *registration = g_new0 (SwipeRegistration, 1);
+
+  g_weak_ref_init (&registration->completer, self);
+  registration->id = job->id;
+  registration->session = job->session;
+  registration->upload = g_strdup (job->upload);
+  job->registering = TRUE;
+  g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "RegisterLayout",
+                          g_variant_new ("(s)", job->upload), G_VARIANT_TYPE ("(s)"),
+                          G_DBUS_CALL_FLAGS_NONE, LOOKUP_TIMEOUT_MS, NULL,
+                          on_swipe_layout_registered, registration);
 }
 
 
@@ -746,7 +899,7 @@ swipe_dispatch (PosCompleterVerbisage *self)
     SwipeEntry *entry = g_ptr_array_index (self->swipe_entries, i);
 
     if (entry->kind == SWIPE_ENTRY_GESTURE && entry->state == SWIPE_JOB_WAITING &&
-        entry->retry_id == 0)
+        entry->retry_id == 0 && !entry->registering)
       swipe_job_start (self, entry);
   }
 }
@@ -1012,10 +1165,39 @@ on_layout_registered (GObject *source, GAsyncResult *result, gpointer user_data)
 
   g_free (self->layout_token);
   self->layout_token = g_strdup (token);
-  if (g_hash_table_size (self->layout_tokens) >= MAX_CACHED_LAYOUTS)
+  cache_layout_token_for_upload (self, registration->upload, token);
+}
+
+
+/* The client-side mirror of the service's content-hash registry: one token
+ * per exact upload, shared by completion and by every gesture drawn on that
+ * layer. Bounded to the few layers a user alternates between. */
+static void
+cache_layout_token_for_upload (PosCompleterVerbisage *self, const char *upload, const char *token)
+{
+  if (g_hash_table_size (self->layout_tokens) >= MAX_CACHED_LAYOUTS &&
+      !g_hash_table_contains (self->layout_tokens, upload))
     g_hash_table_remove_all (self->layout_tokens);
-  g_hash_table_insert (self->layout_tokens, g_strdup (registration->upload),
-                       g_strdup (token));
+  g_hash_table_insert (self->layout_tokens, g_strdup (upload), g_strdup (token));
+}
+
+
+static const char *
+cached_layout_token (PosCompleterVerbisage *self, const char *upload)
+{
+  return g_hash_table_lookup (self->layout_tokens, upload);
+}
+
+
+/* Drop a cache entry the service rejected, but only if it still names the
+ * rejected token: a newer registration of the same layer stays. */
+static void
+forget_cached_layout_token (PosCompleterVerbisage *self, const char *upload, const char *token)
+{
+  const char *current = g_hash_table_lookup (self->layout_tokens, upload);
+
+  if (current && token && g_str_equal (current, token))
+    g_hash_table_remove (self->layout_tokens, upload);
 }
 
 
@@ -1202,7 +1384,7 @@ publish_completions (PosCompleterVerbisage *self)
 
   /* Typed text keeps its literal choice first. A completed swipe keeps the
    * service ranking while its first candidate is shown as editable preedit. */
-  if (self->preedit->len || self->swipe_state == SWIPE_PENDING || can_predict (self)) {
+  if (self->preedit->len || can_predict (self)) {
     if (self->swipe_state == SWIPE_NONE && self->preedit->len)
       g_ptr_array_add (words, g_strdup (self->preedit->str));
     ranked = self->swipe_state != SWIPE_NONE ? g_strdupv (self->ranked) : capitalize_ranked (self);
@@ -1271,45 +1453,6 @@ on_lookup_finished (GObject *source, GAsyncResult *result, gpointer user_data)
   g_ptr_array_add (words, NULL);
   g_strfreev (self->ranked);
   self->ranked = (GStrv) g_ptr_array_free (g_steal_pointer (&words), FALSE);
-  if (self->swipe_state == SWIPE_PENDING) {
-    g_clear_pointer (&self->swipe_parameters, g_variant_unref);
-    if (self->swipe_capitalization == 1) {
-      GStrv capitalized = pos_completer_capitalize_by_template ("A", self->ranked);
-
-      g_strfreev (self->ranked);
-      self->ranked = capitalized;
-    } else if (self->swipe_capitalization == 2) {
-      for (guint i = 0; self->ranked[i]; i++) {
-        char *upper = g_utf8_strup (self->ranked[i], -1);
-
-        g_free (self->ranked[i]);
-        self->ranked[i] = upper;
-      }
-    }
-    if (self->swipe_capitalization) {
-      g_autoptr (GPtrArray) unique = g_ptr_array_new_with_free_func (g_free);
-
-      /* Case conversion can merge distinct service spellings. Keep the stored
-       * list identical to the visible choices so its snapshot restores too. */
-      for (guint i = 0; self->ranked[i]; i++)
-        append_unique (unique, self->ranked[i]);
-      g_ptr_array_add (unique, NULL);
-      g_strfreev (self->ranked);
-      self->ranked = (GStrv) g_ptr_array_free (g_steal_pointer (&unique), FALSE);
-    }
-    if (self->ranked[0]) {
-      self->swipe_state = SWIPE_PREEDIT;
-      g_string_assign (self->preedit, self->ranked[0]);
-      /* Notify only after both values are consistent. Surface eligibility may
-       * be recalculated synchronously by either notification. */
-      g_object_freeze_notify (G_OBJECT (self));
-      publish_completions (self);
-      g_object_notify_by_pspec (G_OBJECT (self), props[PROP_PREEDIT]);
-      g_object_thaw_notify (G_OBJECT (self));
-      return;
-    }
-    self->swipe_state = SWIPE_NONE;
-  }
   publish_completions (self);
 }
 
@@ -1319,13 +1462,8 @@ start_lookup (PosCompleterVerbisage *self)
 {
   g_auto (GStrv) context = build_context (self);
 
-  if (self->swipe_state == SWIPE_PENDING) {
-    g_dbus_connection_call (self->connection, BUS_NAME, OBJECT_PATH, INTERFACE, "RecognizeSwipe",
-                             self->swipe_parameters, G_VARIANT_TYPE ("(a(sd))"),
-                             G_DBUS_CALL_FLAGS_NONE, LOOKUP_TIMEOUT_MS, self->cancellable,
-                             on_lookup_finished, lookup_new (self));
-    return;
-  }
+  /* Gestures are recognized through the ordered queue alone; only typed
+   * input and next-word prediction are looked up here. */
 
   /* The keyboard applies capitalization to display choices. Compare without
    * a case bonus; context and input folding are explicit service parameters. */
@@ -1815,23 +1953,29 @@ pos_completer_verbisage_new (GError **error)
 }
 
 
-/* A pending request has no preedit. Its first result becomes an editable
+/* An accepted gesture has no preedit. Its first result becomes an editable
  * composition; accepting it is a separate operation before another gesture. */
 gboolean
 pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
                                         GVariant *trace,
-                                        GVariant *keys,
+                                        GVariant *geometry,
                                         guint capitalization)
 {
   SwipeEntry *job;
+  g_autofree char *upload = NULL;
 
   g_return_val_if_fail (POS_IS_COMPLETER_VERBISAGE (self), FALSE);
   g_return_val_if_fail (g_variant_is_of_type (trace, G_VARIANT_TYPE ("a(ddu)")), FALSE);
-  g_return_val_if_fail (g_variant_is_of_type (keys, G_VARIANT_TYPE ("a(sdddd)")), FALSE);
+  g_return_val_if_fail (g_variant_is_of_type (geometry, G_VARIANT_TYPE ("a(sasdddd)")), FALSE);
 
   if (!self->language || capitalization > 2 ||
-      g_variant_n_children (trace) < 2 || g_variant_n_children (trace) > 512 ||
-      g_variant_n_children (keys) == 0 || g_variant_n_children (keys) > 64)
+      g_variant_n_children (trace) < 2 || g_variant_n_children (trace) > 512)
+    return FALSE;
+  /* The layer the gesture was drawn on, serialized exactly as completion
+   * uploads the same layer, so equal layers share one registration. The
+   * service decides whether its keys can be gestured at all. */
+  upload = pos_completer_verbisage_layout_upload_json (geometry);
+  if (upload == NULL)
     return FALSE;
   /* Typed text in progress is not a gesture boundary - including text that is
    * still waiting its turn behind unplayed gestures. Without this the word
@@ -1856,11 +2000,15 @@ pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
   job->capitalization = capitalization;
   job->state = SWIPE_JOB_WAITING;
   job->deadline = g_get_monotonic_time () + swipe_job_deadline () * G_TIME_SPAN_MILLISECOND;
-  /* Captured now: a later resize, layer change or Shift release cannot alter
-   * a request that has already been accepted. */
-  job->parameters = g_variant_ref_sink (
-    g_variant_new ("(@a(ddu)@a(sdddd)us)", g_variant_ref (trace), g_variant_ref (keys),
-                     (guint) MAX_RESULTS, self->language));
+  /* Captured now and never replaced: a later resize, layer change, Shift
+   * release, language reselection or reply for another gesture cannot alter
+   * a request that has already been accepted. The token is whatever the
+   * shared registry already knows for this exact layer; without one the
+   * gesture registers its own upload when it is dispatched. */
+  job->trace = g_variant_ref_sink (trace);
+  job->upload = g_steal_pointer (&upload);
+  job->token = g_strdup (cached_layout_token (self, job->upload));
+  job->language = g_strdup (self->language);
   g_ptr_array_add (self->swipe_entries, job);
 
   swipe_dispatch (self);

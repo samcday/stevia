@@ -20,12 +20,19 @@ PosCompleter *pos_completer_verbisage_new (GError **error);
  *   usable key. */
 char *pos_completer_verbisage_layout_upload_json (GVariant *geometry);
 
-/* Accept one gesture into the ordered queue. Capitalization is captured at
- * gesture start: 0 lower, 1 initial, 2 upper. Returns %FALSE when the queue is
- * full or the gesture cannot be accepted, and the caller gives feedback. */
+
+/* Accept one gesture into the ordered queue. The trace is `a(ddu)` in the
+ * keyboard's widget coordinates and the geometry is the displayed layer the
+ * gesture was drawn on, as `a(sasdddd)` from
+ * [method@Pos.OskWidget.get_layout_geometry], both captured when the gesture
+ * started. The gesture keeps that geometry, the selected language and its
+ * capitalization (0 lower, 1 initial, 2 upper) until it is played: the
+ * geometry is registered with the service, or its cached token reused, for
+ * this gesture alone. Returns %FALSE when the queue is full or the gesture
+ * cannot be accepted, and the caller gives feedback. */
 gboolean pos_completer_verbisage_recognize_swipe (PosCompleterVerbisage *self,
                                                  GVariant *trace,
-                                                 GVariant *keys,
+                                                 GVariant *geometry,
                                                  guint capitalization);
 
 gboolean pos_completer_verbisage_at_word_boundary (PosCompleterVerbisage *self);

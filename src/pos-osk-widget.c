@@ -49,6 +49,7 @@ enum {
   OSK_POPOVER_HIDDEN,
   OSK_SWIPE,
   OSK_SWIPE_CANCELLED,
+  OSK_SWIPE_STARTED,
   OSK_GEOMETRY_CHANGED,
   N_SIGNALS
 };
@@ -1496,41 +1497,11 @@ pos_osk_widget_get_layout_geometry (PosOskWidget *self)
 }
 
 
-static GVariant *
-swipe_layout (PosOskWidget *self)
-{
-  GVariantBuilder keys;
-  PosOskWidgetKeyboardLayer *layer = pos_osk_widget_get_current_layer (self);
-  guint count = 0;
-
-  g_variant_builder_init (&keys, G_VARIANT_TYPE ("a(sdddd)"));
-  for (guint r = 0; r < layer->n_rows; r++) {
-    PosOskWidgetRow *row = pos_osk_widget_get_row (self, r);
-    for (guint k = 0; k < row->keys->len; k++) {
-      PosOskKey *key = pos_osk_widget_row_get_key (row, k);
-      const char *symbol = pos_osk_key_get_symbol (key);
-      const GdkRectangle *box = pos_osk_key_get_box (key);
-      char label[2] = {0};
-
-      if (!symbol || strlen (symbol) != 1 || !g_ascii_isalpha (symbol[0]))
-        continue;
-      if (box->width <= 0 || box->height <= 0)
-        continue;
-      label[0] = g_ascii_tolower (symbol[0]);
-      g_variant_builder_add (&keys, "(sdddd)", label,
-                               (double) box->x + layer->offset_x, (double) box->y,
-                               (double) box->width, (double) box->height);
-      count++;
-    }
-  }
-  if (count != 26) {
-    g_variant_builder_clear (&keys);
-    return NULL;
-  }
-  return g_variant_ref_sink (g_variant_builder_end (&keys));
-}
-
-
+/* A gesture may start on any key that inserts text on a letter layer: a
+ * letter of any script, an accented key or a punctuation key alike, but not
+ * the space bar. The displayed layer's geometry is captured here, at the
+ * start, so nothing the keyboard does before release can change what the
+ * gesture was drawn on. */
 static void
 swipe_begin (PosOskWidget *self, double x, double y, guint32 time)
 {
@@ -1540,12 +1511,14 @@ swipe_begin (PosOskWidget *self, double x, double y, guint32 time)
   if (!self->swipe_enabled || self->swipe_blocked ||
       self->mode != POS_OSK_WIDGET_MODE_KEYBOARD ||
       (self->layer != POS_OSK_WIDGET_LAYER_NORMAL && self->layer != POS_OSK_WIDGET_LAYER_CAPS) ||
-      !symbol || strlen (symbol) != 1 || !g_ascii_isalpha (symbol[0]) ||
+      !self->current || pos_osk_key_get_use (self->current) != POS_OSK_KEY_USE_KEY ||
+      gm_str_is_null_or_empty (symbol) || g_str_has_prefix (symbol, "KEY_") ||
+      g_unichar_isspace (g_utf8_get_char (symbol)) ||
       !isfinite (x) || !isfinite (y))
     return;
 
   swipe_clear (self);
-  self->swipe_keys = swipe_layout (self);
+  self->swipe_keys = pos_osk_widget_get_layout_geometry (self);
   if (!self->swipe_keys)
     return;
   self->swipe_start_time = time;
@@ -1555,6 +1528,8 @@ swipe_begin (PosOskWidget *self, double x, double y, guint32 time)
   g_array_append_val (self->swipe_points, point);
   /* A new possible gesture invalidates a previous outstanding recognition. */
   g_signal_emit (self, signals[OSK_SWIPE_CANCELLED], 0);
+  /* Whoever accepts the gesture snapshots its context now, not on release. */
+  g_signal_emit (self, signals[OSK_SWIPE_STARTED], 0);
 }
 
 
@@ -2251,9 +2226,29 @@ pos_osk_widget_class_init (PosOskWidgetClass *klass)
   widget_class->get_preferred_height = pos_osk_widget_get_preferred_height;
   widget_class->get_preferred_width = pos_osk_widget_get_preferred_width;
 
+  /**
+   * PosOskWidget::swipe
+   * @trace: The gesture's points as `a(ddu)` (x, y, elapsed ms) in widget
+   *   coordinates
+   * @geometry: The displayed layer's geometry captured when the gesture
+   *   started, as `a(sasdddd)` from [method@Pos.OskWidget.get_layout_geometry]
+   *
+   * A single-finger gesture across the keys was released. The geometry is the
+   * one the gesture was drawn on, whatever the keyboard shows by now.
+   */
   signals[OSK_SWIPE] = g_signal_new ("swipe", G_TYPE_FROM_CLASS (klass),
                                      G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
                                      G_TYPE_NONE, 2, G_TYPE_VARIANT, G_TYPE_VARIANT);
+  /**
+   * PosOskWidget::swipe-started
+   *
+   * A possible gesture started on a text key and the displayed layer's
+   * geometry was captured for it. Whoever accepts the gesture on `swipe`
+   * captures its own context, such as the language and input field, now.
+   */
+  signals[OSK_SWIPE_STARTED] = g_signal_new ("swipe-started", G_TYPE_FROM_CLASS (klass),
+                                             G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
+                                             G_TYPE_NONE, 0);
   /**
    * PosOskWidget::geometry-changed
    *
