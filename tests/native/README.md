@@ -20,6 +20,17 @@ for the fading trail. Added cases:
 - `context-undo`: select a predicted word, undo it, select it again and continue.
 - `context-swipe`: swipe/accept `hello`, then select `you` and `later`.
 
+The `queue-*` cases run against `fake-verbisage.py`, a controllable stand-in
+that implements the same registered-layout contract as the real service:
+`RegisterLayout` parses the JSON geometry upload and returns a content token,
+`RecognizeSwipe` resolves that token to the geometry captured when the request
+was accepted, and an unknown or empty token is an explicit error. The stand-in
+holds requests, so overlapping recognition, reverse completion and bounded
+failure are observed directly. `queue-geometry` proves each gesture carried its
+own 29-key US geometry, symbols, trace, language and token, and that a
+recognition already accepted keeps its captured geometry even after its token
+is forgotten.
+
 The first three cases use the known-count fixture made by
 `python3 make-sqlite-fixture.py /new/path/context.db`. The swipe case requires
 Patricia, not SQLite: generate its fixture in the paired Verbisage tree using

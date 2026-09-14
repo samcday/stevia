@@ -6,6 +6,7 @@ The pointer clicks the real keyboard. This does not emulate an input method or
 write text into the application. Run the helper build commands in README first.
 """
 import argparse
+import ast
 import ctypes
 import hashlib
 import json
@@ -337,6 +338,16 @@ def service_control(method, *args):
     return call.stdout.strip()
 
 
+def service_payload(index):
+    """A recorded request payload, decoded from the bus tuple that carries it.
+
+    A payload with both quote characters makes gdbus print the string with
+    double-quote delimiters and escaped interior quotes, so the tuple is read
+    back as a Python literal rather than by trimming punctuation."""
+    value = ast.literal_eval(service_control("Payload", str(index)))
+    return json.loads(value[0])
+
+
 def service_count(method):
     # gdbus prints "(uint32 2,)": the type name has digits of its own.
     return int(re.search(r"uint32\s+(\d+)", service_control(method)).group(1))
@@ -345,6 +356,21 @@ def service_count(method):
 def service_languages():
     """Distinct language tags the controllable service has seen, in order."""
     return re.findall(r"'([^']*)'", service_control("Languages"))
+
+
+def service_dictionary(method, *args):
+    """Call the dictionary interface of the controllable stand-in service."""
+    return subprocess.run(["gdbus", "call", "--session", "--dest", "org.verbisage.Dictionary",
+                           "--object-path", "/org/verbisage/Dictionary",
+                           "--method", f"org.verbisage.Dictionary1.{method}", *args],
+                          env=env, capture_output=True, text=True, timeout=5)
+
+
+def service_forget(token):
+    """Forget a registered layout token; report whether it was known."""
+    call = service_dictionary("ForgetLayout", token)
+    assert call.returncode == 0, f"ForgetLayout: {call.stderr.strip()}"
+    return call.stdout.strip() == "(true,)"
 
 
 def wait_held_requests(count, label, timeout=10):
@@ -1052,24 +1078,66 @@ try:
             drag_word("world", None, wait=False, allow_words=allowed)
             wait_held_requests(2, "second recognition outstanding")
 
-            first = json.loads(service_control("Payload", "0").strip("()',\n "))
-            second = json.loads(service_control("Payload", "1").strip("()',\n "))
+            first = service_payload(0)
+            second = service_payload(1)
             result["request_payloads"] = [first, second]
-            # Each gesture carried its own trace and key rectangles, captured
-            # when it was drawn. Recognition still uses the old ASCII letter
-            # export rather than the registered layout token, so the labels are
-            # the same 26 either way; replacing that is the next change.
+            # Each gesture quotes a token from the service's own registry. The
+            # displayed layer changed between the two, so they name two
+            # distinct uploads: the first unshifted, the second shifted.
+            assert first["token"] and second["token"], "a gesture carried no layout token"
+            assert first["token"] != second["token"], \
+                f"both gestures quoted one layer: {first['token']}"
+            # The registry resolved each token to that layer's own geometry,
+            # captured when the request was accepted: the whole 29-key US
+            # letter layer, 26 letters plus comma, space and period. The
+            # rectangles come from the registry, not from the request.
+            assert first["keys"] == second["keys"] == 29, \
+                f"unexpected key count: {first['keys']} {second['keys']}"
+            assert len(first["rects"]) == len(second["rects"]) == 29, \
+                "geometry was not one rectangle per key"
+            assert all(width > 0 and height > 0
+                       for _, _, width, height in first["rects"]), \
+                f"a resolved key had no area: {first['rects']}"
+            # A trace, a token and a language are carried per gesture.
             assert first["points"] >= 2 and second["points"] >= 2, "traces were empty"
             assert first["first_point"] != second["first_point"], \
-                f"both gestures sent one trace: {first} {second}"
-            assert first["keys"] == second["keys"] == 26, \
-                f"unexpected key export: {first} {second}"
+                f"both gestures sent one trace: {first['first_point']} {second['first_point']}"
+            assert first["lang"] == second["lang"] == "en", \
+                f"the gesture language was not carried: {first['lang']} {second['lang']}"
+            # The main symbols are the displayed layer's own, not a case
+            # conversion, and each layer declares the other's case at the same
+            # key: the unshifted layer shows lower case and declares the upper
+            # case, the shifted layer the reverse.
+            assert first["labels"] == "qwertyuiopasdfghjklzxcvbnm, .", \
+                f"the unshifted layer's symbols were not the shown ones: {first['labels']!r}"
+            assert second["labels"] == "QWERTYUIOPASDFGHJKLZXCVBNM, .", \
+                f"the shifted layer's symbols were not the shown ones: {second['labels']!r}"
+            assert first["upper"] == 0 and second["upper"] == 26, \
+                f"the shown case was not captured: {first['upper']} {second['upper']}"
+            assert "H" in first["alts"] and "h" in second["alts"], \
+                "each layer must declare the other layer's symbol at the same key"
             assert first["first_rect"] == second["first_rect"], \
-                "the keyboard did not actually keep its geometry here"
+                "the layer change moved the shared key grid"
+
+            # A recognition already accepted keeps its captured geometry even
+            # when its token is forgotten afterwards: forgetting is not a
+            # re-resolution. Both tokens are registered, and a forgotten one is
+            # then unknown and rejected rather than silently accepted.
+            assert service_forget(first["token"]), "the first token was not registered"
+            assert service_forget(second["token"]), "the second token was not registered"
+            assert not service_forget(first["token"]), "a forgotten token was still known"
+            missing = service_dictionary("RecognizeSwipe", "[(0.0, 0.0, 0)]",
+                                         first["token"], "100", "en")
+            assert missing.returncode != 0 and "unknown layout token" in missing.stderr, \
+                f"a forgotten token was not rejected: {missing.stdout} {missing.stderr}"
+            empty = service_dictionary("RecognizeSwipe", "[(0.0, 0.0, 0)]", "", "100", "en")
+            assert empty.returncode != 0 and "registered layout token" in empty.stderr, \
+                f"an empty token was not rejected: {empty.stdout} {empty.stderr}"
 
             # Capitalization is captured per gesture: the first was drawn
             # unshifted and the second with Shift, and holding both does not
-            # let the later state reach the earlier word.
+            # let the later state reach the earlier word. Forgetting the tokens
+            # above must not disturb the replies already in flight.
             service_control("Release", "1", "beta")
             service_control("Release", "0", "alpha")
             wait_state("alpha ", "Beta", "each gesture kept the case it was drawn with")
