@@ -1284,6 +1284,105 @@ pos_osk_widget_get_swipe_capitalization (PosOskWidget *self)
 }
 
 
+/* The letter layer whose keys Shift would show instead: the capital letters
+ * for the lower-case layer and the other way round. Symbol layers have no
+ * opposite Shift layer, and neither has a layout without one. */
+static int
+opposite_shift_layer (PosOskWidget *self, PosOskWidgetLayer layer)
+{
+  PosOskWidgetLayer opposite;
+
+  switch (layer) {
+  case POS_OSK_WIDGET_LAYER_NORMAL:
+    opposite = POS_OSK_WIDGET_LAYER_CAPS;
+    break;
+  case POS_OSK_WIDGET_LAYER_CAPS:
+    opposite = POS_OSK_WIDGET_LAYER_NORMAL;
+    break;
+  case POS_OSK_WIDGET_LAYER_SYMBOLS:
+  case POS_OSK_WIDGET_LAYER_SYMBOLS2:
+  default:
+    /* Symbol layers have no opposite Shift layer. */
+    return -1;
+  }
+
+  if (self->layout.layers[opposite].width <= 0.0)
+    return -1;
+
+  return opposite;
+}
+
+
+/* Whether the key inserts text and has an allocated rectangle: only such keys
+ * carry a symbol a completer can use. */
+static gboolean
+key_is_exportable (PosOskKey *key)
+{
+  const char *symbol = pos_osk_key_get_symbol (key);
+  const GdkRectangle *box = pos_osk_key_get_box (key);
+
+  return pos_osk_key_get_use (key) == POS_OSK_KEY_USE_KEY &&
+         !gm_str_is_null_or_empty (symbol) &&
+         !g_str_has_prefix (symbol, "KEY_") &&
+         box->width > 0 && box->height > 0;
+}
+
+
+static gboolean
+labels_contains (GPtrArray *labels, const char *label)
+{
+  for (guint i = 0; i < labels->len; i++) {
+    if (g_str_equal (g_ptr_array_index (labels, i), label))
+      return TRUE;
+  }
+  return FALSE;
+}
+
+
+/* Add one exported alternate: a real symbol of the layout, never an action
+ * key or the primary symbol it hangs off. */
+static void
+labels_add (GPtrArray *labels, const char *label, const char *primary)
+{
+  if (gm_str_is_null_or_empty (label) || g_str_has_prefix (label, "KEY_"))
+    return;
+  if (g_str_equal (label, primary) || labels_contains (labels, label))
+    return;
+  g_ptr_array_add (labels, (gpointer) label);
+}
+
+
+/* The opposite Shift layer's text key that sits where @box sits. Keys of the
+ * two letter layers usually share their rectangles; if a layout's rows differ,
+ * the key covering the centre is still the right physical key. */
+static PosOskKey *
+opposite_key_at (GPtrArray *opposite_keys, const GdkRectangle *box)
+{
+  double center_x = box->x + box->width / 2.0;
+  double center_y = box->y + box->height / 2.0;
+
+  for (guint i = 0; i < opposite_keys->len; i++) {
+    PosOskKey *key = g_ptr_array_index (opposite_keys, i);
+    const GdkRectangle *other = pos_osk_key_get_box (key);
+
+    if (other->x == box->x && other->y == box->y &&
+        other->width == box->width && other->height == box->height)
+      return key;
+  }
+
+  for (guint i = 0; i < opposite_keys->len; i++) {
+    PosOskKey *key = g_ptr_array_index (opposite_keys, i);
+    const GdkRectangle *other = pos_osk_key_get_box (key);
+
+    if (center_x >= other->x && center_x < other->x + other->width &&
+        center_y >= other->y && center_y < other->y + other->height)
+      return key;
+  }
+
+  return NULL;
+}
+
+
 /**
  * pos_osk_widget_get_layout_geometry:
  * @self: The keyboard
@@ -1291,8 +1390,13 @@ pos_osk_widget_get_swipe_capitalization (PosOskWidget *self)
  * Export the allocated geometry of the layer that is currently displayed.
  *
  * Every character key of the active layer is reported with the symbol it
- * actually emits, its long-press alternates and its rectangle in widget
- * coordinates, which is the same space as pointer and touch event positions.
+ * actually emits, its long-press alternates, the symbol the opposite Shift
+ * layer emits at the same physical key together with that key's long-press
+ * alternates, and the key's rectangle in widget coordinates, which is the
+ * same space as pointer and touch event positions. The Shift-layer symbols
+ * are the layout's own - a capital, an accented form or whatever else the
+ * layout maps there - never a case conversion of the shown symbols, so keys
+ * whose case pairs are not Unicode mirror images are described as they are.
  * Unlike the gesture-typing helper this imposes no alphabet, script or key
  * count restriction, so a shifted, non-Latin or symbol layer is described as
  * it is rather than being dropped.
@@ -1306,6 +1410,8 @@ pos_osk_widget_get_layout_geometry (PosOskWidget *self)
 {
   GVariantBuilder keys;
   PosOskWidgetKeyboardLayer *layer;
+  g_autoptr (GPtrArray) opposite_keys = NULL;
+  int opposite;
   guint count = 0;
 
   g_return_val_if_fail (POS_IS_OSK_WIDGET (self), NULL);
@@ -1314,6 +1420,24 @@ pos_osk_widget_get_layout_geometry (PosOskWidget *self)
     return NULL;
 
   layer = pos_osk_widget_get_current_layer (self);
+
+  opposite = opposite_shift_layer (self, self->layer);
+  if (opposite >= 0) {
+    PosOskWidgetKeyboardLayer *other = &self->layout.layers[opposite];
+
+    opposite_keys = g_ptr_array_new ();
+    for (guint r = 0; r < other->n_rows; r++) {
+      PosOskWidgetRow *row = pos_osk_widget_get_layer_row (self, opposite, r);
+
+      for (guint k = 0; k < row->keys->len; k++) {
+        PosOskKey *key = g_ptr_array_index (row->keys, k);
+
+        if (key_is_exportable (key))
+          g_ptr_array_add (opposite_keys, key);
+      }
+    }
+  }
+
   g_variant_builder_init (&keys, G_VARIANT_TYPE ("a(sasdddd)"));
   for (guint r = 0; r < layer->n_rows; r++) {
     PosOskWidgetRow *row = pos_osk_widget_get_row (self, r);
@@ -1323,7 +1447,9 @@ pos_osk_widget_get_layout_geometry (PosOskWidget *self)
       const char *symbol = pos_osk_key_get_symbol (key);
       const GdkRectangle *box = pos_osk_key_get_box (key);
       GStrv symbols = pos_osk_key_get_symbols (key);
-      GVariantBuilder alternates;
+      g_autoptr (GPtrArray) alternates = g_ptr_array_new ();
+      GVariantBuilder alternates_builder;
+      PosOskKey *other = NULL;
 
       /* Only keys that insert text carry a position a completer can use. */
       if (pos_osk_key_get_use (key) != POS_OSK_KEY_USE_KEY)
@@ -1334,15 +1460,27 @@ pos_osk_widget_get_layout_geometry (PosOskWidget *self)
       if (box->width <= 0 || box->height <= 0)
         continue;
 
-      g_variant_builder_init (&alternates, G_VARIANT_TYPE ("as"));
-      for (guint i = 0; symbols && symbols[i]; i++) {
-        if (gm_str_is_null_or_empty (symbols[i]) || g_str_has_prefix (symbols[i], "KEY_"))
-          continue;
-        g_variant_builder_add (&alternates, "s", symbols[i]);
+      for (guint i = 0; symbols && symbols[i]; i++)
+        labels_add (alternates, symbols[i], symbol);
+
+      /* What Shift emits at this very key, and that key's own long-press
+       * characters, are alternates of this key: they belong to its position,
+       * whatever the shown layer's case makes of them. */
+      if (opposite_keys)
+        other = opposite_key_at (opposite_keys, box);
+      if (other && other != key) {
+        labels_add (alternates, pos_osk_key_get_symbol (other), symbol);
+        symbols = pos_osk_key_get_symbols (other);
+        for (guint i = 0; symbols && symbols[i]; i++)
+          labels_add (alternates, symbols[i], symbol);
       }
 
+      g_variant_builder_init (&alternates_builder, G_VARIANT_TYPE ("as"));
+      for (guint i = 0; i < alternates->len; i++)
+        g_variant_builder_add (&alternates_builder, "s", g_ptr_array_index (alternates, i));
+
       g_variant_builder_add (&keys, "(s@asdddd)", symbol,
-                             g_variant_builder_end (&alternates),
+                             g_variant_builder_end (&alternates_builder),
                              (double) box->x + layer->offset_x, (double) box->y,
                              (double) box->width, (double) box->height);
       count++;

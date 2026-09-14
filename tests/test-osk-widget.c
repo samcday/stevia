@@ -33,6 +33,75 @@
 }G_STMT_END
 
 
+static gboolean
+geometry_has_symbol (GVariant *geometry, const char *symbol)
+{
+  GVariantIter iter;
+  GVariantIter *alternates;
+  const char *label;
+  double x, y, width, height;
+  gboolean found = FALSE;
+
+  g_variant_iter_init (&iter, geometry);
+  while (g_variant_iter_next (&iter, "(&sasdddd)", &label, &alternates,
+                              &x, &y, &width, &height)) {
+    if (g_str_equal (label, symbol))
+      found = TRUE;
+    g_variant_iter_free (alternates);
+  }
+  return found;
+}
+
+
+/* Whether @alternate is exported among the alternates of @symbol. */
+static gboolean
+geometry_has_alternate (GVariant *geometry, const char *symbol, const char *alternate)
+{
+  GVariantIter iter;
+  GVariantIter *alternates;
+  const char *label, *candidate;
+  double x, y, width, height;
+  gboolean found = FALSE;
+
+  g_variant_iter_init (&iter, geometry);
+  while (!found && g_variant_iter_next (&iter, "(&sasdddd)", &label, &alternates,
+                                        &x, &y, &width, &height)) {
+    if (g_str_equal (label, symbol)) {
+      while (g_variant_iter_next (alternates, "&s", &candidate)) {
+        if (g_str_equal (candidate, alternate)) {
+          found = TRUE;
+          break;
+        }
+      }
+    }
+    g_variant_iter_free (alternates);
+  }
+  return found;
+}
+
+
+/* The exported rectangle of @symbol's key, or %FALSE when the layer has no
+ * such primary key. */
+static gboolean
+geometry_rect_of (GVariant *geometry, const char *symbol, double *x, double *y,
+                  double *width, double *height)
+{
+  GVariantIter iter;
+  GVariantIter *alternates;
+  const char *label;
+  gboolean found = FALSE;
+
+  g_variant_iter_init (&iter, geometry);
+  while (!found && g_variant_iter_next (&iter, "(&sasdddd)", &label, &alternates,
+                                        x, y, width, height)) {
+    if (g_str_equal (label, symbol))
+      found = TRUE;
+    g_variant_iter_free (alternates);
+  }
+  return found;
+}
+
+
 static void
 test_switch_layer (void)
 {
@@ -665,26 +734,6 @@ geometry_teardown (GeometryFixture *fixture, gconstpointer unused)
 }
 
 
-static gboolean
-geometry_has_symbol (GVariant *geometry, const char *symbol)
-{
-  GVariantIter iter;
-  GVariantIter *alternates;
-  const char *label;
-  double x, y, width, height;
-  gboolean found = FALSE;
-
-  g_variant_iter_init (&iter, geometry);
-  while (g_variant_iter_next (&iter, "(&sasdddd)", &label, &alternates,
-                              &x, &y, &width, &height)) {
-    if (g_str_equal (label, symbol))
-      found = TRUE;
-    g_variant_iter_free (alternates);
-  }
-  return found;
-}
-
-
 /* Every character key of the shown layer is exported with its real rectangle,
  * without the gesture helper's ASCII and 26-key restrictions. */
 static void
@@ -754,6 +803,46 @@ test_geometry_alternates (GeometryFixture *fixture, gconstpointer unused)
 }
 
 
+/* The opposite Shift layer's symbol at the same physical key, and that key's
+ * own long-press characters, are exported with the shown key. Case pairs are
+ * distinct keys sharing one rectangle. */
+static void
+test_geometry_opposite_shift (GeometryFixture *fixture, gconstpointer unused)
+{
+  g_autoptr (GVariant) normal = pos_osk_widget_get_layout_geometry (fixture->osk);
+  g_autoptr (GVariant) shifted = NULL;
+  double qx, qy, qw, qh, Qx, Qy, Qw, Qh;
+
+  /* The shown layer's own long-press characters. */
+  g_assert_true (geometry_has_alternate (normal, "e", "é"));
+  /* What Shift emits at the same physical key, and that key's popup: the
+   * layout's own spelling, never a case conversion of the shown symbols. */
+  g_assert_true (geometry_has_alternate (normal, "e", "E"));
+  g_assert_true (geometry_has_alternate (normal, "e", "È"));
+  g_assert_true (geometry_has_alternate (normal, "q", "Q"));
+
+  /* The exported rectangle is the widget's own hit box. */
+  g_assert_true (geometry_rect_of (normal, "q", &qx, &qy, &qw, &qh));
+  g_assert_cmpstr (pos_osk_key_get_symbol (pos_osk_widget_locate_key (fixture->osk,
+                                                                      qx + qw / 2.0,
+                                                                      qy + qh / 2.0)),
+                   ==, "q");
+
+  pos_osk_widget_set_layer (fixture->osk, POS_OSK_WIDGET_LAYER_CAPS);
+  shifted = pos_osk_widget_get_layout_geometry (fixture->osk);
+  g_assert_true (geometry_has_symbol (shifted, "Q"));
+  g_assert_false (geometry_has_symbol (shifted, "q"));
+  g_assert_true (geometry_has_alternate (shifted, "Q", "q"));
+
+  /* One physical key, two case-related keys: the same rectangle. */
+  g_assert_true (geometry_rect_of (shifted, "Q", &Qx, &Qy, &Qw, &Qh));
+  g_assert_cmpfloat_with_epsilon (Qx, qx, 0.0001);
+  g_assert_cmpfloat_with_epsilon (Qy, qy, 0.0001);
+  g_assert_cmpfloat_with_epsilon (Qw, qw, 0.0001);
+  g_assert_cmpfloat_with_epsilon (Qh, qh, 0.0001);
+}
+
+
 /* The shown layer is exported as it is, in its own spelling. */
 static void
 test_geometry_layer (GeometryFixture *fixture, gconstpointer unused)
@@ -777,6 +866,90 @@ test_geometry_layer (GeometryFixture *fixture, gconstpointer unused)
   symbols = pos_osk_widget_get_layout_geometry (fixture->osk);
   g_assert_true (geometry_has_symbol (symbols, "1"));
   g_assert_false (geometry_has_symbol (symbols, "q"));
+}
+
+
+/* How @geometry's keys pair with @opposite's keys: by shared rectangle where
+ * the two layers agree, and by the rectangle's centre where they differ.
+ * Returns whether every key that has an opposite key at its position names it
+ * among its alternates, and stores how many keys needed the centre. */
+static gboolean
+geometry_pairs_with_opposite (GVariant *geometry, GVariant *opposite, guint *centre_fallbacks)
+{
+  GVariantIter iter;
+  GVariantIter *alternates;
+  const char *label;
+  double x, y, width, height;
+  guint covered = 0, paired = 0, centre = 0;
+
+  g_variant_iter_init (&iter, geometry);
+  while (g_variant_iter_next (&iter, "(&sasdddd)", &label, &alternates,
+                              &x, &y, &width, &height)) {
+    double center_x = x + width / 2.0, center_y = y + height / 2.0;
+    GVariantIter other_iter;
+    GVariantIter *other_alternates;
+    const char *other_label, *cover = NULL;
+    double ox, oy, ow, oh;
+    gboolean exact = FALSE;
+
+    g_variant_iter_init (&other_iter, opposite);
+    while (g_variant_iter_next (&other_iter, "(&sasdddd)", &other_label, &other_alternates,
+                                &ox, &oy, &ow, &oh)) {
+      /* Exported rectangles are whole pixels. */
+      if ((long) ox == (long) x && (long) oy == (long) y &&
+          (long) ow == (long) width && (long) oh == (long) height) {
+        exact = TRUE;
+        cover = other_label;
+      } else if (!exact && cover == NULL &&
+                 center_x >= ox && center_x < ox + ow &&
+                 center_y >= oy && center_y < oy + oh) {
+        cover = other_label;
+      }
+      g_variant_iter_free (other_alternates);
+    }
+
+    if (cover) {
+      covered++;
+      if (!exact)
+        centre++;
+      if (g_str_equal (cover, label) || geometry_has_alternate (geometry, label, cover))
+        paired++;
+    }
+    g_variant_iter_free (alternates);
+  }
+
+  *centre_fallbacks = centre;
+  return covered > 0 && paired == covered;
+}
+
+
+/* A layout whose letter layers do not share their row geometry: keys still
+ * pair with the opposite Shift layer's key at their position, by rectangle
+ * where the layers agree and by their centre where they differ. The
+ * Malayalam letter layers' first rows carry twelve and eleven keys, and each
+ * layer scales to the widget's width on its own, so no cross-layer key pair
+ * shares an exact rectangle. */
+static void
+test_geometry_layer_mismatch (void)
+{
+  GeometryFixture fixture = {0};
+  g_autoptr (GVariant) normal = NULL;
+  g_autoptr (GVariant) shifted = NULL;
+  guint fallbacks;
+
+  geometry_setup_layout (&fixture, "in+mal");
+  normal = pos_osk_widget_get_layout_geometry (fixture.osk);
+  pos_osk_widget_set_layer (fixture.osk, POS_OSK_WIDGET_LAYER_CAPS);
+  shifted = pos_osk_widget_get_layout_geometry (fixture.osk);
+
+  g_assert_nonnull (normal);
+  g_assert_nonnull (shifted);
+  g_assert_true (geometry_pairs_with_opposite (normal, shifted, &fallbacks));
+  g_assert_cmpuint (fallbacks, >, 0);
+  g_assert_true (geometry_pairs_with_opposite (shifted, normal, &fallbacks));
+  g_assert_cmpuint (fallbacks, >, 0);
+
+  gtk_widget_destroy (fixture.window);
 }
 
 
@@ -843,6 +1016,7 @@ main (int argc, char *argv[])
 
   g_test_add_func ("/pos/osk-widget/switch_layer", test_switch_layer);
   g_test_add_func ("/pos/osk-widget/geometry/non-qwerty", test_geometry_non_qwerty);
+  g_test_add_func ("/pos/osk-widget/geometry/layer-mismatch", test_geometry_layer_mismatch);
   g_test_add_func ("/pos/osk-widget/geometry/unallocated", test_geometry_unallocated);
 
 #define GEOMETRY_TEST(name, function) \
@@ -850,6 +1024,7 @@ main (int argc, char *argv[])
               geometry_setup, function, geometry_teardown)
   GEOMETRY_TEST ("export", test_geometry_export);
   GEOMETRY_TEST ("alternates", test_geometry_alternates);
+  GEOMETRY_TEST ("opposite-shift", test_geometry_opposite_shift);
   GEOMETRY_TEST ("layer", test_geometry_layer);
   GEOMETRY_TEST ("resize", test_geometry_resize);
 #undef GEOMETRY_TEST

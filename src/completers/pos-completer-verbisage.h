@@ -11,6 +11,14 @@ G_DECLARE_FINAL_TYPE (PosCompleterVerbisage, pos_completer_verbisage, POS, COMPL
 
 PosCompleter *pos_completer_verbisage_new (GError **error);
 
+/* Serialize exported keyboard geometry as the JSON layout upload the service
+ * registers. @geometry is `a(sasdddd)` from
+ * [method@Pos.OskWidget.get_layout_geometry]. The rectangles stay in the
+ * keyboard's own coordinate space; the service normalizes internally.
+ *
+ * Returns: (transfer full): The upload, or %NULL when @geometry carries no
+ *   usable key. */
+char *pos_completer_verbisage_layout_upload_json (GVariant *geometry);
 
 /* Accept one gesture into the ordered queue. Capitalization is captured at
  * gesture start: 0 lower, 1 initial, 2 upper. Returns %FALSE when the queue is

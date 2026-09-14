@@ -38,6 +38,16 @@ foreach name : tests
   test('@0@'.format(name), test, depends: compile_schemas, env: test_env)
 endforeach
 
+# Fixture exporter, not a test: drives the real widget and the completer's
+# upload serialization, so committed layout fixtures are generated rather
+# than hand-written. See tests/fixtures/README.md.
+executable(
+  'export-layout-fixture',
+  'export-layout-fixture.c',
+  pie: true,
+  dependencies: libpos_dep,
+)
+
 # Protocol-level input method fixture: an in-process compositor stub speaks
 # zwp_input_method_v2 to the real PosInputMethod.
 wayland_server_dep = dependency('wayland-server', version: '>=1.14')

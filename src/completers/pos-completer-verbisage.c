@@ -907,8 +907,8 @@ static void update_lookup (PosCompleterVerbisage *self);
 /* Serialize exported keyboard geometry as a Verbisage layout upload. The
  * rectangles stay in the keyboard's own coordinate space; the service
  * normalizes internally. */
-static char *
-layout_upload_json (GVariant *geometry)
+char *
+pos_completer_verbisage_layout_upload_json (GVariant *geometry)
 {
   g_autoptr (JsonBuilder) builder = NULL;
   g_autoptr (JsonGenerator) generator = NULL;
@@ -1127,7 +1127,7 @@ pos_completer_verbisage_set_layout (PosCompleterVerbisage *self, GVariant *geome
   g_return_if_fail (geometry == NULL ||
                     g_variant_is_of_type (geometry, G_VARIANT_TYPE ("a(sasdddd)")));
 
-  upload = layout_upload_json (geometry);
+  upload = pos_completer_verbisage_layout_upload_json (geometry);
   if (g_strcmp0 (upload, self->layout_upload) == 0)
     return;
 
